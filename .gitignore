@@ -1,0 +1,14 @@
+# Rust build output
+/target
+/dist
+
+# Knowledge graph / AI tooling artifacts (not project source)
+/graphify-out
+/.omo
+/.sisyphus
+/.tools
+.codegraph
+
+# Local editor/OS noise
+*.swp
+.DS_Store

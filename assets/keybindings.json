@@ -1,0 +1,29 @@
+{
+  "bindings": {
+    "undo": {"key":"z","modifiers":{"command":true}},
+    "redo": {"key":"y","modifiers":{"command":true}},
+    "copy": {"key":"c","modifiers":{"command":true}},
+    "cut": {"key":"x","modifiers":{"command":true}},
+    "paste": {"key":"v","modifiers":{"command":true}},
+    "transform_rotate_cw": {"key":"r"},
+    "transform_rotate_ccw": {"key":"r","modifiers":{"shift":true}},
+    "transform_grow": {"key":"plus"},
+    "transform_shrink": {"key":"minus"},
+    "flip_horizontal": {"key":"h"},
+    "flip_vertical": {"key":"v"},
+    "cancel_transform": {"key":"escape"},
+    "toggle_grid": {"key":"g"},
+    "select_pen": {"key":"d"},
+    "select_eraser": {"key":"e"},
+    "toggle_color_picker": {"key":"c"},
+    "swap_colors": {"key":"x"},
+    "select_delete": {"key":"delete"},
+    "invert_selection": {"key":"i","modifiers":{"command":true}},
+    "flip_selection_horizontal": {"key":"f","modifiers":{"command":true}},
+    "flip_selection_vertical": {"key":"f","modifiers":{"shift":true}},
+    "rotate_selection": {"key":"f","modifiers":{"alt":true}},
+    "select_rectangle": {"key":"s"},
+    "select_wand": {"key":"w"},
+    "select_lasso": {"key":"l"}
+  }
+}

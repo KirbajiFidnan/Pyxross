@@ -1,0 +1,46 @@
+[package]
+name = "pyxross"
+version = "0.1.0"
+edition = "2021"
+description = "Pyxross Workshop — region-based pixel art editor (Pyxel Edit clone)"
+license = "MIT"
+rust-version = "1.95"
+
+[lib]
+name = "pyxross"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pyxross"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dirs = "6.0.0"
+egui = "0.36.2"
+egui_dock = { version = "0.21.1", features = ["serde"] }
+egui-wgpu = "0.36.2"
+egui-winit = "0.36.2"
+gif = "0.14"
+png = "0.18.1"
+pollster = "1.0.1"
+rfd = "0.15.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+# P01 Phase 0 spike (projection PoC) — Linux-gated dev deps.
+# wayland-client/system is REQUIRED: wgpu-hal's Vulkan backend calls
+# vkCreateWaylandSurfaceKHR with raw C pointers from the system libwayland.
+[dev-dependencies]
+raw-window-handle = "0.6.2"
+smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["calloop"] }
+wayland-client = { version = "0.31.15", features = ["system"] }

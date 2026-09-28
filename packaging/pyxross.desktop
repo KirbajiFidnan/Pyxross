@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Pyxross Workshop
+Comment=Region-based pixel art editor
+Exec=pyxross
+Icon=pyxross
+Type=Application
+Categories=Graphics;2DGraphics;RasterGraphics;
