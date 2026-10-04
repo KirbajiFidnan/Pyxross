@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::core::color::Color;
 use crate::core::model::{BlendMode, LayerId};
 use crate::core::transform::TransformAlgorithm;
-use crate::input::{FieldierChild, Tool, WandSettings};
+use crate::input::{FieldierChild, FillSettings, Tool, WandSettings};
 use crate::ui::dock_color_palette_panel::PalettePanelEvent;
 use crate::ui::layers::LayerPanelEvent;
 use crate::ui::project::DrawSettings;
@@ -40,6 +40,23 @@ pub struct LayerView {
     pub delete_enabled: bool,
 }
 
+/// Snapshot of the Tile tool's sticky placement transform for one frame,
+/// mirrored from the App's [`TilePlacerTransform`](crate::ui::TilePlacerTransform)
+/// so the Tool Property panel stays a pure view.
+///
+/// `rotation` is the DEGREE form of the App's quarter-turn counter: always a
+/// multiple of 90 and always normalized into `0..360`, so the panel only ever
+/// shows 0 / 90 / 180 / 270.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TilePlacerView {
+    /// Clockwise rotation in degrees; a normalized multiple of 90.
+    pub rotation: i32,
+    /// Horizontal flip.
+    pub flip_x: bool,
+    /// Vertical flip.
+    pub flip_y: bool,
+}
+
 /// Snapshot of the toolbox state for one frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolboxView {
@@ -54,6 +71,8 @@ pub struct ToolboxView {
     /// [`WandSettings::contiguous`] with Alt momentarily dropping contiguity
     /// (`false`) so the panel can show it read-only.
     pub wand_contiguous_effective: bool,
+    /// The Fill (bucket) tool's stored flood-fill settings.
+    pub fill: FillSettings,
     /// Whether a selection-transform session is live. When true the Tool
     /// Property panel shows the "Transform" algorithm selector instead of the
     /// active tool's properties.
@@ -61,6 +80,9 @@ pub struct ToolboxView {
     /// The session's stored free-angle rotation algorithm, mirrored for the
     /// selector so the panel stays a pure view.
     pub transform_algorithm: TransformAlgorithm,
+    /// The Tile tool's sticky placement transform, mirrored for the rotation /
+    /// flip controls.
+    pub tile_placer: TilePlacerView,
 }
 
 impl Default for ToolboxView {
@@ -72,8 +94,10 @@ impl Default for ToolboxView {
             child: FieldierChild::default(),
             wand,
             wand_contiguous_effective: wand.contiguous,
+            fill: FillSettings::default(),
             transform_active: false,
             transform_algorithm: TransformAlgorithm::default(),
+            tile_placer: TilePlacerView::default(),
         }
     }
 }

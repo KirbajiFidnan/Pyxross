@@ -211,6 +211,24 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         lifecycle: "survives project switches without recreating panel entries",
     },
     AppOwnership {
+        field: "tile_palette_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "dock panel host cells are shell-global view state",
+        lifecycle: "survives project switches without recreating panel entries",
+    },
+    AppOwnership {
+        field: "tile_placer",
+        owner: AppOwner::HostLocal,
+        rationale: "the in-flight tile-placer gesture (per-cell diffs) is transient per-gesture state",
+        lifecycle: "reset at each placer gesture start and cleared on commit",
+    },
+    AppOwnership {
+        field: "tile_placer_preview",
+        owner: AppOwner::HostLocal,
+        rationale: "the per-frame tile-placer cursor preview (hover cell, hollow preview, index labels) is derived canvas state",
+        lifecycle: "recomputed every canvas frame and only emitted while the Tile tool is active",
+    },
+    AppOwnership {
         field: "settings",
         owner: AppOwner::ShellGlobal,
         rationale: "panel UI memory is shell-global",

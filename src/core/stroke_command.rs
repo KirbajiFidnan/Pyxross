@@ -118,6 +118,78 @@ impl StrokeSession {
         self.record.region
     }
 
+    /// Returns the tight RGBA8 before/current delta for changed stroke pixels.
+    ///
+    /// The stroke's stamp bbox conservatively includes the tapered brush
+    /// footprint and scatter radius; intersecting it with the captured region
+    /// bounds work to the region the session recorded. Only that candidate
+    /// rectangle is exported, never the full canvas.
+    pub fn preview_delta(&self, buf: &PixelBuffer) -> Option<(Rect2i, Vec<u8>, Vec<u8>)> {
+        let capture = self.record.region;
+        if capture.is_empty()
+            || capture.x < 0
+            || capture.y < 0
+            || capture.right() > buf.width().min(i32::MAX as usize) as i32
+            || capture.bottom() > buf.height().min(i32::MAX as usize) as i32
+        {
+            return None;
+        }
+        let capture_len = (capture.w as usize)
+            .checked_mul(capture.h as usize)?
+            .checked_mul(4)?;
+        if self.record.before.len() != capture_len {
+            return None;
+        }
+        let candidate = self.stroke.bounding_box().intersection(capture);
+        if candidate.is_empty() {
+            return None;
+        }
+        let current = buf.export_region(candidate, None)?;
+        let capture_stride = capture.w as usize * 4;
+        let candidate_stride = candidate.w as usize * 4;
+        let mut changed_bounds: Option<(i32, i32, i32, i32)> = None;
+        for y in 0..candidate.h as usize {
+            for x in 0..candidate.w as usize {
+                let capture_offset = ((candidate.y - capture.y) as usize + y) * capture_stride
+                    + (candidate.x - capture.x) as usize * 4
+                    + x * 4;
+                let current_offset = y * candidate_stride + x * 4;
+                if self.record.before[capture_offset..capture_offset + 4]
+                    != current[current_offset..current_offset + 4]
+                {
+                    let px = candidate.x + x as i32;
+                    let py = candidate.y + y as i32;
+                    changed_bounds = Some(match changed_bounds {
+                        Some((x0, y0, x1, y1)) => {
+                            (x0.min(px), y0.min(py), x1.max(px + 1), y1.max(py + 1))
+                        }
+                        None => (px, py, px + 1, py + 1),
+                    });
+                }
+            }
+        }
+        let (x0, y0, x1, y1) = changed_bounds?;
+        let region = Rect2i::new(x0, y0, x1 - x0, y1 - y0);
+        let mut before = Vec::with_capacity(region.area() as usize * 4);
+        let mut after = Vec::with_capacity(region.area() as usize * 4);
+        for y in y0..y1 {
+            let source_y = (y - candidate.y) as usize;
+            let source_x = (x0 - candidate.x) as usize;
+            let candidate_offset = source_y * candidate_stride + source_x * 4;
+            let capture_offset = (y - capture.y) as usize * capture_stride
+                + (x0 - capture.x) as usize * 4;
+            let row_bytes = region.w as usize * 4;
+            before.extend_from_slice(
+                &self.record.before[capture_offset..capture_offset + row_bytes],
+            );
+            after.extend_from_slice(&current[candidate_offset..candidate_offset + row_bytes]);
+        }
+        if before.len() != region.area() as usize * 4 || after.len() != before.len() {
+            return None;
+        }
+        Some((region, before, after))
+    }
+
     /// Finalize the stroke and produce an undo command.
     ///
     /// The command stores the full before/after delta for the captured region,
@@ -138,11 +210,19 @@ mod tests {
     use crate::core::brush::{BrushShape, BrushSpec, DrawMode};
     use crate::core::color::Color;
     use crate::core::model::LayerStack;
+    use crate::core::tilemap::TilePalette;
     use crate::core::undo::{Command, CommandContext};
 
     /// Build a `CommandContext` borrowing the given layer stack.
     fn ctx(layers: &mut LayerStack) -> CommandContext<'_> {
-        CommandContext { layers }
+        // Test-only: the palette is leaked so the returned context outlives the
+        // `&mut ctx(...)` temporary (no tile-edit command flows through these
+        // tests).
+        let palette = Box::leak(Box::new(TilePalette::new()));
+        CommandContext {
+            layers,
+            palette: &mut *palette,
+        }
     }
 
     #[test]
@@ -273,6 +353,81 @@ mod tests {
         assert!(
             StrokeSession::begin(&layers.active_layer().buffer, stroke, oob_region, lid).is_none()
         );
+    }
+
+    #[test]
+    fn preview_delta_is_none_for_noop_and_tight_for_single_pixel() {
+        let mut layers = LayerStack::new(8, 8);
+        let lid = layers.active_layer_id();
+        let canvas = Rect2i::new(0, 0, 8, 8);
+        let stroke = Stroke::new(BrushSpec::PENCIL_1PX, DrawMode::Pen, Color::WHITE);
+        let mut session =
+            StrokeSession::begin(&layers.active_layer().buffer, stroke, canvas, lid).unwrap();
+        assert!(session.preview_delta(&layers.active_layer().buffer).is_none());
+        session
+            .stroke_mut()
+            .start(&mut layers.active_layer_mut().buffer, 4, 5);
+        assert_eq!(
+            session.preview_delta(&layers.active_layer().buffer),
+            Some((Rect2i::new(4, 5, 1, 1), vec![0, 0, 0, 0], vec![255, 255, 255, 255]))
+        );
+    }
+
+    #[test]
+    fn preview_delta_tightly_covers_scatter_and_tail_on_large_canvas() {
+        let mut layers = LayerStack::new(512, 512);
+        let lid = layers.active_layer_id();
+        let canvas = Rect2i::new(0, 0, 512, 512);
+        let stroke = Stroke::new(
+            BrushSpec::new(1, BrushShape::Square),
+            DrawMode::Pen,
+            Color::rgb(30, 90, 240),
+        )
+        .with_scatter(7)
+        .with_jitter_seed(1234)
+        .with_tail(2);
+        let mut session =
+            StrokeSession::begin(&layers.active_layer().buffer, stroke, canvas, lid).unwrap();
+        {
+            let buf = &mut layers.active_layer_mut().buffer;
+            session.stroke_mut().start(buf, 100, 100);
+            session.stroke_mut().continue_to(buf, 130, 100);
+        }
+
+        let (region, before, after) = session
+            .preview_delta(&layers.active_layer().buffer)
+            .expect("scatter/tail stroke changed pixels");
+        let mut expected_bounds: Option<(i32, i32, i32, i32)> = None;
+        let current = layers.active_layer().buffer.as_bytes();
+        for y in 0..512usize {
+            for x in 0..512usize {
+                let offset = (y * 512 + x) * 4;
+                if session.record.before[offset..offset + 4] != current[offset..offset + 4] {
+                    expected_bounds = Some(match expected_bounds {
+                        Some((x0, y0, x1, y1)) => (
+                            x0.min(x as i32),
+                            y0.min(y as i32),
+                            x1.max(x as i32 + 1),
+                            y1.max(y as i32 + 1),
+                        ),
+                        None => (x as i32, y as i32, x as i32 + 1, y as i32 + 1),
+                    });
+                }
+            }
+        }
+        let (x0, y0, x1, y1) = expected_bounds.unwrap();
+        assert_eq!(region, Rect2i::new(x0, y0, x1 - x0, y1 - y0));
+        assert_eq!(before.len(), region.area() as usize * 4);
+        assert_eq!(after.len(), region.area() as usize * 4);
+        assert!(region.area() < canvas.area() / 4, "preview must stay sparse");
+        for y in 0..region.h as usize {
+            for x in 0..region.w as usize {
+                let output_offset = (y * region.w as usize + x) * 4;
+                let canvas_offset = ((region.y as usize + y) * 512 + region.x as usize + x) * 4;
+                assert_eq!(&before[output_offset..output_offset + 4], &session.record.before[canvas_offset..canvas_offset + 4]);
+                assert_eq!(&after[output_offset..output_offset + 4], &current[canvas_offset..canvas_offset + 4]);
+            }
+        }
     }
 
     #[test]

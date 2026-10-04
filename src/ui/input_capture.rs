@@ -112,6 +112,21 @@ impl InputCapture {
         self.target.get() == Some(surface)
     }
 
+    /// True when a docked / floating panel is the topmost surface under the
+    /// pointer this frame, i.e. the pointer sits over panel chrome.
+    ///
+    /// This is the SINGLE panel mask every surface consults: the App resolves
+    /// [`Self::set_target`] once per frame from
+    /// [`crate::ui::panel_dock::DockManager::surface_at`] (floating panels over
+    /// docked ones, visible panels only) and routes wheel/pan through
+    /// [`Self::handles_wheel`] / [`Self::handles_buttons`]. A surface that
+    /// processes input outside its own rect — the canvas widget's RAW press
+    /// signal and its hover-driven previews — MUST gate on this too, otherwise a
+    /// press over a panel leaks to the surface underneath.
+    pub fn pointer_over_panel(&self) -> bool {
+        matches!(self.target.get(), Some(surface) if surface != SurfaceId::Canvas)
+    }
+
     /// Claims the gesture for `surface`, unless another surface owns it.
     ///
     /// Returns whether `surface` holds the gesture afterwards.
@@ -269,5 +284,25 @@ mod tests {
         capture.claim(canvas);
         assert!(!capture.handles_wheel(nest));
         assert!(!capture.handles_wheel(canvas));
+    }
+
+    #[test]
+    fn pointer_over_panel_is_the_inverse_of_targeting_the_canvas() {
+        let canvas = SurfaceId::Canvas;
+        let nest = SurfaceId::Panel(panel(0));
+        let capture = InputCapture::new();
+
+        // No target recorded (pointer outside the app frame): nothing masks the
+        // canvas, and the canvas is NOT the target either.
+        assert!(!capture.pointer_over_panel());
+        assert!(!capture.is_target(canvas));
+
+        capture.set_target(Some(canvas));
+        assert!(!capture.pointer_over_panel());
+        assert!(capture.is_target(canvas));
+
+        capture.set_target(Some(nest));
+        assert!(capture.pointer_over_panel());
+        assert!(!capture.is_target(canvas));
     }
 }

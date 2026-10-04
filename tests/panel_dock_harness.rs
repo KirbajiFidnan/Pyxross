@@ -3753,7 +3753,7 @@ fn toolbox_lists_exactly_the_real_tools() {
         vec![],
     );
     let texts = rendered_texts(&output);
-    for label in ["Pencil", "Eraser", "Fill", "Eyedropper", "Fieldier"] {
+    for label in ["Pencil", "Eraser", "Fill", "Eyedropper", "Fieldier", "Tile"] {
         assert_eq!(
             texts.iter().filter(|text| *text == label).count(),
             1,
@@ -3765,7 +3765,7 @@ fn toolbox_lists_exactly_the_real_tools() {
         .filter(|text| {
             !matches!(
                 text.as_str(),
-                "Pencil" | "Eraser" | "Fill" | "Eyedropper" | "Fieldier"
+                "Pencil" | "Eraser" | "Fill" | "Eyedropper" | "Fieldier" | "Tile"
             )
         })
         .collect();
@@ -4247,7 +4247,7 @@ fn tool_property_panel_has_a_placeholder_property_area() {
     let theme = Theme::default_dark();
     let chrome = ChromeHarness::new();
     let host = ToolboxHost::default();
-    host.view.borrow_mut().tool = Tool::Fill;
+    host.view.borrow_mut().tool = Tool::Eyedropper;
     let mut manager = tool_property_manager(&host);
 
     let output = run_tool_property_frame(
@@ -4257,7 +4257,7 @@ fn tool_property_panel_has_a_placeholder_property_area() {
         vec2(800.0, 600.0),
         vec![],
     );
-    let name = text_pos(&output, "Fill").expect("the tool name paints");
+    let name = text_pos(&output, "Eyedropper").expect("the tool name paints");
     let placeholder = text_pos(&output, "No editable properties for this tool yet.")
         .expect("the placeholder property area paints");
     assert!(
@@ -4319,7 +4319,7 @@ fn tool_property_panel_keeps_placeholder_for_non_draw_tools() {
     let host = ToolboxHost::default();
     let mut manager = tool_property_manager(&host);
 
-    for tool in [Tool::Fill, Tool::Eyedropper] {
+    for tool in [Tool::Eyedropper] {
         host.view.borrow_mut().tool = tool;
         let output = run_tool_property_frame(
             &ctx,
@@ -5000,7 +5000,7 @@ fn tool_property_panel_exposes_scatter_for_draw_tools() {
     row_reset(&output, "Scatter");
 
     // Non-draw tools keep the placeholder: no Scatter row at all.
-    host.view.borrow_mut().tool = Tool::Fill;
+    host.view.borrow_mut().tool = Tool::Eyedropper;
     let output = run_tool_property_frame(
         &ctx,
         &mut manager,
@@ -5025,7 +5025,7 @@ fn tool_property_content_shrinks_with_the_panel_width() {
     let theme = Theme::default_dark();
     let chrome = ChromeHarness::new();
     let host = ToolboxHost::default();
-    host.view.borrow_mut().tool = Tool::Fill;
+    host.view.borrow_mut().tool = Tool::Eyedropper;
     let mut manager = tool_property_manager(&host);
 
     // A narrow-but-usable dock: a 40pt wide panel leaves a ~30pt nest viewport.
@@ -5274,6 +5274,56 @@ fn wand_restrict_checkbox_emits_event() {
         events,
         vec![ToolbarEvent::WandRestrictToRegionChanged(false)],
         "the second click must emit WandRestrictToRegionChanged(false)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fill tool property tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fill_properties_render_and_emit_events() {
+    let ctx = egui::Context::default();
+    let theme = Theme::default_dark();
+    let chrome = ChromeHarness::new();
+    let host = ToolboxHost::default();
+    host.view.borrow_mut().tool = Tool::Fill;
+    let mut manager = tool_property_manager(&host);
+    let screen = vec2(800.0, 600.0);
+
+    let output = run_tool_property_frame(&ctx, &mut manager, &chrome.view(&theme), screen, vec![]);
+    for label in ["Tolerance", "Contiguous", "Restrict to region"] {
+        assert!(
+            text_pos(&output, label).is_some(),
+            "the Fill panel must show {label:?}: {:?}",
+            rendered_texts(&output)
+        );
+    }
+    assert!(
+        text_pos(&output, "No editable properties for this tool yet.").is_none(),
+        "the Fill tool must not keep the placeholder"
+    );
+
+    // The Contiguous checkbox toggles off and emits.
+    let contiguous = text_pos(&output, "Contiguous").expect("the Contiguous checkbox paints");
+    click_tool_property(&ctx, &mut manager, &chrome.view(&theme), contiguous);
+    let events: Vec<ToolbarEvent> = host.events.borrow_mut().drain(..).collect();
+    assert_eq!(
+        events,
+        vec![ToolbarEvent::FillContiguousChanged(false)],
+        "clicking Contiguous must emit FillContiguousChanged(false)"
+    );
+
+    // The Restrict to region checkbox toggles on and emits.
+    let output = run_tool_property_frame(&ctx, &mut manager, &chrome.view(&theme), screen, vec![]);
+    let restrict =
+        text_pos(&output, "Restrict to region").expect("the Restrict to region checkbox paints");
+    click_tool_property(&ctx, &mut manager, &chrome.view(&theme), restrict);
+    let events: Vec<ToolbarEvent> = host.events.borrow_mut().drain(..).collect();
+    assert_eq!(
+        events,
+        vec![ToolbarEvent::FillRestrictToRegionChanged(true)],
+        "clicking Restrict to region must emit FillRestrictToRegionChanged(true)"
     );
 }
 

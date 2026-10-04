@@ -111,10 +111,16 @@ fn action_label(action: Action) -> &'static str {
         Action::SelectPen => "Select pen",
         Action::SelectEraser => "Select eraser",
         Action::ToggleColorPicker => "Toggle color picker",
+        // UX item 2 conflict: `x` doubles as the Tile-placer's horizontal-flip
+        // modifier. The App resolves it by tool context — while the Tile tool
+        // is active the placer reads X directly and this shortcut is
+        // suppressed; outside the Tile tool X still swaps colors.
         Action::SwapColors => "Swap colors",
         Action::SelectRectangle => "Select rectangle",
         Action::SelectWand => "Select wand",
         Action::SelectLasso => "Select lasso",
+        Action::SelectFill => "Select fill",
+        Action::SelectTileTool => "Select tile tool",
     }
 }
 
@@ -139,7 +145,7 @@ fn binding_label(binding: Option<KeyBinding>) -> String {
     parts.join("+")
 }
 
-fn logical_keys() -> [crate::input::LogicalKey; 20] {
+fn logical_keys() -> [crate::input::LogicalKey; 21] {
     [
         crate::input::LogicalKey::Z,
         crate::input::LogicalKey::Y,
@@ -161,6 +167,7 @@ fn logical_keys() -> [crate::input::LogicalKey; 20] {
         crate::input::LogicalKey::S,
         crate::input::LogicalKey::W,
         crate::input::LogicalKey::L,
+        crate::input::LogicalKey::B,
     ]
 }
 
@@ -186,6 +193,7 @@ fn key_label(key: crate::input::LogicalKey) -> &'static str {
         crate::input::LogicalKey::S => "S",
         crate::input::LogicalKey::W => "W",
         crate::input::LogicalKey::L => "L",
+        crate::input::LogicalKey::B => "B",
     }
 }
 
@@ -209,7 +217,9 @@ mod tests {
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(800.0, 600.0),
+                // Tall enough for every action row plus the Reset/Apply
+                // buttons (the panel grew when tools were added).
+                egui::vec2(800.0, 1400.0),
             )),
             predicted_dt: 1.0 / 60.0,
             events,

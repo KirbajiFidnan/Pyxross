@@ -32,13 +32,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::model::BlendMode;
+use crate::core::tilemap::{TileMap, TilePalette};
 
 /// Current on-disk format version of the `.pyxross` save format.
 ///
 /// Bump this when the manifest structure changes incompatibly, and add a
 /// stepwise migration in [`crate::io::migrate_document`] for the previous
 /// version. Loaders reject manifests saved by a newer version.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// A complete `.pyxross` project: canvas, layers, regions, frames,
 /// sequences, palette, and editor settings.
@@ -64,6 +65,12 @@ pub struct Document {
     pub sequences: Vec<SequenceDoc>,
     /// Project palette, straight-alpha RGBA.
     pub palette: Vec<[u8; 4]>,
+    /// Tile palette: the project's tile pixel data plus selection.
+    ///
+    /// `#[serde(default)]` keeps v5-and-earlier manifests (which predate the
+    /// tilemap palette) loading; the v5→v6 migration injects an empty one.
+    #[serde(default)]
+    pub tile_palette: TilePalette,
     /// Editor preferences.
     pub editor: EditorSettings,
 }
@@ -98,6 +105,13 @@ pub struct LayerDoc {
     pub parent: Option<u64>,
     /// True for group layers (which carry an empty `pixels` vector).
     pub is_group: bool,
+    /// Per-layer tilemap (grid of tile-cell references); `None` when the layer
+    /// has no tilemap.
+    #[serde(default)]
+    pub tilemap: Option<TileMap>,
+    /// Whether the layer is locked against edits.
+    #[serde(default)]
+    pub locked: bool,
     /// Row-major RGBA8 pixels, `canvas_width * canvas_height * 4` bytes.
     #[serde(skip)]
     pub pixels: Vec<u8>,

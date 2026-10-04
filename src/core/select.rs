@@ -813,10 +813,18 @@ mod tests {
     use super::*;
     use crate::core::color::Color;
     use crate::core::model::LayerStack;
+    use crate::core::tilemap::TilePalette;
     use crate::core::undo::{Command, CommandContext, UndoStack};
 
     fn ctx(layers: &mut LayerStack) -> CommandContext<'_> {
-        CommandContext { layers }
+        // Test-only: the palette is leaked so the returned context outlives the
+        // `&mut ctx(...)` temporary (no tile-edit command flows through these
+        // tests).
+        let palette = Box::leak(Box::new(TilePalette::new()));
+        CommandContext {
+            layers,
+            palette: &mut *palette,
+        }
     }
 
     fn pattern_fill(buf: &mut PixelBuffer) {

@@ -24,6 +24,8 @@
     "rotate_selection": {"key":"f","modifiers":{"alt":true}},
     "select_rectangle": {"key":"s"},
     "select_wand": {"key":"w"},
-    "select_lasso": {"key":"l"}
+    "select_lasso": {"key":"l"},
+    "select_fill": {"key":"f"},
+    "select_tile_tool": {"key":"b"}
   }
 }

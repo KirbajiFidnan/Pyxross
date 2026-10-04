@@ -301,6 +301,121 @@ impl PixelBuffer {
         true
     }
 
+    /// Source-over composites raw RGBA8 bytes onto `region` (canvas
+    /// coordinates).  Unlike [`blit_region`](Self::blit_region) this blends
+    /// every pixel with straight-alpha source-over instead of replacing it:
+    ///
+    /// ```text
+    /// out_a   = sa + da*(1-sa)
+    /// out_rgb = (src_rgb*sa + dst_rgb*da*(1-sa)) / out_a
+    /// ```
+    ///
+    /// with `out_rgb = 0` when `out_a == 0`.  A fully transparent source pixel
+    /// (`sa == 0`) leaves the destination byte-identical, so low/zero-alpha
+    /// textures never erase existing canvas content.  Returns false when the
+    /// region is out of bounds or the byte length does not match
+    /// `region.w * region.h * 4`.
+    pub fn blit_region_over(&mut self, region: Rect2i, bytes: &[u8]) -> bool {
+        let rw = region.w as usize;
+        let rh = region.h as usize;
+        if region.x < 0
+            || region.y < 0
+            || rw == 0
+            || rh == 0
+            || (region.x as usize)
+                .checked_add(rw)
+                .is_none_or(|end| end > self.width)
+            || (region.y as usize)
+                .checked_add(rh)
+                .is_none_or(|end| end > self.height)
+        {
+            return false;
+        }
+        let Some(expected) = rw
+            .checked_mul(rh)
+            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        else {
+            return false;
+        };
+        if bytes.len() != expected {
+            return false;
+        }
+        let x0 = region.x as usize;
+        let y0 = region.y as usize;
+        for row in 0..rh {
+            let dst_start = ((y0 + row) * self.width + x0) * BYTES_PER_PIXEL;
+            let src_start = row * rw * BYTES_PER_PIXEL;
+            for x in 0..rw {
+                let px = x * BYTES_PER_PIXEL;
+                let dst = &mut self.pixels[dst_start + px..dst_start + px + BYTES_PER_PIXEL];
+                let src = &bytes[src_start + px..src_start + px + BYTES_PER_PIXEL];
+                composite_over(dst, src);
+            }
+        }
+        self.note_changed(region);
+        true
+    }
+
+    /// Mask-aware variant of [`blit_region_over`](Self::blit_region_over),
+    /// skipping every cell the mask does not select.  `None`, or a mask whose
+    /// length does not match `region.area()`, composites everything exactly
+    /// like [`blit_region_over`](Self::blit_region_over) (mirroring the
+    /// [`blit_region_masked`](Self::blit_region_masked) contract).  Returns
+    /// false when the region is out of bounds or the byte length does not
+    /// match `region.w * region.h * 4`.
+    pub fn blit_region_masked_over(
+        &mut self,
+        region: Rect2i,
+        bytes: &[u8],
+        mask: Option<&[bool]>,
+    ) -> bool {
+        let rw = region.w as usize;
+        let rh = region.h as usize;
+        if region.x < 0
+            || region.y < 0
+            || rw == 0
+            || rh == 0
+            || (region.x as usize)
+                .checked_add(rw)
+                .is_none_or(|end| end > self.width)
+            || (region.y as usize)
+                .checked_add(rh)
+                .is_none_or(|end| end > self.height)
+        {
+            return false;
+        }
+        let Some(expected) = rw
+            .checked_mul(rh)
+            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        else {
+            return false;
+        };
+        if bytes.len() != expected {
+            return false;
+        }
+        // The mask applies only when it covers the region cell for cell;
+        // anything else degrades to the plain composite.
+        let Some(cells) = mask.filter(|cells| cells.len() == rw * rh) else {
+            return self.blit_region_over(region, bytes);
+        };
+        let x0 = region.x as usize;
+        let y0 = region.y as usize;
+        for row in 0..rh {
+            let dst_start = ((y0 + row) * self.width + x0) * BYTES_PER_PIXEL;
+            let src_start = row * rw * BYTES_PER_PIXEL;
+            for x in 0..rw {
+                if cells[row * rw + x] {
+                    let px = x * BYTES_PER_PIXEL;
+                    let dst = &mut self.pixels[dst_start + px..dst_start + px + BYTES_PER_PIXEL];
+                    let src = &bytes[src_start + px..src_start + px + BYTES_PER_PIXEL];
+                    composite_over(dst, src);
+                }
+            }
+        }
+        self.note_changed(region);
+        true
+    }
+
     fn index(&self, x: usize, y: usize) -> Option<usize> {
         if x >= self.width || y >= self.height {
             return None;
@@ -392,6 +507,38 @@ impl PixelBuffer {
         }
         Some(out)
     }
+}
+
+/// Straight-alpha source-over composite of one RGBA8 `src` pixel onto `dst`,
+/// using integer math:
+///
+/// ```text
+/// out_a   = sa + da*(1-sa)
+/// out_rgb = (src_rgb*sa + dst_rgb*da*(1-sa)) / out_a
+/// ```
+///
+/// `out_rgb` is `0` when `out_a == 0`.  `sa == 0` leaves `dst` untouched;
+/// `sa == 255` replaces it byte for byte.  RGB is rounded to nearest, alpha
+/// is rounded to nearest (`out_a` may differ from the exact real value by at
+/// most half a unit, while the RGB division uses the exact denominator for
+/// maximum precision).
+fn composite_over(dst: &mut [u8], src: &[u8]) {
+    let sa = src[3] as u32;
+    if sa == 0 {
+        return;
+    }
+    let da = dst[3] as u32;
+    let inv = 255 - sa;
+    // `out_a_num == out_a * 255` in exact integer form.
+    let out_a_num = sa * 255 + da * inv;
+    // `sa > 0` implies `out_a_num >= 255`, so the divisions below are safe.
+    let out_a = ((out_a_num + 127) / 255) as u8;
+    let half = out_a_num / 2;
+    for i in 0..3 {
+        let num = src[i] as u32 * sa * 255 + dst[i] as u32 * da * inv;
+        dst[i] = ((num + half) / out_a_num) as u8;
+    }
+    dst[3] = out_a;
 }
 
 #[cfg(test)]
@@ -633,6 +780,74 @@ mod tests {
         // Bounds and length failures behave like blit_region.
         assert!(!b.blit_region_masked(Rect2i::new(0, 0, 4, 1), &red, Some(&[true, false])));
         assert!(!b.blit_region_masked(Rect2i::new(0, 0, 2, 1), &[0u8; 4], Some(&[true, false])));
+    }
+
+    #[test]
+    fn blit_region_over_formula() {
+        // Destination starts opaque blue; dst = (0, 0, 255, 255).
+        let mut b = PixelBuffer::new(3, 1);
+        b.set_pixel(0, 0, Color::rgba(0, 0, 255, 255));
+        b.set_pixel(1, 0, Color::rgba(0, 0, 255, 255));
+        b.set_pixel(2, 0, Color::rgba(0, 0, 255, 255));
+        // src[0] alpha 0 → untouched; src[1] half red (128) → blend;
+        // src[2] opaque red (255) → replace.
+        let src = [
+            255, 0, 0, 0, // fully transparent: destination must not change
+            255, 0, 0, 128, // semi-transparent: source-over blend
+            255, 0, 0, 255, // opaque: replace
+        ];
+        assert!(b.blit_region_over(Rect2i::new(0, 0, 3, 1), &src));
+        assert_eq!(b.get_pixel(0, 0), Some(Color::rgba(0, 0, 255, 255)));
+        // sa=128, da=255: out_a_num = 128*255 + 255*127 = 65025; red =
+        // (255*128*255 + 65025/2)/65025 = 128, blue = (255*255*127 + 32512)/
+        // 65025 = 127, alpha = 255.
+        assert_eq!(b.get_pixel(1, 0), Some(Color::rgba(128, 0, 127, 255)));
+        assert_eq!(b.get_pixel(2, 0), Some(Color::rgba(255, 0, 0, 255)));
+
+        // Degenerate: transparent source over transparent destination stays
+        // byte-identical.
+        let mut empty = PixelBuffer::new(1, 1);
+        assert!(empty.blit_region_over(Rect2i::new(0, 0, 1, 1), &[9, 9, 9, 0]));
+        assert_eq!(empty.get_pixel(0, 0), Some(Color::TRANSPARENT));
+
+        // Bounds and length validation mirrors blit_region.
+        assert!(!b.blit_region_over(Rect2i::new(0, 0, 4, 1), &src));
+        assert!(!b.blit_region_over(Rect2i::new(0, 0, 3, 1), &[0u8; 4]));
+    }
+
+    #[test]
+    fn blit_region_masked_over_skips_unselected_cells() {
+        let mut b = PixelBuffer::new(2, 1);
+        b.set_pixel(0, 0, Color::rgba(0, 0, 255, 255));
+        b.set_pixel(1, 0, Color::rgba(0, 0, 255, 255));
+        let red = [255u8, 0, 0, 255, 255, 0, 0, 255];
+        // Mask selects only the first cell: it composites (opaque → replace)
+        // while the second keeps its blue value.
+        assert!(b.blit_region_masked_over(Rect2i::new(0, 0, 2, 1), &red, Some(&[true, false])));
+        assert_eq!(b.get_pixel(0, 0), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(b.get_pixel(1, 0), Some(Color::rgb(0, 0, 255)));
+        // None composites everything, like blit_region_over.
+        assert!(b.blit_region_masked_over(Rect2i::new(0, 0, 2, 1), &red, None));
+        assert_eq!(b.get_pixel(1, 0), Some(Color::rgb(255, 0, 0)));
+        // A length mismatch composites everything too.
+        assert!(b.blit_region_masked_over(Rect2i::new(0, 0, 2, 1), &red, Some(&[true])));
+        assert_eq!(b.get_pixel(0, 0), Some(Color::rgb(255, 0, 0)));
+        // Masked-out alpha-0 cell never touches the destination.
+        b.set_pixel(1, 0, Color::rgba(7, 8, 9, 255));
+        let transparent = [0u8; 8];
+        assert!(b.blit_region_masked_over(
+            Rect2i::new(0, 0, 2, 1),
+            &transparent,
+            Some(&[true, false])
+        ));
+        assert_eq!(b.get_pixel(1, 0), Some(Color::rgba(7, 8, 9, 255)));
+        // Bounds and length failures behave like blit_region_over.
+        assert!(!b.blit_region_masked_over(Rect2i::new(0, 0, 4, 1), &red, Some(&[true, false])));
+        assert!(!b.blit_region_masked_over(
+            Rect2i::new(0, 0, 2, 1),
+            &[0u8; 4],
+            Some(&[true, false])
+        ));
     }
 
     #[test]

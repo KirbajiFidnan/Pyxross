@@ -131,6 +131,9 @@ impl LayerStack {
             buffer: PixelBuffer::new(self.width, self.height),
             parent: None,
             is_group: true,
+            tilemap: None,
+            locked: false,
+            tilemap_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -614,7 +617,10 @@ mod tests {
         let b = stack.add_layer("B");
         stack.layer_mut(b).unwrap().buffer.fill(Color::rgb(7, 8, 9));
         let g = stack.create_group_around(&[a, b], "G").unwrap();
-        let before = stack.composite_layers().as_bytes().to_vec();
+        let before = stack
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
         let ids_before: Vec<LayerId> = stack.iter().map(|l| l.id).collect();
 
         let detached = stack.detach_subtree(g).unwrap();
@@ -625,7 +631,12 @@ mod tests {
         assert!(stack.attach_subtree(detached));
         let ids_after: Vec<LayerId> = stack.iter().map(|l| l.id).collect();
         assert_eq!(ids_after, ids_before);
-        assert_eq!(stack.composite_layers().as_bytes(), before);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            before
+        );
     }
 
     #[test]
@@ -657,7 +668,12 @@ mod tests {
         assert!(stack.has_groups());
         assert_eq!(stack.children_of(Some(g)), Vec::<LayerId>::new());
         // A group with no children composites as transparent.
-        assert_eq!(stack.composite_layers().as_bytes(), vec![0; 2 * 2 * 4]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            vec![0; 2 * 2 * 4]
+        );
     }
 
     #[test]
@@ -719,7 +735,10 @@ mod tests {
         let g = stack.create_group_around(&[a, b], "G").unwrap();
 
         let captured = stack.structure();
-        let captured_bytes = stack.composite_layers().as_bytes().to_vec();
+        let captured_bytes = stack
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         // Shuffle the stack with existing ops until it no longer matches.
         assert!(stack.set_parent_and_position(c, Some(g), 0));
@@ -729,7 +748,12 @@ mod tests {
 
         assert!(stack.restore_structure(&captured));
         assert_eq!(stack.structure(), captured);
-        assert_eq!(stack.composite_layers().as_bytes(), captured_bytes);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            captured_bytes
+        );
 
         // `next_id` was recomputed: a fresh layer gets a brand-new id.
         let max_id = captured.iter().map(|(id, _)| id.as_u64()).max().unwrap();

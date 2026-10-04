@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::document::{Document, FORMAT_VERSION};
 use crate::core::palette::Palette;
+use crate::core::tilemap::TilePalette;
 use crate::input::Keymap;
 
 pub use crate::core::png_codec::{decode_png, encode_png, PngError, PngImage};
@@ -381,7 +382,13 @@ fn validate_layer_tree(doc: &Document) -> Result<(), PersistenceError> {
 ///
 /// v0 → v1 is an identity migration (no structural changes yet). v1 → v2
 /// injects the new layer-tree fields: every v1 layer was a flat root-level
-/// layer, so each entry gains `is_group: false` and `parent: null`.
+/// layer, so each entry gains `is_group: false` and `parent: null`. v2 → v5
+/// are identity steps (the intermediate tile systems were removed; their
+/// fields are stripped at v5 → v6). v5 → v6 replaces the OLD tile system
+/// (`tiles` / `tile_references` keys) with the new [`TilePalette`] under
+/// `tile_palette`, and gives every layer doc a `tilemap: null` / `locked:
+/// false`. **Documented data loss:** old tile data is dropped (the old model
+/// is incompatible with the tilemap model).
 pub fn migrate_document(
     mut value: serde_json::Value,
     from: u32,
@@ -404,6 +411,41 @@ pub fn migrate_document(
                         if let Some(obj) = layer.as_object_mut() {
                             obj.insert("is_group".to_string(), serde_json::json!(false));
                             obj.insert("parent".to_string(), serde_json::Value::Null);
+                        }
+                    }
+                }
+            }
+            // v2 -> v3, v3 -> v4, v4 -> v5: identity steps. The intermediate
+            // tile systems they once injected have been removed; the old keys
+            // (if any) are dropped by the v5 -> v6 step below.
+            2 | 3 | 4 => {}
+            // v5 -> v6: the OLD tile system is replaced by the tilemap palette.
+            // Strip the old `tiles`/`tile_references` keys (data loss), inject
+            // an empty `tile_palette`, and give every layer doc a `tilemap`
+            // and `locked`.
+            5 => {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove("tiles");
+                    obj.remove("tile_references");
+                    if !obj.contains_key("tile_palette") {
+                        obj.insert(
+                            "tile_palette".to_string(),
+                            serde_json::to_value(TilePalette::default())
+                                .map_err(|e| PersistenceError::Json(e.to_string()))?,
+                        );
+                    }
+                    if let Some(layers) = obj.get_mut("layers").and_then(|v| v.as_array_mut()) {
+                        for layer in layers {
+                            if let Some(layer_obj) = layer.as_object_mut() {
+                                if !layer_obj.contains_key("tilemap") {
+                                    layer_obj
+                                        .insert("tilemap".to_string(), serde_json::Value::Null);
+                                }
+                                if !layer_obj.contains_key("locked") {
+                                    layer_obj
+                                        .insert("locked".to_string(), serde_json::json!(false));
+                                }
+                            }
                         }
                     }
                 }
@@ -686,7 +728,9 @@ mod tests {
     }
 
     use crate::core::document::{EditorSettings, FrameDoc, LayerDoc, RegionDoc, SequenceDoc};
+    use crate::core::math::Rect2i;
     use crate::core::model::BlendMode;
+    use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette};
 
     struct TempDir(std::path::PathBuf);
 
@@ -737,6 +781,8 @@ mod tests {
                     blend: BlendMode::Normal,
                     parent: None,
                     is_group: false,
+                    tilemap: None,
+                    locked: false,
                     pixels: opaque,
                 },
                 LayerDoc {
@@ -747,6 +793,8 @@ mod tests {
                     blend: BlendMode::Multiply,
                     parent: None,
                     is_group: false,
+                    tilemap: None,
+                    locked: false,
                     pixels: vec![0u8; 4 * 4 * 4],
                 },
                 LayerDoc {
@@ -757,6 +805,8 @@ mod tests {
                     blend: BlendMode::Screen,
                     parent: None,
                     is_group: false,
+                    tilemap: None,
+                    locked: false,
                     pixels: gradient,
                 },
             ],
@@ -793,6 +843,7 @@ mod tests {
                 tags: vec!["loop".to_string()],
             }],
             palette: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
+            tile_palette: TilePalette::default(),
             editor: EditorSettings {
                 autosave_interval_min: 7,
             },
@@ -948,9 +999,25 @@ mod tests {
     }
 
     #[test]
-    fn migrate_document_v0_is_identity() {
+    fn migrate_document_v0_migrates_forward_and_injects_tilemap_fields() {
+        // v0 -> v1 is an identity step, but the full chain to the current
+        // version injects the new `tile_palette` and strips the old tile keys.
+        // Existing fields must be preserved untouched.
         let value = serde_json::json!({"canvas_width": 4});
-        assert_eq!(migrate_document(value.clone(), 0).unwrap(), value);
+        let migrated = migrate_document(value.clone(), 0).unwrap();
+        assert_eq!(migrated["canvas_width"], value["canvas_width"]);
+        let palette: TilePalette =
+            serde_json::from_value(migrated["tile_palette"].clone()).unwrap();
+        assert_eq!(palette, TilePalette::default());
+        assert!(palette.is_empty());
+        assert!(
+            migrated.get("tiles").is_none(),
+            "the old `tiles` key must be stripped"
+        );
+        assert!(
+            migrated.get("tile_references").is_none(),
+            "the old `tile_references` key must be stripped"
+        );
     }
 
     #[test]
@@ -989,6 +1056,186 @@ mod tests {
             assert_eq!(layer["is_group"], serde_json::json!(false));
             assert_eq!(layer["parent"], serde_json::Value::Null);
         }
+    }
+
+    #[test]
+    fn migrate_document_v5_strips_old_tile_keys_and_injects_tile_palette() {
+        let value = serde_json::json!({
+            "tiles": {"tiles": [], "selected": null},
+            "tile_references": {"cells": []},
+            "layers": [
+                {"id": 1, "name": "base", "visible": true, "opacity": 1.0,
+                 "blend": "Normal", "is_group": false, "parent": null}
+            ]
+        });
+        let migrated = migrate_document(value, 5).unwrap();
+        assert!(
+            migrated.get("tiles").is_none(),
+            "the old `tiles` key is dropped"
+        );
+        assert!(
+            migrated.get("tile_references").is_none(),
+            "the old `tile_references` key is dropped"
+        );
+        let palette: TilePalette =
+            serde_json::from_value(migrated["tile_palette"].clone()).unwrap();
+        assert_eq!(palette, TilePalette::default());
+        let layers = migrated["layers"].as_array().unwrap();
+        assert_eq!(layers[0]["tilemap"], serde_json::Value::Null);
+        assert_eq!(layers[0]["locked"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn migrate_document_v5_preserves_tile_palette_and_layer_fields() {
+        let value = serde_json::json!({
+            "tile_palette": {
+                "tiles": [{"id": 1, "w": 2, "h": 2, "pixels": [1, 2, 3, 4]}],
+                "selected": 1
+            },
+            "layers": [
+                {"id": 1, "name": "base", "visible": true, "opacity": 1.0,
+                 "blend": "Normal", "is_group": false, "parent": null,
+                 "tilemap": {"tile_size": 4, "cols": 2, "rows": 2,
+                             "cells": [null, null, null, null]},
+                 "locked": true}
+            ]
+        });
+        let migrated = migrate_document(value, 5).unwrap();
+        let palette: TilePalette =
+            serde_json::from_value(migrated["tile_palette"].clone()).unwrap();
+        assert_eq!(palette.tiles.len(), 1);
+        assert_eq!(palette.selected, Some(crate::core::tilemap::TileId(1)));
+        let layers = migrated["layers"].as_array().unwrap();
+        assert_eq!(layers[0]["locked"], serde_json::json!(true));
+        assert!(layers[0].get("tilemap").is_some());
+    }
+
+    #[test]
+    fn v5_manifest_loads_end_to_end() {
+        let dir = TempDir::new();
+        let manifest = serde_json::json!({
+            "format_version": 5,
+            "canvas_width": 8,
+            "canvas_height": 8,
+            "tile_size": 4,
+            "layers": [
+                {"id": 1, "name": "base", "visible": true, "opacity": 1.0,
+                 "blend": "Normal", "is_group": false, "parent": null}
+            ],
+            "regions": [],
+            "frames": [],
+            "sequences": [],
+            "palette": [],
+            "tiles": {"tiles": [], "selected": null},
+            "tile_references": {"cells": []},
+            "editor": {"autosave_interval_min": 5}
+        });
+        fs::create_dir_all(dir.path().join("layers")).unwrap();
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("layers").join("1.png"),
+            encode_png(8, 8, &[0u8; 8 * 8 * 4]).unwrap(),
+        )
+        .unwrap();
+
+        let doc = load_document(dir.path()).unwrap();
+        assert_eq!(doc.tile_palette, TilePalette::default());
+        assert!(doc.tile_palette.is_empty());
+        assert_eq!(doc.layers[0].tilemap, None);
+        assert!(!doc.layers[0].locked);
+    }
+
+    #[test]
+    fn tile_palette_roundtrip_through_save_load() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.truncate(1);
+        doc.regions.clear();
+        doc.frames.clear();
+        doc.sequences.clear();
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 2,
+            pixels: vec![9u8; 2 * 2 * 4],
+        });
+        palette.add(Tile {
+            id: TileId(0),
+            w: 3,
+            h: 1,
+            pixels: vec![5u8; 3 * 1 * 4],
+        });
+        palette.select(TileId(1));
+        doc.tile_palette = palette;
+        save_document(&doc, dir.path()).unwrap();
+        let loaded = load_document(dir.path()).unwrap();
+        assert_eq!(loaded.tile_palette, doc.tile_palette);
+        assert_eq!(loaded, doc);
+    }
+
+    #[test]
+    fn tilemap_and_locked_layer_roundtrip_through_save_load() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.truncate(1);
+        doc.regions.clear();
+        doc.frames.clear();
+        doc.sequences.clear();
+        let mut map = TileMap::new(4, 2, 2);
+        map.set_cell(
+            (1, 0),
+            Some(TileCell {
+                tile_id: TileId(3),
+                rotation: 2,
+                flip_x: true,
+                flip_y: false,
+            }),
+        );
+        doc.layers[0].tilemap = Some(map);
+        doc.layers[0].locked = true;
+        save_document(&doc, dir.path()).unwrap();
+        let loaded = load_document(dir.path()).unwrap();
+        assert_eq!(loaded.layers[0].tilemap, doc.layers[0].tilemap);
+        assert!(loaded.layers[0].locked);
+        assert_eq!(loaded, doc);
+    }
+
+    #[test]
+    fn project_session_document_roundtrip_preserves_tile_palette() {
+        use crate::ui::project::{ProjectId, ProjectSession};
+
+        let mut session = ProjectSession::new(ProjectId::new(1), "tiles", 4, 4);
+        let first = session.tile_palette.add(Tile {
+            id: TileId(0),
+            w: 2,
+            h: 2,
+            pixels: vec![0u8; 2 * 2 * 4],
+        });
+        let second = session.tile_palette.add(Tile {
+            id: TileId(0),
+            w: 2,
+            h: 2,
+            pixels: vec![0u8; 2 * 2 * 4],
+        });
+        assert!(session.tile_palette.select(second));
+        let doc = session.to_document();
+        assert_eq!(doc.tile_palette, session.tile_palette);
+        assert_eq!(doc.tile_palette.tiles.len(), 2);
+        assert_eq!(doc.tile_palette.selected, Some(second));
+
+        let mut restored = ProjectSession::new(ProjectId::new(2), "restored", 4, 4);
+        restored.load_document(&doc);
+        assert_eq!(restored.tile_palette, doc.tile_palette);
+        assert_eq!(
+            restored.tile_palette.selected_tile().map(|tile| tile.id),
+            Some(second)
+        );
+        assert_eq!(first, TileId(1));
     }
 
     #[test]
@@ -1089,6 +1336,8 @@ mod tests {
                 blend: BlendMode::Normal,
                 parent: None,
                 is_group: true,
+                tilemap: None,
+                locked: false,
                 pixels: Vec::new(),
             },
         );

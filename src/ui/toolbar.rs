@@ -42,21 +42,39 @@ pub enum ToolbarEvent {
     WandToleranceChanged(u8),
     /// The user toggled the wand's restrict-to-region checkbox.
     WandRestrictToRegionChanged(bool),
+    /// The user moved the Fill tool's tolerance control in the Tool Property panel.
+    FillToleranceChanged(u8),
+    /// The user toggled the Fill tool's contiguous checkbox.
+    FillContiguousChanged(bool),
+    /// The user toggled the Fill tool's restrict-to-region checkbox.
+    FillRestrictToRegionChanged(bool),
     /// The user picked the free-angle rotation algorithm (RotSprite / CleanEdge
     /// / Rotxel) in the Tool Property panel while a transform is live.
     TransformAlgorithmChanged(TransformAlgorithm),
+    /// The user typed a rotation into the Tile tool's rotation input. The value
+    /// arrives ALREADY snapped to a multiple of 90 and normalized into
+    /// `0..360` by the panel, so the App stores `(value / 90) % 4` quarter
+    /// turns. Activates the sticky transform.
+    TileRotationChanged(i32),
+    /// The user toggled the Tile tool's horizontal-flip checkbox. Activates
+    /// the sticky transform.
+    TileFlipXChanged(bool),
+    /// The user toggled the Tile tool's vertical-flip checkbox. Activates
+    /// the sticky transform.
+    TileFlipYChanged(bool),
     PaletteSelected(usize),
     /// The user swapped the primary and secondary colors (swap button / X key).
     SwapColors,
 }
 
 /// All tools in toolbox display order.
-pub(crate) const TOOLS: [Tool; 5] = [
+pub(crate) const TOOLS: [Tool; 6] = [
     Tool::Pencil,
     Tool::Eraser,
     Tool::Fill,
     Tool::Eyedropper,
     Tool::Fieldier,
+    Tool::Tile,
 ];
 
 /// Display label for a tool.
@@ -67,6 +85,7 @@ pub(crate) fn tool_label(tool: Tool) -> &'static str {
         Tool::Fill => "Fill",
         Tool::Eyedropper => "Eyedropper",
         Tool::Fieldier => "Fieldier",
+        Tool::Tile => "Tile",
         Tool::Draw => "Draw",
     }
 }
@@ -536,7 +555,7 @@ mod tests {
             &mut events,
         );
 
-        for label in ["Pencil", "Eraser", "Fill", "Eyedropper", "Fieldier"] {
+        for label in ["Pencil", "Eraser", "Fill", "Eyedropper", "Fieldier", "Tile"] {
             assert!(
                 !text_positions(&output, label).is_empty(),
                 "missing tool label {label}"
@@ -717,7 +736,7 @@ mod tests {
 
     #[test]
     fn toolbox_lists_only_the_real_tools() {
-        assert_eq!(TOOLS.len(), 5);
+        assert_eq!(TOOLS.len(), 6);
         assert!(
             !TOOLS.contains(&Tool::Draw),
             "the hidden Draw tool must never be selectable from the toolbox"
@@ -726,9 +745,10 @@ mod tests {
             assert_ne!(tool, Tool::Draw);
         }
         assert!(TOOLS.contains(&Tool::Fieldier));
+        assert!(TOOLS.contains(&Tool::Tile));
         assert_eq!(
             TOOLS.len(),
-            5,
+            6,
             "rectangle/wand/lasso are Fieldier children, not separate toolbox entries"
         );
     }

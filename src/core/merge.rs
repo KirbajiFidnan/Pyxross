@@ -176,13 +176,21 @@ mod tests {
             .unwrap()
             .buffer
             .fill(Color::rgb(255, 0, 0));
-        let expected = layers.composite_layers().as_bytes().to_vec();
+        let expected = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
         assert!(ctl.merge_down(&mut layers, top));
         assert_eq!(layers.layer(top), None);
-        assert_eq!(layers.composite_layers().as_bytes(), expected);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            expected
+        );
         assert_eq!(ctl.top_undo_name(), Some("Merge Down"));
     }
 
@@ -253,17 +261,30 @@ mod tests {
             layer.buffer.fill(Color::rgb(255, 0, 0));
             layer.opacity = 0.5;
         }
-        let expected = layers.composite_layers().as_bytes().to_vec();
+        let expected = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
         assert!(ctl.merge_down(&mut layers, top));
-        assert_eq!(layers.composite_layers().as_bytes(), expected);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            expected
+        );
 
         assert!(ctl.undo(&mut layers));
         assert!(ctl.redo(&mut layers));
         assert_eq!(layers.layer(top), None);
-        assert_eq!(layers.composite_layers().as_bytes(), expected);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            expected
+        );
     }
 
     #[test]
@@ -283,7 +304,10 @@ mod tests {
             .fill(Color::rgb(255, 0, 0));
         assert!(layers.set_active(top));
         let before = layers.structure();
-        let before_bytes = layers.composite_layers().as_bytes().to_vec();
+        let before_bytes = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
@@ -292,7 +316,12 @@ mod tests {
 
         assert!(ctl.undo(&mut layers));
         assert_eq!(layers.structure(), before);
-        assert_eq!(layers.composite_layers().as_bytes(), before_bytes);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            before_bytes
+        );
         assert!(layers.layer(top).is_some());
         assert_eq!(layers.active_layer_id(), top);
     }

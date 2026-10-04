@@ -61,6 +61,31 @@ impl PixelClip {
             Some(mask) => !mask.iter().any(|&selected| selected),
         }
     }
+
+    /// Returns the intersection of two clips: a pixel belongs only when both
+    /// clips contain it.  The result stays a rect-only clip when neither input
+    /// carries a mask; otherwise it is a masked clip over the overlapping rect.
+    pub fn intersect(&self, other: &PixelClip) -> PixelClip {
+        let rect = self.rect.intersection(other.rect);
+        if self.mask.is_none() && other.mask.is_none() {
+            return Self { rect, mask: None };
+        }
+        let area = rect.area().max(0) as usize;
+        let mut mask = vec![false; area];
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                if self.contains(x, y) && other.contains(x, y) {
+                    let index =
+                        ((y - rect.y) as i64 * rect.w as i64 + (x - rect.x) as i64) as usize;
+                    mask[index] = true;
+                }
+            }
+        }
+        Self {
+            rect,
+            mask: Some(std::sync::Arc::from(mask)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,5 +201,43 @@ mod tests {
 
         assert!(clip.is_empty());
         assert!(!clip.contains(0, 0));
+    }
+
+    #[test]
+    /// Given two clips, when they are intersected, then only pixels in both are kept.
+    fn intersect_keeps_only_the_shared_pixels() {
+        let buffer = PixelBuffer::new(8, 8);
+        let selection = Selection::capture(&buffer, Rect2i::new(1, 1, 4, 4)).unwrap();
+        let selection_clip = PixelClip::from_selection(&selection);
+        let region = PixelClip::from_rect(Rect2i::new(3, 3, 4, 4));
+
+        let clip = selection_clip.intersect(&region);
+
+        assert!(clip.contains(3, 3) && clip.contains(4, 4));
+        assert!(!clip.contains(2, 2), "outside the region");
+        assert!(!clip.contains(5, 5), "outside the selection");
+        assert!(!clip.contains(3, 6), "outside the selection");
+    }
+
+    #[test]
+    /// Given a masked clip and a rect clip, when they are intersected, then the mask is preserved.
+    fn intersect_preserves_the_mask() {
+        let buffer = PixelBuffer::new(8, 8);
+        let selection = Selection::capture_mask(
+            &buffer,
+            Rect2i::new(1, 1, 3, 3),
+            vec![true, false, true, true, true, true, false, true, true],
+        )
+        .unwrap();
+        let selection_clip = PixelClip::from_selection(&selection);
+        let region = PixelClip::from_rect(Rect2i::new(1, 1, 2, 2));
+
+        let clip = selection_clip.intersect(&region);
+
+        assert!(clip.contains(1, 1));
+        assert!(clip.contains(2, 2));
+        assert!(!clip.contains(2, 1), "selection mask excludes it");
+        assert!(!clip.contains(3, 1), "region excludes it");
+        assert!(!clip.contains(1, 3), "region excludes it");
     }
 }

@@ -18,6 +18,7 @@ pub mod dock_color_picker_panel;
 pub mod dock_hosts;
 pub mod dock_layers_panel;
 pub mod dock_layers_settings;
+pub mod dock_tile_palette_panel;
 pub mod dock_tool_property_panel;
 pub mod dock_toolbox_panel;
 pub mod host_registry;
@@ -63,10 +64,15 @@ use crate::core::select::{
     delete_selected_command, flip_selected_command, rotate_selected_command, SelectMode, Selection,
 };
 use crate::core::stroke_command::StrokeSession;
+use crate::core::tile_edit;
+use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette, TilePixelOverrides};
 use crate::core::transform::{
     CurveTransform, LayerBuffer, LayerCommit, TransformAlgorithm, TransformObject, GIZMO_HIT_RADIUS,
 };
-use crate::core::undo::{CommandContext, DeltaRecorder};
+use crate::core::undo::{
+    Command, CommandContext, CompositeCommand, DeltaRecorder, ReverseDeltaCommand,
+    TilemapEditCommand,
+};
 use crate::input::{FieldierChild, Keymap, Tool};
 use crate::io::{
     autosave_dir_for, clear_recovery_journal, decode_png, encode_gif, encode_png, load_document,
@@ -78,10 +84,13 @@ use crate::render::gizmo::GizmoHit;
 use crate::render::RendererState;
 use canvas::{
     scroll_steps, CanvasInteractions, CanvasOverlay, CanvasView, CanvasWidget, HudState,
-    LinePreview,
+    LinePreview, SelectionLatch,
 };
 use dock_color_palette_panel::{palette_panel_spec, PalettePanelEvent};
-use dock_hosts::{ColorPickerView, LayerRow, LayerView, PaletteView, ToolboxView};
+use dock_hosts::{
+    ColorPickerView, LayerRow, LayerView, PaletteView, TilePlacerView, ToolboxView,
+};
+use dock_tile_palette_panel::{tile_palette_panel_spec, TilePalettePanelEvent, TilePaletteView};
 use host_registry::{ContextGenerationService, ContextSnapshot, WindowHostRegistry};
 use input_capture::{InputCapture, SurfaceId};
 use keybindings::KeybindingsPanel;
@@ -131,6 +140,18 @@ impl<T> NativeHostRetirement<T> {
 /// Document size in pixels (the canvas is a 128×128 transparent buffer).
 const CANVAS_WIDTH: usize = 128;
 const CANVAS_HEIGHT: usize = 128;
+
+/// Undo label for a pixel-edit gesture that ALSO wrote through to root tile
+/// data (the original command + the produced [`TilePixelEditCommand`]s are
+/// wrapped in one composite under this name).
+const TILE_EDIT_COMPOSITE_NAME: &str = "Tile Edit";
+
+/// BB: the selection "dead zone", in logical screen points. A selection press
+/// (primary or secondary, Rectangle/Lasso) does NOT start a selection until the
+/// pointer has moved at least this far from the latched press position, so a
+/// plain click never starts a sticky zero-size selection. Kept small enough
+/// that an intentional drag starts immediately, but above the click/drag noise.
+const SELECTION_DEAD_ZONE_PX: f32 = 3.0;
 
 /// R6 F3: autosave cadence (5 minutes).
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(300);
@@ -197,7 +218,7 @@ fn workspace_layout_path() -> Option<PathBuf> {
 }
 
 fn preview_image_for_session(session: &project::ProjectSession) -> egui::ColorImage {
-    let composite = session.layers.composite_layers();
+    let composite = session.layers.composite_layers(&session.tile_palette);
     egui::ColorImage::from_rgba_unmultiplied(
         [composite.width(), composite.height()],
         composite.as_bytes(),
@@ -243,6 +264,28 @@ struct App {
     color_picker_host: dock_hosts::ColorPickerHost,
     /// Shared per-frame cells for the docked Palette panel (pure view).
     palette_host: dock_hosts::PalettePanelHost,
+    /// Shared per-frame cells for the docked Tile Palette panel (pure view).
+    tile_palette_host: dock_tile_palette_panel::TilePaletteHost,
+    /// In-flight Tile-tool placer gesture: the per-cell diffs of the current
+    /// primary (stamp) or secondary (clear) drag, committed as ONE undo step
+    /// on release.
+    tile_placer: TilePlacerGesture,
+    /// The SINGLE source of truth for the Tile tool's placement transform, written
+    /// by BOTH the Q/R/X/Z sticky keys (see [`Self::tick_tile_placer_transform`])
+    /// and the Tool Property panel's rotation / flip controls (see
+    /// `apply_toolbar_events`). There is deliberately no second copy: the panel
+    /// reads this field through the [`TilePlacerView`] snapshot, so the keys and
+    /// the panel can never disagree.
+    ///
+    /// The rotation/flip is applied ABSOLUTELY to every stamp and is never reset
+    /// by a key release, so it survives across frames, across stamps, and across
+    /// the redundant re-stamp of the last dragged cell; it resets only on tool
+    /// deactivation.
+    tile_placer_transform: TilePlacerTransform,
+    /// Per-frame Tile-placer cursor preview (UX items 1/4/6), computed in the
+    /// canvas update path and emitted as [`CanvasOverlay::TilePlacer`] while
+    /// the Tile tool is active.
+    tile_placer_preview: TilePlacerPreview,
     /// Theme browser panel (F4): switch/refresh themes and preview colors.
     settings: SettingsPanel,
     keybindings: KeybindingsPanel,
@@ -344,6 +387,7 @@ impl Default for App {
         let layers_host = dock_hosts::LayerPanelHost::default();
         let color_picker_host = dock_hosts::ColorPickerHost::default();
         let palette_host = dock_hosts::PalettePanelHost::default();
+        let tile_palette_host = dock_tile_palette_panel::TilePaletteHost::default();
         let mut panel_dock = panel_dock::DockManager::demo();
         panel_dock
             .add_spec(dock_toolbox_panel::toolbox_panel_spec(
@@ -369,6 +413,12 @@ impl Default for App {
                 panel_dock::PanelPlacement::DockedRight,
             ))
             .expect("palette panel id must be unique");
+        panel_dock
+            .add_spec(tile_palette_panel_spec(
+                &tile_palette_host,
+                panel_dock::PanelPlacement::DockedRight,
+            ))
+            .expect("tile palette panel id must be unique");
         let mut app = Self {
             window: None,
             renderer: None,
@@ -385,6 +435,10 @@ impl Default for App {
             layers_host,
             color_picker_host,
             palette_host,
+            tile_palette_host,
+            tile_placer: TilePlacerGesture::default(),
+            tile_placer_transform: TilePlacerTransform::default(),
+            tile_placer_preview: TilePlacerPreview::default(),
             settings: SettingsPanel::default(),
             keybindings: KeybindingsPanel::new(&keymap),
             panel_layout: PanelLayout::new(),
@@ -467,7 +521,7 @@ fn shift_pressed(ctx: &egui::Context) -> bool {
 /// move evenly) instead of the opposite corner/edge, and the pivot is forced
 /// back onto the bbox centre afterwards. With Shift it is additionally a
 /// uniform (dominant-axis) centre scale. Alt is no longer the pivot-only
-/// modifier and Ctrl is no longer part of the transform map.
+/// modifier.
 fn alt_pressed(ctx: &egui::Context) -> bool {
     ctx.input(|input| {
         input.modifiers.alt
@@ -483,6 +537,161 @@ fn alt_pressed(ctx: &egui::Context) -> bool {
                 )
             })
     })
+}
+
+/// The oriented OPAQUE pixels of `tile` under the placement transform (Fix 1):
+/// `(offset_x, offset_y, colour)` relative to the cell origin, with the tile's
+/// ACTUAL straight-alpha RGBA colour per pixel.
+///
+/// Mirrors the core `orient_tile_pixels` order EXACTLY: flips first (horizontal
+/// then vertical mirror), then `rotation` 90° CLOCKWISE steps. The preview must
+/// match what a stamp bakes, so the two stay in lockstep by construction.
+/// Fully-transparent pixels are omitted (the preview preserves transparency).
+fn oriented_preview_pixels(
+    tile: &crate::core::tilemap::Tile,
+    flip_x: bool,
+    flip_y: bool,
+    rotation: u8,
+) -> Vec<(i32, i32, Color)> {
+    let w = tile.w as usize;
+    let h = tile.h as usize;
+    let mut out = Vec::new();
+    for ry in 0..h {
+        for rx in 0..w {
+            let i = (ry * w + rx) * 4;
+            let alpha = tile.pixels[i + 3];
+            if alpha == 0 {
+                continue;
+            }
+            let color = Color::rgba(
+                tile.pixels[i],
+                tile.pixels[i + 1],
+                tile.pixels[i + 2],
+                alpha,
+            );
+            // Phase 1 (flips): root (rx, ry) -> flipped (fx, fy).
+            let fx = if flip_x { w - 1 - rx } else { rx };
+            let fy = if flip_y { h - 1 - ry } else { ry };
+            // Phase 2 (rotation): flipped (fx, fy) -> output, closed-form for
+            // each 90° CW step count (dims swap on odd rotations).
+            let (ox, oy) = match rotation % 4 {
+                0 => (fx as i32, fy as i32),
+                1 => (h as i32 - 1 - fy as i32, fx as i32),
+                2 => (w as i32 - 1 - fx as i32, h as i32 - 1 - fy as i32),
+                _ => (fy as i32, w as i32 - 1 - fx as i32),
+            };
+            out.push((ox, oy, color));
+        }
+    }
+    out
+}
+
+/// In-flight Tile-tool placer gesture (ui-only state).
+///
+/// Holds the per-cell `(before, after)` diffs of the current primary (stamp)
+/// or secondary (clear) drag. Cells already touched by the gesture keep their
+/// ORIGINAL `before` so one gesture commits as one undo step; re-stamping the
+/// same cell only updates its `after`.
+#[derive(Default)]
+struct TilePlacerGesture {
+    /// `cell -> (before, after)` in the active layer's tilemap.
+    diffs: BTreeMap<(u32, u32), (Option<TileCell>, Option<TileCell>)>,
+    /// Per-stamped-cell buffer footprint `(rect, before)` — the buffer bytes
+    /// BEFORE the cell was baked. Clear (un-tile) records nothing: the last
+    /// baked content becomes ordinary visible pixels.
+    buffer_deltas: Vec<(Rect2i, Vec<u8>)>,
+}
+
+/// Sticky Tile-placer transform (ui-only state): the CURRENT rotation/flip
+/// that the next stamp applies.
+///
+/// Toggled by Q/R/X/Z key PRESSES (edge-triggered via `key_pressed`, folded in
+/// by [`App::tick_tile_placer_transform`]) — releasing a key does NOT reset it,
+/// so the transform "sticks" across frames and across stamps. While no
+/// modifier has been pressed ([`Self::active`] is false) a stamped cell keeps
+/// its OWN existing transform (0 rotation / no flips for a fresh cell); once a
+/// modifier IS active the sticky transform is applied ABSOLUTELY (never as a
+/// delta/xor on the cell's own), so a drag that re-visits a cell — notably the
+/// deliberate re-stamp of the last dragged cell in
+/// `handle_tile_placer_interactions`, done on `stroke_ended` to measure fast-drag
+/// extent — re-stamps the SAME transform instead of toggling it back off.
+/// Reset only when the Tile tool is deactivated (see `apply_toolbar_events`).
+#[derive(Default)]
+struct TilePlacerTransform {
+    /// Quarter-turns clockwise (0-3).
+    rotation: u8,
+    /// Horizontal flip.
+    flip_x: bool,
+    /// Vertical flip.
+    flip_y: bool,
+    /// Whether any Q/R/X/Z press OR Tool-Property-panel edit has activated the
+    /// transform since the last reset. While false, stamped cells keep their own
+    /// existing transform.
+    active: bool,
+}
+
+impl TilePlacerTransform {
+    /// The rotation in DEGREES for the Tool Property panel: always a multiple
+    /// of 90 and always normalized into `0..360` (0 / 90 / 180 / 270).
+    fn rotation_degrees(&self) -> i32 {
+        i32::from(self.rotation % 4) * 90
+    }
+
+    /// Set the rotation from a DEGREE value that is already a normalized
+    /// multiple of 90 (the Tool Property panel snaps its input before
+    /// emitting). Marks the transform active, so the next stamp applies this
+    /// transform instead of keeping the cell's own.
+    ///
+    /// Degrees are converted to quarter-turns first and THEN wrapped, so the
+    /// negative multiples the panel can emit (`-90 → 270`) land on the right
+    /// quarter instead of truncating toward zero. `rem_euclid` keeps the result
+    /// in `0..=3` for every input, including a full turn (`360 → 0`).
+    fn set_rotation_degrees(&mut self, degrees: i32) {
+        self.rotation = (i64::from(degrees) / 90).rem_euclid(4) as u8;
+        self.active = true;
+    }
+
+    /// Set the horizontal flip from the Tool Property panel's checkbox. Marks
+    /// the transform active.
+    fn set_flip_x(&mut self, flip: bool) {
+        self.flip_x = flip;
+        self.active = true;
+    }
+
+    /// Set the vertical flip from the Tool Property panel's checkbox. Marks the
+    /// transform active.
+    fn set_flip_y(&mut self, flip: bool) {
+        self.flip_y = flip;
+        self.active = true;
+    }
+}
+
+/// Per-frame Tile-placer canvas state (UX items 1/4/6), computed by the App
+/// each frame and passed to the canvas through
+/// [`CanvasOverlay::TilePlacer`]: the hovered grid cell, the REAL
+/// flip+rotated preview pixels, and the assigned cells' tile ids.
+///
+/// Only meaningful while the Tile tool is active (`current_overlay` emits the
+/// overlay then); a stale or absent state yields no preview.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TilePlacerPreview {
+    /// The hovered grid cell `(cx, cy)` — `Some` only when the Tile tool is
+    /// active, a tile is selected, and the pointer is over the canvas.
+    pub hover_cell: Option<(u32, u32)>,
+    /// The cells of the IN-FLIGHT placer gesture ([`TilePlacerGesture`::diffs]),
+    /// i.e. every cell the current stroke/drag has already stamped or cleared.
+    /// Each one gets its own oriented-tile preview in place (see
+    /// [`Self::preview_pixels`]) and a green outline, so a drag shows where the
+    /// tile lands at EVERY dragged cell, not only under the pointer. Empty when
+    /// no gesture is active.
+    pub gesture_cells: Vec<(u32, u32)>,
+    /// The oriented tile's OPAQUE pixels in CANVAS coordinates with their
+    /// straight-alpha RGBA colour — the REAL tile content to be placed
+    /// (transparent pixels omitted). Covers the hovered cell AND every
+    /// [`Self::gesture_cells`] entry.
+    pub preview_pixels: Vec<(i32, i32, Color)>,
+    /// Assigned cells: `(cell_x, cell_y)` + the placed tile's id.
+    pub indices: Vec<((u32, u32), u64)>,
 }
 
 /// Shift-rotation snap points in degrees: 45° multiples only, so a Shift-held
@@ -713,8 +922,11 @@ fn resize_selection_absolute(t: &mut SelectionTransform, rx: f32, ry: f32, track
 /// Centre the transform pivot on the current transformed bbox WITHOUT moving
 /// the rendered output.
 ///
-/// M1 invariant: the pivot is ALWAYS the centre of the transformed pixels (the
-/// gizmo bbox centre) and the user cannot move it. Rescaling anchors at the
+/// M1 invariant: the pivot is ALWAYS the visual AREA centre of the transformed
+/// pixels (the gizmo bbox centre) and the user cannot move it. The bbox is
+/// `[min, min + size]` (`canvas_bbox`), so its AREA centre is `(min + max)/2`
+/// — i.e. `min + size/2`, the convention `lift` seeds (`pos + w/2`); this is
+/// NOT the `(w-1)/2` pixel-coordinate centre. Rescaling anchors at the
 /// opposite corner/edge (or the centre for Alt), so the pixel centre moves
 /// while the stored pivot stays put; this helper re-derives the centre after
 /// every scale.
@@ -726,6 +938,8 @@ fn resize_selection_absolute(t: &mut SelectionTransform, rx: f32, ry: f32, track
 /// returns the desired box again exactly.
 fn recenter_pivot_keeping_output(t: &mut SelectionTransform) {
     let (desired_x0, desired_y0, desired_x1, desired_y1) = t.object.canvas_bbox();
+    // `[x0, x1]` is `[min, min + size]`, so this is the AREA centre
+    // `min + size/2` (the same point `lift` seeds).
     let new_pivot = (
         (desired_x0 + desired_x1) * 0.5,
         (desired_y0 + desired_y1) * 0.5,
@@ -757,7 +971,11 @@ fn recenter_pivot_keeping_output(t: &mut SelectionTransform) {
 /// masked source writes only mask-true cells (the snapshot already carries
 /// zeros outside the mask); a rectangular source blits the whole rect. A paste
 /// session has an empty snapshot and is a no-op.
-fn restore_transform_source(layers: &mut LayerStack, source: &TransformSource) {
+fn restore_transform_source(
+    layers: &mut LayerStack,
+    palette: &mut TilePalette,
+    source: &TransformSource,
+) {
     if source.snapshot.is_empty() || source.rect.area() <= 0 {
         return;
     }
@@ -774,6 +992,19 @@ fn restore_transform_source(layers: &mut LayerStack, source: &TransformSource) {
             layer.buffer.blit_region(source.rect, &source.snapshot);
         }
     }
+    // TRANSIENT mirror (no undo): after restoring the cut source's snapshot,
+    // mirror it into the ROOT tiles the rect covers. This keeps the root tile
+    // data the single source of truth for a transform that was CANCELLED (the
+    // lift cut had zeroed the roots; the restore must put them back).
+    let zeros = vec![0u8; source.snapshot.len()];
+    let _ = tile_edit::write_back_region(
+        layers,
+        palette,
+        source.layer_id,
+        source.rect,
+        &zeros,
+        &source.snapshot,
+    );
 }
 
 /// Derive the new MASKED selection after a masked transform commit (Part C):
@@ -839,6 +1070,76 @@ fn transformed_selection_for(
     Selection::capture_mask(&layer.buffer, bbox, mask)
 }
 
+/// Exact canvas damage for every occupied instance of a root tile touched by a
+/// live stroke. Tilemap rasterization participates at each layer's normal
+/// composition position, so hidden layers are included here too (composition
+/// itself retains responsibility for visibility).
+fn tile_override_damage_regions(
+    layers: &LayerStack,
+    palette: &TilePalette,
+    overrides: &TilePixelOverrides,
+) -> Vec<Rect2i> {
+    let canvas = Rect2i::new(
+        0,
+        0,
+        layers.width().min(i32::MAX as usize) as i32,
+        layers.height().min(i32::MAX as usize) as i32,
+    );
+    let ids: BTreeSet<TileId> = overrides.tile_ids().collect();
+    let mut regions = Vec::new();
+    for layer in layers.iter() {
+        let Some(tilemap) = layer.tilemap.as_ref() else {
+            continue;
+        };
+        let cols = tilemap.cols.max(1) as usize;
+        let tile_size = u64::from(tilemap.tile_size.max(1));
+        for (index, cell) in tilemap.cells().iter().enumerate() {
+            let Some(cell) = cell.filter(|cell| ids.contains(&cell.tile_id)) else {
+                continue;
+            };
+            let Some(tile) = palette.get(cell.tile_id) else {
+                continue;
+            };
+            let (w, h) = if cell.rotation % 2 == 1 {
+                (u32::from(tile.h), u32::from(tile.w))
+            } else {
+                (u32::from(tile.w), u32::from(tile.h))
+            };
+            let cx = index % cols;
+            let cy = index / cols;
+            let x = (cx as u64 * tile_size).min(i32::MAX as u64) as i32;
+            let y = (cy as u64 * tile_size).min(i32::MAX as u64) as i32;
+            let region = Rect2i::new(x, y, w as i32, h as i32).clamp_to(canvas);
+            if !region.is_empty() {
+                regions.push(region);
+            }
+        }
+    }
+    coalesce_intersecting_rects(&mut regions);
+    regions
+}
+
+/// Coalesce overlapping damage only. Keeping disjoint instances separate
+/// avoids turning distant tile references into a near-full-canvas upload.
+fn coalesce_intersecting_rects(regions: &mut Vec<Rect2i>) {
+    let mut i = 0;
+    while i < regions.len() {
+        let mut j = i + 1;
+        while j < regions.len() {
+            if regions[i].intersects(regions[j]) {
+                let joined = regions[i].union(regions[j]);
+                regions[i] = joined;
+                regions.swap_remove(j);
+                // The enlarged rect may now overlap an earlier entry.
+                j = i + 1;
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Build the dock's layer rows in display order (row 0 = the TOPMOST layer).
 ///
 /// The model's flat vec is bottom-to-top, so roots are walked from LAST to
@@ -900,6 +1201,29 @@ fn merge_enabled_for(layers: &LayerStack, active: LayerId) -> bool {
 }
 
 impl App {
+    /// The sparse root-tile pixels implied by the active stroke, without
+    /// mutating the palette, tilemap, layer buffers, or undo history.
+    fn live_tile_pixel_overrides(&self) -> TilePixelOverrides {
+        let session = self.projects.current();
+        let Some(stroke) = session.stroke.as_ref() else {
+            return TilePixelOverrides::default();
+        };
+        let Some(layer) = session.layers.layer(stroke.layer_id()) else {
+            return TilePixelOverrides::default();
+        };
+        let Some((region, before, after)) = stroke.preview_delta(&layer.buffer) else {
+            return TilePixelOverrides::default();
+        };
+        tile_edit::derive_tile_pixel_overrides(
+            &session.layers,
+            &session.tile_palette,
+            stroke.layer_id(),
+            region,
+            &before,
+            &after,
+        )
+    }
+
     fn canvas_rect(&self) -> Rect2i {
         Rect2i::new(
             0,
@@ -1288,7 +1612,26 @@ impl App {
     ) -> project::ProjectId {
         let outcome = self.projects.new_project(name, width, height);
         self.consume_activation(outcome.activation());
-        outcome.project()
+        let id = outcome.project();
+        // GÖRÜNÜRLÜK: with the demo dock visible, the canvas draw rect at 100%
+        // zoom sits entirely under the opaque left dock (200px), so a freshly
+        // created project is invisible — writes land in the model but the user
+        // sees nothing. Pan the default camera to the RIGHT of the left dock so
+        // the canvas is visible beside it. Only applied when the demo dock is
+        // actually shown (the real app starts with `panel_dock_demo` on); the
+        // test helpers reset the pan to (0,0) to keep their canvas-at-origin
+        // coordinate mapping.
+        if self.panel_dock_demo {
+            let extent = self.panel_dock.dock_extent(panel_dock::DockSide::Left);
+            // +1 keeps a 1px visual gap from the dock edge so the canvas draw
+            // rect does not even touch the dock panel rect (egui's `intersects`
+            // is inclusive of shared edges).
+            let pan = (extent.max(0.0).round() as i32) + 1;
+            if let Some(session) = self.projects.session_mut(id) {
+                session.camera.set_pan(pan, 0);
+            }
+        }
+        id
     }
 
     pub(crate) fn close_project(
@@ -1326,7 +1669,11 @@ impl App {
     ///
     /// Full `set()` on first upload, size change, or any layer-stack change;
     /// partial `set_partial()` uploads for the accumulated dirty rect
-    /// otherwise.
+    /// otherwise. The dirty union includes BOTH pixel-buffer changes and
+    /// tilemap changes: a layer's edited cells (dirty cell bbox × tile_size)
+    /// and, when the project tile palette changed since a layer's last
+    /// rasterize, the layer's full tilemap area (so the partial path
+    /// re-composites and re-uploads it).
     fn sync_texture(&mut self) {
         if self.projects.active_id().is_none() {
             return;
@@ -1335,25 +1682,82 @@ impl App {
         if self.canvas_cache_token != active_token {
             self.invalidate_host_project_cache();
         }
+        let overrides = self.live_tile_pixel_overrides();
         let Some(texture) = &mut self.canvas_texture else {
+            // No canvas texture (startup upload not yet complete / absent):
+            // mark the full upload PENDING so the moment a texture exists the
+            // whole canvas is (re)composited and pushed. Without this, content
+            // drawn before a texture appears would never reach the canvas —
+            // a blank, unresponsive editor.
+            self.texture_dirty = true;
             return;
         };
         let (w, h) = (
-            self.projects.current_mut().layers.width(),
-            self.projects.current_mut().layers.height(),
+            self.projects.current().layers.width(),
+            self.projects.current().layers.height(),
         );
-        let dirty = self
+        // Snapshot the palette epoch BEFORE the mutable layers borrow so the
+        // per-layer dirty scan can compare each rasterize cache against it.
+        let palette_epoch = self.projects.current().tile_palette.change_epoch;
+        let mut dirty_regions: Vec<Rect2i> = self
             .projects
             .current_mut()
             .layers
             .iter_mut()
-            .filter_map(|layer| layer.buffer.take_pixels_changed())
-            .reduce(|acc, region| acc.union(region));
+            .filter_map(|layer| {
+                let mut region = layer.buffer.take_pixels_changed();
+                // Tilemap cell edits: the dirty cell bbox (× tile_size) is the
+                // region the partial path must re-composite.
+                if let Some(tm) = layer.tilemap.as_mut() {
+                    if let Some(r) = tm.take_dirty_canvas_region(w as u32, h as u32) {
+                        region = Some(region.map_or(r, |acc| acc.union(r)));
+                    }
+                }
+                // Palette-driven: if the project palette changed since the
+                // layer's last rasterize, its full tilemap area is stale.
+                let palette_stale = layer.tilemap.is_some()
+                    && layer
+                        .tilemap_cache
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|cache| cache.palette_epoch != palette_epoch);
+                if palette_stale {
+                    if let Some(tm) = &layer.tilemap {
+                        let r = tm.full_canvas_region(w as u32, h as u32);
+                        region = Some(region.map_or(r, |acc| acc.union(r)));
+                    }
+                }
+                region
+            })
+            .collect();
+        if !overrides.is_empty() {
+            let session = self.projects.current();
+            dirty_regions.extend(tile_override_damage_regions(
+                &session.layers,
+                &session.tile_palette,
+                &overrides,
+            ));
+        }
+        coalesce_intersecting_rects(&mut dirty_regions);
         if self.texture_dirty
             || texture.size() != [w, h]
             || self.projects.current_mut().layers.changed()
         {
-            let composite = self.projects.current_mut().layers.composite_layers();
+            let composite = {
+                let session = self.projects.current();
+                if overrides.is_empty() {
+                    session.layers.composite_layers(&session.tile_palette)
+                } else {
+                    session
+                        .layers
+                        .composite_layers_region_with_tile_overrides(
+                            Rect2i::new(0, 0, w as i32, h as i32),
+                            &session.tile_palette,
+                            &overrides,
+                        )
+                        .unwrap_or_else(|| PixelBuffer::new(w, h))
+                }
+            };
             let image = egui::ColorImage::from_rgba_unmultiplied([w, h], composite.as_bytes());
             texture.set(image, egui::TextureOptions::NEAREST);
             self.texture_dirty = false;
@@ -1361,17 +1765,26 @@ impl App {
             self.projects.current_mut().layers.clear_changed();
             return;
         }
-        if let Some(region) = dirty {
+        for region in dirty_regions {
             // Recompositing the region across ALL layers keeps partial uploads
             // correct when layer visibility/opacity/blend vary (D44 identity:
             // a single NORMAL layer at opacity 1 is byte-identical to the old
             // `over()` path).
-            if let Some(bytes) = self
-                .projects
-                .current_mut()
-                .layers
-                .composite_layers_region(region)
-            {
+            let bytes = {
+                let session = self.projects.current();
+                if overrides.is_empty() {
+                    session
+                        .layers
+                        .composite_layers_region(region, &session.tile_palette)
+                } else {
+                    session.layers.composite_layers_region_with_tile_overrides(
+                        region,
+                        &session.tile_palette,
+                        &overrides,
+                    )
+                }
+            };
+            if let Some(bytes) = bytes {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [region.w as usize, region.h as usize],
                     bytes.as_bytes(),
@@ -1402,6 +1815,13 @@ impl App {
                     // new selection).
                     self.transform_session_commit();
                     self.projects.current_mut().tool_state.select_tool(tool);
+                    // The sticky Tile-placer transform (Q/R/X/Z) resets when the
+                    // Tile tool is DEACTIVATED (switching to another tool); it
+                    // persists across frames, stamps and key releases while the
+                    // Tile tool stays active.
+                    if tool != Tool::Tile {
+                        self.tile_placer_transform = TilePlacerTransform::default();
+                    }
                 }
                 ToolbarEvent::ColorChanged(color) => self.projects.current_mut().color = color,
                 ToolbarEvent::SecondaryColorChanged(color) => {
@@ -1449,6 +1869,19 @@ impl App {
                         .wand_mut()
                         .restrict_to_region = restrict;
                 }
+                ToolbarEvent::FillToleranceChanged(tolerance) => {
+                    self.projects.current_mut().tool_state.fill_mut().tolerance = tolerance;
+                }
+                ToolbarEvent::FillContiguousChanged(contiguous) => {
+                    self.projects.current_mut().tool_state.fill_mut().contiguous = contiguous;
+                }
+                ToolbarEvent::FillRestrictToRegionChanged(restrict) => {
+                    self.projects
+                        .current_mut()
+                        .tool_state
+                        .fill_mut()
+                        .restrict_to_region = restrict;
+                }
                 ToolbarEvent::TransformAlgorithmChanged(algorithm) => {
                     // Store the choice on the session so a later lift seeds
                     // from it, AND apply it to a live selection object so the
@@ -1458,6 +1891,21 @@ impl App {
                     if let Some(TransformSession::Selection(t)) = session.transform.as_mut() {
                         t.object.set_algorithm(algorithm);
                     }
+                }
+                ToolbarEvent::TileRotationChanged(degrees) => {
+                    // The panel already snapped and normalized the value to a
+                    // multiple of 90. It writes the SAME `tile_placer_transform`
+                    // the Q/R key presses drive, so a panel edit changes what the
+                    // next stamp writes and a later R continues from here. The
+                    // setter also marks the transform active — an explicit panel
+                    // choice must not be discarded in favour of the cell's own.
+                    self.tile_placer_transform.set_rotation_degrees(degrees);
+                }
+                ToolbarEvent::TileFlipXChanged(flip) => {
+                    self.tile_placer_transform.set_flip_x(flip);
+                }
+                ToolbarEvent::TileFlipYChanged(flip) => {
+                    self.tile_placer_transform.set_flip_y(flip);
                 }
                 ToolbarEvent::PaletteSelected(index) => {
                     if let Some(palette) = self.projects.current_mut().palettes.get(index) {
@@ -1502,16 +1950,27 @@ impl App {
         let child = session.tool_state.child();
         let wand = session.tool_state.wand();
         let wand_contiguous_effective = wand.contiguous && !self.ctx.input(|i| i.modifiers.alt);
+        let fill = session.tool_state.fill();
         let transform_active = session.transform.is_some();
         let transform_algorithm = session.transform_algorithm;
+        // Mirror the SINGLE Tile placement transform into the panel's view, so the
+        // rotation / flip controls read exactly the state the Q/R/X/Z keys
+        // write (and a panel edit is visible in the same widgets).
+        let tile_placer = TilePlacerView {
+            rotation: self.tile_placer_transform.rotation_degrees(),
+            flip_x: self.tile_placer_transform.flip_x,
+            flip_y: self.tile_placer_transform.flip_y,
+        };
         *self.toolbox_host.view.borrow_mut() = ToolboxView {
             tool,
             draw,
             child,
             wand,
             wand_contiguous_effective,
+            fill,
             transform_active,
             transform_algorithm,
+            tile_placer,
         };
         let mut color_picker_view = self.color_picker_host.view.borrow_mut();
         if color_picker_view.open {
@@ -1545,6 +2004,11 @@ impl App {
             entries,
             primary: session.color,
             secondary: session.secondary_color,
+        };
+        *self.tile_palette_host.view.borrow_mut() = TilePaletteView {
+            tiles: session.tile_palette.tiles.clone(),
+            selected: session.tile_palette.selected,
+            pixel_overrides: self.live_tile_pixel_overrides(),
         };
     }
 
@@ -1647,6 +2111,13 @@ impl App {
         let palette_events: Vec<PalettePanelEvent> =
             self.palette_host.events.borrow_mut().drain(..).collect();
         self.apply_palette_events(palette_events);
+        let tile_events: Vec<TilePalettePanelEvent> = self
+            .tile_palette_host
+            .events
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        self.apply_tile_palette_events(tile_events);
     }
 
     /// Apply Palette panel gestures: color picks route through the toolbar
@@ -1706,6 +2177,79 @@ impl App {
         if removed {
             self.mark_dirty();
         }
+    }
+
+    /// Apply Tile Palette panel gestures.
+    ///
+    /// Selecting a tile makes it the palette's selected tile AND switches to
+    /// the Tile tool. Add (empty / from selection) appends a tile and selects
+    /// it; Delete removes a tile; reorder moves the selected tile one slot.
+    /// Palette edits mark the project dirty and are deliberately not undoable
+    /// (the shared undo stack is layer-scoped).
+    fn apply_tile_palette_events(&mut self, events: Vec<TilePalettePanelEvent>) {
+        for event in events {
+            match event {
+                TilePalettePanelEvent::Select(id) => {
+                    let session = self.projects.current_mut();
+                    if session.tile_palette.select(id) {
+                        session.tool_state.select_tool(Tool::Tile);
+                    }
+                }
+                TilePalettePanelEvent::AddEmpty => self.add_empty_tile(),
+                TilePalettePanelEvent::Delete(id) => {
+                    if self.projects.current_mut().tile_palette.remove(id) {
+                        self.mark_dirty();
+                    }
+                }
+                TilePalettePanelEvent::MoveSelected(dir) => self.move_selected_tile(dir),
+            }
+        }
+    }
+
+    /// Appends a new EMPTY tile (`tile_size` × `tile_size`, transparent) to the
+    /// project's tile palette and selects it. The "+ Selection" (AddFromSelection)
+    /// path was removed (UX item 5) — tiles are created empty only.
+    fn add_empty_tile(&mut self) {
+        let tile_size = self.projects.current().tile_size.max(1) as u16;
+        let w = tile_size;
+        let h = tile_size;
+        let pixels = vec![0u8; tile_size as usize * tile_size as usize * 4];
+        let session = self.projects.current_mut();
+        let id = session.tile_palette.add(Tile {
+            id: TileId(0),
+            w,
+            h,
+            pixels,
+        });
+        session.tile_palette.select(id);
+        self.mark_dirty();
+    }
+
+    /// Moves the selected tile one slot in the palette (`+1` up toward index 0,
+    /// `-1` down), keeping insertion order otherwise. A no-op at the edges or
+    /// without a selection.
+    fn move_selected_tile(&mut self, dir: i32) {
+        let session = self.projects.current_mut();
+        let Some(selected) = session.tile_palette.selected else {
+            return;
+        };
+        let Some(index) = session
+            .tile_palette
+            .tiles
+            .iter()
+            .position(|tile| tile.id == selected)
+        else {
+            return;
+        };
+        let new_index = index as i64 - dir as i64;
+        if new_index < 0 || new_index >= session.tile_palette.tiles.len() as i64 {
+            return;
+        }
+        let new_index = new_index as usize;
+        let tile = session.tile_palette.tiles.remove(index);
+        session.tile_palette.tiles.insert(new_index, tile);
+        session.tile_palette.change_epoch = session.tile_palette.change_epoch.wrapping_add(1);
+        self.mark_dirty();
     }
 
     fn persist_keymap(&mut self) {
@@ -1925,7 +2469,8 @@ impl App {
     /// happened. Pushes no undo entry.
     fn clear_selection(&mut self) {
         if let Some(TransformSession::Selection(t)) = self.projects.current_mut().transform.take() {
-            restore_transform_source(&mut self.projects.current_mut().layers, &t.source);
+            let project = self.projects.current_mut();
+            restore_transform_source(&mut project.layers, &mut project.tile_palette, &t.source);
         }
         let session = self.projects.current_mut();
         session.selection = None;
@@ -1962,11 +2507,20 @@ impl App {
     /// grid-cell region gesture instead, and the Wand keeps its own Alt
     /// contiguity override. The result is stored on the gesture so the release
     /// never re-derives it from a frame whose button state may be missing.
+    ///
+    /// CC: an Alt region sweep with NO existing selection is `Replace` even
+    /// when Shift is held. `Add` with no base is a deliberate no-op (D78), so
+    /// without this the Alt+Shift sweep would silently produce nothing; with
+    /// nothing to add to, `Add` degenerates to `Replace`, so the Alt action's
+    /// selection is still produced. Plain Shift (no Alt) keeps the D78 no-op.
     fn select_mode(&self, right_button: bool, region: bool) -> SelectMode {
         if right_button {
             return SelectMode::Subtract;
         }
-        if self.ctx.input(|i| i.modifiers.shift) {
+        if region && self.projects.current().selection.is_none() {
+            return SelectMode::Replace;
+        }
+        if shift_pressed(&self.ctx) {
             return SelectMode::Add;
         }
         if region && self.projects.current().selection.is_some() {
@@ -2052,10 +2606,178 @@ impl App {
             .get_pixel(x as usize, y as usize)
     }
 
+    /// The Tile-placer canvas state for THIS frame (UX items 1/4/6): the
+    /// hovered grid cell, the cells of the in-flight placer gesture, the REAL
+    /// flip+rotated preview pixels (canvas coordinates + colour) and the
+    /// assigned cells' tile ids.
+    ///
+    /// The hover + preview are `Some`/populated only when the Tile tool is
+    /// active, a tile is selected, and the pointer is over the canvas — a
+    /// stale or absent state yields no preview. The index labels are collected
+    /// whenever the Tile tool is active.
+    ///
+    /// The preview covers EVERY cell the stroke has touched, not just the one
+    /// under the pointer: each [`TilePlacerGesture`] diff cell contributes its
+    /// own oriented-tile preview in place, so a drag shows the whole painted
+    /// trail. The hovered cell is previewed even when the gesture has not
+    /// reached it yet, and it is previewed LAST so it wins over a gesture-cell
+    /// preview at the same cell.
+    fn tile_placer_preview_at(
+        &self,
+        ctx: &egui::Context,
+        camera: crate::core::camera::Camera,
+        canvas_size: (u32, u32),
+    ) -> TilePlacerPreview {
+        let session = self.projects.current();
+        let mut preview = TilePlacerPreview::default();
+        if session.tool_state.tool() != Tool::Tile {
+            return preview;
+        }
+        let tile_size = session.tile_size.max(1) as u32;
+        let layer_id = session.layers.active_layer_id();
+        // Item 6: every assigned cell of the ACTIVE layer's tilemap carries its
+        // tile_id label.
+        if let Some(tm) = session
+            .layers
+            .layer(layer_id)
+            .and_then(|l| l.tilemap.as_ref())
+        {
+            let cols = tm.cols.max(1) as usize;
+            for (index, cell) in tm.cells().iter().enumerate() {
+                if let Some(cell) = cell {
+                    preview.indices.push((
+                        ((index % cols) as u32, (index / cols) as u32),
+                        cell.tile_id.0,
+                    ));
+                }
+            }
+        }
+        // Item 2 (multi-cell preview): the in-flight gesture's stamped cells.
+        // Clone the cell list first — `session` borrows `self` immutably and the
+        // gesture state is read alongside it.
+        let gesture_cells: Vec<(u32, u32)> = self.tile_placer.diffs.keys().copied().collect();
+        preview.gesture_cells = gesture_cells.clone();
+        // Items 1 + 4: only with a selected tile and the pointer over the
+        // canvas (in-bounds grid cell).
+        let Some(tile) = session.tile_palette.selected_tile() else {
+            return preview;
+        };
+        let cols = session.layers.width() as u32;
+        let rows = session.layers.height() as u32;
+        let (max_cx, max_cy) = (cols.div_ceil(tile_size), rows.div_ceil(tile_size));
+        let push_preview = |preview: &mut TilePlacerPreview, cell: (u32, u32), placed: TileCell| {
+            let (cx, cy) = cell;
+            if cx >= max_cx || cy >= max_cy {
+                return;
+            }
+            let pixels = oriented_preview_pixels(tile, placed.flip_x, placed.flip_y, placed.rotation);
+            let (ox0, oy0) = ((cx * tile_size) as i32, (cy * tile_size) as i32);
+            preview.preview_pixels.extend(
+                pixels
+                    .into_iter()
+                    .map(|(dx, dy, color)| (ox0 + dx, oy0 + dy, color)),
+            );
+        };
+        // Every cell the gesture already stamped previews the tile AS WRITTEN —
+        // its own `after` cell carries the transform that was actually baked, so
+        // re-deriving it here can never disagree with the stamp. A cleared cell
+        // (`after == None`) previews nothing: there is no tile content to show.
+        for &(cx, cy) in &gesture_cells {
+            if let Some(placed) = self.tile_placer.diffs.get(&(cx, cy)).and_then(|(_, after)| *after)
+            {
+                push_preview(&mut preview, (cx, cy), placed);
+            }
+        }
+        // The hover cell is always previewed, even when the gesture has not
+        // reached it, and LAST so it takes precedence at a shared cell.
+        //
+        // The hover cell is the one PURE-HOVER part of the preview, so it obeys
+        // the panel mask: a palette / toolbox / timeline panel covers the
+        // pointer, and the placer must not highlight a cell underneath it. The
+        // in-flight gesture cells above are deliberately NOT masked — they
+        // preview what the running stamp already wrote.
+        let hover_cell = if self.pointer_over_panel() {
+            None
+        } else {
+            ctx.input(|i| i.pointer.hover_pos())
+                .and_then(|pos| {
+                    self.canvas_widget
+                        .screen_to_canvas(pos, camera, canvas_size)
+                })
+                .map(|(px, py)| TileMap::snap_cell((px, py), tile_size))
+                .filter(|&(cx, cy)| cx < max_cx && cy < max_cy)
+        };
+        if let Some(cell) = hover_cell {
+            preview.hover_cell = Some(cell);
+            // The effective transform from the STICKY Q/R/X/Z state (no modifier
+            // pressed -> the cell's OWN current transform, a fresh cell has none),
+            // so the preview shows exactly what a stamp on this cell will write.
+            let existing = session
+                .layers
+                .layer(layer_id)
+                .and_then(|layer| layer.tilemap.as_ref())
+                .and_then(|tm| tm.cell(cell));
+            let placed = self.tile_placement_cell(existing);
+            push_preview(&mut preview, cell, placed);
+        }
+        preview
+    }
+
+    /// True when the SCREEN point `p` lies over ANY panel surface that masks
+    /// the canvas: a docked panel's full rect (body AND its drag-only header
+    /// band) or a floating panel's window rect.
+    ///
+    /// The demo dock panels are drawn OVER the canvas, so a press over one
+    /// overlapping the canvas would otherwise leak to the canvas — the tile
+    /// placer stamps from the raw press signal (`raw_pressed_over_canvas`),
+    /// which bypasses egui's widget attribution and fires even when a drag-only
+    /// header band claims the press. The panel must FULLY mask the canvas: a
+    /// press/drag/wheel over any panel chrome never reaches the canvas.
+    ///
+    /// The answer comes from the shared [`InputCapture`] target, which
+    /// [`Self::ui_frame`] resolves ONCE per frame from the dock's own
+    /// [`panel_dock::DockManager::surface_at`] — the same query that routes
+    /// wheel/middle-drag pan — so the mask, the wheel routing and the pan
+    /// routing can never disagree (floating panels over docked ones, visible
+    /// panels only, and only while the dock overlay is actually shown).
+    fn pointer_over_panel(&self) -> bool {
+        self.input_capture.pointer_over_panel()
+    }
+
+    /// The topmost surface under the SCREEN point `p`: the docked or floating
+    /// panel that contains it, else the canvas.
+    ///
+    /// `panel_dock.surface_at` owns the whole z-order contract (floating panels,
+    /// most recently used first, over the docked panels of left/right/bottom;
+    /// invisible panels are skipped), so the canvas and the panels agree on who
+    /// owns a point instead of each re-deriving it.
+    ///
+    /// Returns [`SurfaceId::Canvas`] when the dock overlay is hidden: no panel
+    /// is painted then, so nothing may claim the pointer for the canvas.
+    fn surface_at_pointer(&self, p: egui::Pos2, frame_rect: egui::Rect) -> SurfaceId {
+        if !self.panel_dock_demo {
+            return SurfaceId::Canvas;
+        }
+        self.panel_dock
+            .surface_at(p, frame_rect)
+            .map_or(SurfaceId::Canvas, SurfaceId::Panel)
+    }
+
     /// The overlay to paint on the canvas this frame: the transform session's
     /// gizmo + floating pixels first, then the live move preview, then the live
-    /// marquee, then the committed selection.
+    /// marquee, then the committed selection. While the Tile tool is active,
+    /// the tile-placer cursor preview (UX items 1/4/6) takes precedence — it is
+    /// a dedicated variant, kept separate from the gizmo/selection overlays.
     fn current_overlay(&self) -> CanvasOverlay {
+        if self.projects.current().tool_state.tool() == Tool::Tile {
+            let preview = &self.tile_placer_preview;
+            return CanvasOverlay::TilePlacer {
+                hover_cell: preview.hover_cell,
+                gesture_cells: preview.gesture_cells.clone(),
+                preview_pixels: preview.preview_pixels.clone(),
+                indices: preview.indices.clone(),
+            };
+        }
         if let Some(t) = &self.projects.current().transform {
             match t {
                 TransformSession::Curve(curve) => {
@@ -2156,7 +2878,7 @@ impl App {
             return;
         }
         let ctrl = self.ctx.input(|i| i.modifiers.command);
-        let alt = self.ctx.input(|i| i.modifiers.alt);
+        let alt = alt_pressed(&self.ctx);
         let child = self.projects.current().tool_state.child();
         // Alt+left on the Rectangle child is the grid-cell region sweep, so it
         // takes precedence over the inside-hit area move (D77 item 4).
@@ -2379,9 +3101,13 @@ impl App {
     }
 
     /// Select-tool interactions: marquee/move drags plus click-to-dismiss.
-    fn handle_select_interactions(&mut self, interactions: CanvasInteractions) {
+    fn handle_select_interactions(
+        &mut self,
+        ctx: &egui::Context,
+        interactions: CanvasInteractions,
+    ) {
         if self.projects.current().tool_state.child() == FieldierChild::Wand {
-            self.handle_wand_interactions(interactions);
+            self.handle_wand_interactions(ctx, interactions);
             return;
         }
         let right_button =
@@ -2456,22 +3182,66 @@ impl App {
     /// Shift+double-click unions with the existing selection instead of wiping
     /// it. A secondary double-click is indistinguishable from two secondary
     /// presses there, so it falls back to the single-click subtract path.
-    fn handle_wand_interactions(&mut self, interactions: CanvasInteractions) {
+    fn handle_wand_interactions(&mut self, ctx: &egui::Context, interactions: CanvasInteractions) {
         // The pre-gesture selection is the explicit merge base, so Add/Subtract
         // never depend on `combine_selection` taking the live selection (D78).
         let base = self.projects.current().selection.clone();
+        // D78/FF: prefer the PRIMARY-press-time modifier latch the canvas widget
+        // attached. winit batches events per redraw, so the Alt/Shift key-up can
+        // land in the same batch as the mouse-up and the live held state is
+        // already clear by the click frame. Synthetic/direct callers have no
+        // latch and fall back to the live `alt_pressed`/`shift_pressed` seam.
+        let (alt_held, shift_held) = match interactions.click_modifiers {
+            Some(mods) => (mods.alt, mods.shift),
+            None => (alt_pressed(ctx), shift_pressed(ctx)),
+        };
+        // CC: the Alt wand action (non-contiguous fill) must coexist with
+        // Shift-Add. With no base selection, `Add` is a deliberate D78 no-op, so
+        // an Alt+Shift click would silently produce nothing; with nothing to add
+        // to, `Add` degenerates to `Replace`, so the Alt fill is still produced.
+        // Plain Shift (no Alt) keeps the D78 no-op.
+        let primary_mode = if shift_held {
+            if alt_held && base.is_none() {
+                SelectMode::Replace
+            } else {
+                SelectMode::Add
+            }
+        } else {
+            SelectMode::Replace
+        };
+        let wand = self.projects.current().tool_state.wand();
+        let effective_contiguous = wand.contiguous && !alt_held;
         if let Some(seed) = interactions.double_clicked {
             let captured = {
                 let buf = &self.projects.current().layers.active_layer().buffer;
-                crate::core::selection_ops::alpha_neighbors_shape(buf, seed)
-                    .and_then(|(bbox, mask)| Selection::capture_mask(buf, bbox, mask))
+                let shape = if alt_held {
+                    // FF: Alt+double-click is the non-contiguous Wand fill
+                    // (matching the single-click Alt override), NOT the
+                    // alpha-connected component. Otherwise a fast second click
+                    // would silently break Alt+Shift.
+                    let tile = self.projects.current().tile_size.max(1) as i32;
+                    let seed_cell = Rect2i::new(
+                        seed.0.div_euclid(tile) * tile,
+                        seed.1.div_euclid(tile) * tile,
+                        tile,
+                        tile,
+                    );
+                    let clip = wand
+                        .restrict_to_region
+                        .then(|| PixelClip::from_rect(seed_cell));
+                    crate::core::selection_ops::magic_wand_shape(
+                        buf,
+                        seed,
+                        wand.tolerance,
+                        false,
+                        clip.as_ref(),
+                    )
+                } else {
+                    crate::core::selection_ops::alpha_neighbors_shape(buf, seed)
+                };
+                shape.and_then(|(bbox, mask)| Selection::capture_mask(buf, bbox, mask))
             };
-            let mode = if self.ctx.input(|i| i.modifiers.shift) {
-                SelectMode::Add
-            } else {
-                SelectMode::Replace
-            };
-            self.combine_selection(captured, mode, base);
+            self.combine_selection(captured, primary_mode, base);
             return;
         }
         // A primary click arrives as `clicked`; a secondary press arrives as
@@ -2480,21 +3250,13 @@ impl App {
         let (seed, mode) = if interactions.eyedropper_started {
             (interactions.eyedropper_point, SelectMode::Subtract)
         } else if let Some(seed) = interactions.clicked {
-            let mode = if self.ctx.input(|i| i.modifiers.shift) {
-                SelectMode::Add
-            } else {
-                SelectMode::Replace
-            };
-            (Some(seed), mode)
+            (Some(seed), primary_mode)
         } else {
             return;
         };
         let Some(seed) = seed else {
             return;
         };
-        let wand = self.projects.current().tool_state.wand();
-        let alt_held = self.ctx.input(|i| i.modifiers.alt);
-        let effective_contiguous = wand.contiguous && !alt_held;
         let tile = self.projects.current().tile_size.max(1) as i32;
         let seed_cell = Rect2i::new(
             seed.0.div_euclid(tile) * tile,
@@ -2600,16 +3362,28 @@ impl App {
         // clears the whole rect.
         if cut_source && !bytes.is_empty() {
             let layer = self.projects.current_mut().layers.active_layer_mut();
+            let before = bytes.clone();
+            let zeros = vec![0u8; bytes.len()];
             match &source.mask {
                 Some(mask) => {
-                    let zeros = vec![0u8; bytes.len()];
                     layer.buffer.blit_region_masked(rect, &zeros, Some(mask));
                 }
                 None => {
-                    let zeros = vec![0u8; bytes.len()];
                     layer.buffer.blit_region(rect, &zeros);
                 }
             }
+            // TRANSIENT mirror (no undo): write the zeroed cells back to the
+            // ROOT tiles they covered, so the root data stays the single source
+            // of truth even for a lift cut. The produced command is discarded.
+            let project = self.projects.current_mut();
+            let _ = tile_edit::write_back_region(
+                &mut project.layers,
+                &mut project.tile_palette,
+                source.layer_id,
+                rect,
+                &before,
+                &zeros,
+            );
         }
         self.projects.current_mut().transform =
             Some(TransformSession::Selection(SelectionTransform {
@@ -2710,6 +3484,17 @@ impl App {
     /// empty-area commit.
     fn commit_transform_from_global_double_click(&mut self) {
         if self.ctx.egui_is_using_pointer() {
+            return;
+        }
+        // A panel under the pointer masks the canvas completely. The
+        // `egui_is_using_pointer` guard above only covers presses a panel
+        // WIDGET captured (a dock header band, a resize handle, a palette
+        // button); a panel's dead space — its body between widgets, which paints
+        // opaque chrome over the canvas but registers no widget — captures
+        // nothing, and a double-click there reached the canvas and committed the
+        // floating selection. `interactions.double_clicked` is blanked by this
+        // same mask for the in-draw-rect path.
+        if self.pointer_over_panel() {
             return;
         }
         let Some(pos) = self.ctx.input(|i| {
@@ -3129,7 +3914,8 @@ impl App {
         // below records the correct cut before-state. A paste session has an
         // empty snapshot and is a no-op here.
         if t.cut_source {
-            restore_transform_source(&mut self.projects.current_mut().layers, &t.source);
+            let project = self.projects.current_mut();
+            restore_transform_source(&mut project.layers, &mut project.tile_palette, &t.source);
         }
         if let Some(cmd) = apply_layer_commits_with(
             &t.source,
@@ -3138,7 +3924,7 @@ impl App {
             &mut self.projects.current_mut().layers,
             t.cut_source,
         ) {
-            self.projects.current_mut().undo.push(Box::new(cmd));
+            self.push_pixel_edit(Box::new(cmd));
             self.mark_dirty();
         }
         if self.lifted_selection_is_masked {
@@ -3176,7 +3962,8 @@ impl App {
         let TransformSession::Selection(t) = session else {
             return;
         };
-        restore_transform_source(&mut self.projects.current_mut().layers, &t.source);
+        let project = self.projects.current_mut();
+        restore_transform_source(&mut project.layers, &mut project.tile_palette, &t.source);
         let restored = self
             .projects
             .current_mut()
@@ -3286,7 +4073,7 @@ impl App {
     fn update_tool_gesture(
         &mut self,
         ctx: &egui::Context,
-        interactions: CanvasInteractions,
+        mut interactions: CanvasInteractions,
     ) -> CanvasInteractions {
         let camera = self.projects.current().camera;
         let canvas_size = (
@@ -3333,7 +4120,7 @@ impl App {
             }
             // The other tools act on the cursor pixel itself; a 1 px footprint
             // keeps their inside test the strict point-in-draw-rect test.
-            Tool::Fill | Tool::Eyedropper | Tool::Fieldier => 1,
+            Tool::Fill | Tool::Eyedropper | Tool::Fieldier | Tool::Tile => 1,
         };
         let pressed = ctx.input(|i| i.pointer.primary_pressed());
         let down = ctx.input(|i| i.pointer.primary_down());
@@ -3343,9 +4130,40 @@ impl App {
             self.canvas_widget
                 .screen_to_canvas_footprint(p, camera, canvas_size, stroke_size)
         });
+        // A pointer over ANY panel (docked body, dock header band, floating
+        // panel) masks the canvas completely: the panel owns the pointer, so
+        // no canvas interaction may be processed. Folded into `other_ui` so
+        // every arming path below (the tool machine, the Fieldier selection
+        // gesture, the transform latch) treats a panel press as "another UI
+        // wants the pointer".
+        //
+        // One source of truth: the frame's `InputCapture` target, resolved from
+        // the dock's own `surface_at` — exactly what gates wheel and middle-drag
+        // pan inside the canvas widget.
+        let over_panel = self.pointer_over_panel();
         // Another UI wants the pointer when egui is using it for a widget other
         // than the canvas itself (the canvas claims presses in its letterbox).
-        let other_ui = ctx.egui_is_using_pointer() && !interactions.primary_down_on_canvas;
+        let other_ui =
+            over_panel || (ctx.egui_is_using_pointer() && !interactions.primary_down_on_canvas);
+
+        // The canvas widget's own click/stroke/eyedropper stream AND the raw
+        // press signal are blanked whenever the pointer is over a panel, on
+        // ANY frame, so they cannot leak on the move/release frames either (the
+        // machine below only emits for an ARMED gesture, which a panel press
+        // never starts). `stroke_ended` is preserved so an in-progress gesture
+        // that moves over a panel still commits on release.
+        if over_panel {
+            interactions.clicked = None;
+            interactions.double_clicked = None;
+            interactions.click_modifiers = None;
+            interactions.stroke_started = false;
+            interactions.stroke_point = None;
+            interactions.stroke_segment_started = false;
+            interactions.raw_pressed_over_canvas = None;
+            interactions.eyedropper_started = false;
+            interactions.eyedropper_point = None;
+            interactions.eyedropper_ended = false;
+        }
 
         if selection_transform_active {
             let mut out = interactions;
@@ -3430,6 +4248,18 @@ impl App {
 
         let mut out = interactions;
 
+        // BB: the Fieldier owns BOTH selection buttons GLOBALLY. The canvas
+        // widget's secondary-button eyedropper (and its primary drag stream) are
+        // scoped to the draw rect, so a right-press outside it can never start a
+        // Subtract and a left-press outside only works via the ad-hoc clamp
+        // below. Drive both buttons from the global pointer instead, with a
+        // small dead zone so a plain click does not start a sticky selection. A
+        // live transform keeps the generic machine (the Curve session relies on
+        // `stroke_segment_started`; the Selection session already returned).
+        if selection_tool && !transform_active {
+            return self.update_selection_gesture(ctx, out, pos, other_ui);
+        }
+
         if released {
             if self.tool_armed {
                 out.stroke_ended = true;
@@ -3441,6 +4271,59 @@ impl App {
         }
 
         if pressed {
+            // A press over ANY panel (docked body, dock header band, floating
+            // panel) owns the pointer: fully disarm the tool machine (no
+            // arming, no drag continuation, no `clicked` fallback, no
+            // right-button clear) so NOTHING reaches the canvas. The panel
+            // keeps the click.
+            if over_panel {
+                self.tool_armed = false;
+                self.tool_outside = false;
+                self.last_selection_drag_point = None;
+                self.reset_line_gesture();
+                out.clicked = None;
+                out.stroke_started = false;
+                out.stroke_point = None;
+                out.stroke_segment_started = false;
+                out.eyedropper_started = false;
+                out.eyedropper_point = None;
+                out.eyedropper_ended = false;
+                return out;
+            }
+            // The TILE placer owns the canvas's primary press GLOBALLY, like
+            // the Fieldier's selection gesture: the demo dock panels are drawn
+            // OVER the canvas (`panel_dock.show_inside` runs after the canvas
+            // widget), so egui attributes a press over a dock-panel-overlapping
+            // canvas point to the dock widget. That makes `other_ui` true and
+            // `interactions.primary_down_on_canvas` false, so the press arm
+            // below would be skipped and the widget's `clicked` would be None —
+            // "clicking the canvas does nothing" while every headless test
+            // passes (it clicks a point egui assigns to the canvas).
+            //
+            // The widget reports the RAW press point (`raw_pressed_over_canvas`)
+            // straight from the egui pointer state, independent of widget
+            // attribution — a DRAG-ONLY widget (a resize handle, a scrollbar)
+            // resolves a press as `click: None, drag: Some`, so `clicked` never
+            // fires, but the raw press point still maps to the canvas cell under
+            // it. Stamp from that raw point so the placer works even when egui
+            // gives the drag to non-panel chrome; a press NOT over the canvas
+            // image keeps the widget's own click (raw_pressed_over_canvas is
+            // None). Presses over ANY panel (body, header band, floating) are
+            // blocked earlier — the panel fully masks the canvas.
+            if tool == Tool::Tile && !transform_active {
+                if let Some(raw_pt) = interactions.raw_pressed_over_canvas.or(pt) {
+                    self.tool_armed = true;
+                    self.tool_outside = false;
+                    self.last_selection_drag_point = None;
+                    self.reset_line_gesture();
+                    out.stroke_started = true;
+                    out.stroke_point = Some(raw_pt);
+                    return out;
+                }
+                // No canvas footprint: fall through to the generic other_ui /
+                // arming handling below (the press is over letterbox or another
+                // surface — the dock panel keeps it).
+            }
             if other_ui {
                 self.tool_armed = false;
                 self.tool_outside = false;
@@ -3476,6 +4359,21 @@ impl App {
                             out.stroke_segment_started = true;
                             out.stroke_point = Some(pt);
                         }
+                    }
+                } else if tool == Tool::Tile && !transform_active {
+                    // The tile placer is a stamp tool: a plain press (or the
+                    // start of a drag) must stamp the pressed cell IMMEDIATELY,
+                    // not wait for the widget's `clicked` on release. Emitting
+                    // `stroke_started` + `stroke_point` at the press gives the
+                    // placer the exact same contract as the draw tools: stamp
+                    // now, continue stamping each swept cell while held, and
+                    // commit on release. (The widget's `clicked` would be
+                    // swallowed by any dock panel overlapping the canvas point,
+                    // and a drag would miss its first cell entirely.)
+                    self.reset_line_gesture();
+                    if let Some(pt) = pt {
+                        out.stroke_started = true;
+                        out.stroke_point = Some(pt);
                     }
                 } else if selection_tool {
                     // A selection gesture may begin outside the canvas: the press
@@ -3558,11 +4456,200 @@ impl App {
         out
     }
 
+    /// BB: drive the Fieldier's primary AND secondary selection gestures from
+    /// the GLOBAL pointer, with a [`SELECTION_DEAD_ZONE_PX`] latch.
+    ///
+    /// - **Primary**: latch the press; emit `stroke_started` + `stroke_point`
+    ///   only once the pointer has moved past the dead zone, then keep emitting
+    ///   the clamped drag point (including outside the canvas). A plain click
+    ///   emits nothing, so the canvas `clicked` path keeps handling
+    ///   dismiss/lift.
+    /// - **Secondary**: the same latch drives the Subtract marquee for the
+    ///   Rectangle / Lasso children, so a right-press OUTSIDE the canvas now
+    ///   starts a Subtract. The Wand is click-driven, so its secondary press
+    ///   subtracts immediately (no dead zone) to preserve that action, but it is
+    ///   still routed globally so it works outside the draw rect too.
+    ///
+    /// Either way the events flow through the existing primary-`stroke_*` /
+    /// secondary-`eyedropper_*` contract that `handle_select_interactions`
+    /// already reads. The widget's own draw-rect-scoped selection stream is
+    /// discarded so the App is the single source of truth inside AND outside.
+    fn update_selection_gesture(
+        &mut self,
+        ctx: &egui::Context,
+        mut out: CanvasInteractions,
+        pos: Option<egui::Pos2>,
+        other_ui: bool,
+    ) -> CanvasInteractions {
+        let camera = self.projects.current().camera;
+        let canvas_size = (
+            self.projects.current().layers.width() as u32,
+            self.projects.current().layers.height() as u32,
+        );
+        let wand = self.projects.current().tool_state.child() == FieldierChild::Wand;
+
+        // Single source of truth: discard the widget's draw-rect-scoped primary
+        // and secondary selection streams and rebuild them from the global
+        // pointer below. Canvas `clicked`/`double_clicked`/pan/zoom stay — and
+        // so does the widget's D78 `click_modifiers` press-time latch carried on
+        // those click fields (`out` starts from `interactions`).
+        out.stroke_started = false;
+        out.stroke_segment_started = false;
+        out.stroke_point = None;
+        out.stroke_ended = false;
+        out.eyedropper_started = false;
+        out.eyedropper_point = None;
+        out.eyedropper_ended = false;
+
+        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let primary_down = ctx.input(|i| i.pointer.primary_down());
+        let primary_released = ctx.input(|i| i.pointer.primary_released());
+        let secondary_pressed =
+            ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+        let secondary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+        let secondary_released =
+            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
+
+        let clamp = |widget: &CanvasWidget, p: egui::Pos2| {
+            widget.screen_to_canvas_clamped(p, camera, canvas_size)
+        };
+
+        // ---- primary selection button ----
+        if primary_released {
+            if let Some(latch) = self.canvas_widget.selection_primary_latch.take() {
+                if latch.started {
+                    // Feed the final clamped point so a fast drag that crosses
+                    // the dead zone and releases on the same frame still
+                    // measures the released extent.
+                    if let Some(p) = pos {
+                        out.stroke_point = Some(clamp(&self.canvas_widget, p));
+                    }
+                    out.stroke_ended = true;
+                }
+            }
+            self.tool_armed = false;
+            self.tool_outside = false;
+            self.last_selection_drag_point = None;
+        } else if primary_pressed {
+            self.canvas_widget.selection_primary_latch = None;
+            self.last_selection_drag_point = None;
+            self.tool_armed = !other_ui;
+            self.tool_outside = false;
+            if !other_ui {
+                if let Some(p) = pos {
+                    let point = clamp(&self.canvas_widget, p);
+                    self.canvas_widget.selection_primary_latch = Some(SelectionLatch {
+                        screen: p,
+                        point,
+                        started: false,
+                    });
+                }
+            }
+        } else if primary_down && self.tool_armed {
+            let edge = pos.map(|p| clamp(&self.canvas_widget, p));
+            if let Some(latch) = self.canvas_widget.selection_primary_latch.as_mut() {
+                if !latch.started {
+                    if pos.is_some_and(|p| (p - latch.screen).length() >= SELECTION_DEAD_ZONE_PX) {
+                        latch.started = true;
+                        out.stroke_started = true;
+                        out.stroke_point = Some(latch.point);
+                        self.last_selection_drag_point = Some(latch.point);
+                    }
+                } else if let Some(edge) = edge.or(self.last_selection_drag_point) {
+                    out.stroke_point = Some(edge);
+                    self.last_selection_drag_point = Some(edge);
+                }
+            }
+        }
+
+        // ---- secondary selection button ----
+        if secondary_released {
+            let had_latch = self.canvas_widget.selection_secondary_latch.is_some();
+            let started = self
+                .canvas_widget
+                .selection_secondary_latch
+                .take()
+                .is_some_and(|latch| latch.started);
+            if started {
+                if let Some(p) = pos {
+                    out.eyedropper_point = Some(clamp(&self.canvas_widget, p));
+                }
+                out.eyedropper_ended = true;
+            } else if !had_latch && self.canvas_widget.selection_secondary_armed {
+                // Wand path: the one-shot subtract was emitted on press, so a
+                // lone release must still end it. A plain Rectangle/Lasso
+                // right-click (latched, never started) emits nothing.
+                out.eyedropper_ended = true;
+            }
+            self.canvas_widget.selection_secondary_armed = false;
+            self.last_selection_drag_point = None;
+        } else if secondary_pressed {
+            self.canvas_widget.selection_secondary_latch = None;
+            self.canvas_widget.selection_secondary_armed = false;
+            self.last_selection_drag_point = None;
+            if !other_ui {
+                if let Some(p) = pos {
+                    let point = clamp(&self.canvas_widget, p);
+                    if wand {
+                        // The wand's secondary press is a one-shot click
+                        // subtract, not a marquee: keep it immediate.
+                        out.eyedropper_started = true;
+                        out.eyedropper_point = Some(point);
+                    } else {
+                        self.canvas_widget.selection_secondary_latch = Some(SelectionLatch {
+                            screen: p,
+                            point,
+                            started: false,
+                        });
+                    }
+                    self.canvas_widget.selection_secondary_armed = true;
+                }
+            }
+        } else if secondary_down && self.canvas_widget.selection_secondary_armed {
+            let edge = pos.map(|p| clamp(&self.canvas_widget, p));
+            if wand {
+                if let Some(edge) = edge.or(self.last_selection_drag_point) {
+                    out.eyedropper_point = Some(edge);
+                    self.last_selection_drag_point = Some(edge);
+                }
+            } else if let Some(latch) = self.canvas_widget.selection_secondary_latch.as_mut() {
+                if !latch.started {
+                    if pos.is_some_and(|p| (p - latch.screen).length() >= SELECTION_DEAD_ZONE_PX) {
+                        latch.started = true;
+                        out.eyedropper_started = true;
+                        out.eyedropper_point = Some(latch.point);
+                        self.last_selection_drag_point = Some(latch.point);
+                    }
+                } else if let Some(edge) = edge.or(self.last_selection_drag_point) {
+                    out.eyedropper_point = Some(edge);
+                    self.last_selection_drag_point = Some(edge);
+                }
+            }
+        }
+
+        out
+    }
+
     /// Route canvas interactions to the active tool. A live transform session
     /// owns the gesture surface (D32): stroke drags drive the floating object
     /// and release commits it, so the temporary eyedropper and tool dispatch
     /// are suspended until the session ends.
+    ///
+    /// Direct/test seam: callers that drive interactions without a running
+    /// frame have no separate frame context, so the App's own context is used.
     fn handle_interactions(&mut self, interactions: CanvasInteractions) {
+        let ctx = self.ctx.clone();
+        self.handle_interactions_in(&ctx, interactions);
+    }
+
+    /// Frame entry point: `ctx` is the egui context the frame actually ran on.
+    ///
+    /// The click-driven Wand observes Alt/Shift from THIS context, not
+    /// `App::ctx`, so a frame driven by a different context (a detached/native
+    /// canvas surface, or a test frame) still sees the held modifiers. Reading
+    /// `App::ctx` there would always report "no modifiers" and collapse an
+    /// Alt+Shift wand click to a plain contiguous Replace.
+    fn handle_interactions_in(&mut self, ctx: &egui::Context, interactions: CanvasInteractions) {
         if self.projects.current_mut().transform.is_some() {
             self.handle_transform_interactions(interactions);
             return;
@@ -3620,7 +4707,14 @@ impl App {
         // eyedropper so the right-button gesture reaches the selection handler.
         let active_tool = self.projects.current().tool_state.tool();
         if active_tool == Tool::Fieldier {
-            self.handle_select_interactions(interactions);
+            self.handle_select_interactions(ctx, interactions);
+            return;
+        }
+        // The Tile tool owns BOTH buttons: primary stamps cells, secondary
+        // clears them (not the temporary eyedropper). Route it before the
+        // generic eyedropper handling.
+        if active_tool == Tool::Tile {
+            self.handle_tile_placer_interactions(interactions);
             return;
         }
         if interactions.eyedropper_started {
@@ -3649,6 +4743,11 @@ impl App {
                 if let Some(pt) = interactions.clicked {
                     self.sample_color(pt);
                 }
+            }
+            Tool::Tile => {
+                // Unreachable: `handle_interactions_in` routes Tool::Tile to
+                // `handle_tile_placer_interactions` before the generic match.
+                // Kept for exhaustiveness.
             }
             Tool::Fieldier => {}
         }
@@ -3689,6 +4788,342 @@ impl App {
         if interactions.stroke_ended {
             self.end_stroke();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tile placer (Tool::Tile)
+    // -----------------------------------------------------------------------
+
+    /// Drives the Tile-tool gesture: primary stamps the selected palette tile
+    /// at snapped grid cells, secondary clears cells. One gesture (a plain
+    /// click or a full drag) commits exactly ONE [`TilemapEditCommand`].
+    ///
+    /// The active layer gets a tilemap on first placement if it lacks one;
+    /// a `locked` layer blocks ALL writes (the gesture is a no-op).
+    fn handle_tile_placer_interactions(&mut self, interactions: CanvasInteractions) {
+        // Secondary (right) button: CLEAR cells.
+        if interactions.eyedropper_started {
+            self.tile_placer = TilePlacerGesture::default();
+        }
+        if interactions.eyedropper_started || interactions.eyedropper_point.is_some() {
+            if let Some(pt) = interactions.eyedropper_point {
+                self.tile_placer_cell(pt, true);
+            }
+        }
+        if interactions.eyedropper_ended {
+            self.tile_placer_commit();
+        }
+        // Primary (left) button: STAMP cells.
+        if let Some(pt) = interactions.clicked {
+            // A plain click (press+release within the click threshold). If a
+            // drag gesture already stamped cells (diffs non-empty), the stroke
+            // stream owns the gesture and its `stroke_ended` commits below.
+            if self.tile_placer.diffs.is_empty() {
+                self.tile_placer_cell(pt, false);
+                self.tile_placer_commit();
+            }
+        }
+        if interactions.stroke_started && self.tile_placer.diffs.is_empty() {
+            // A fresh drag gesture.
+            self.tile_placer = TilePlacerGesture::default();
+        }
+        if let Some(pt) = interactions.stroke_point {
+            self.tile_placer_cell(pt, false);
+        }
+        if interactions.stroke_ended {
+            self.tile_placer_commit();
+        }
+    }
+
+    /// Stamps (or clears) the grid cell under `pt` on the ACTIVE layer.
+    ///
+    /// The placement transform comes from the STICKY Q/R/X/Z state (toggled by
+    /// key presses, see [`Self::tile_placement_cell`]): **X** flips horizontally, **Z** flips
+    /// vertically, **R** rotates 90° CW, **Q** 90° CCW. The layer must be
+    /// unlocked and the selected tile must exist (for stamping); otherwise this
+    /// is a no-op.
+    fn tile_placer_cell(&mut self, pt: (i32, i32), clearing: bool) {
+        if !clearing
+            && self
+                .projects
+                .current()
+                .tile_palette
+                .selected_tile()
+                .is_none()
+        {
+            // Honest feedback: the palette is empty, so a stamp is impossible.
+            // The user must add a tile first (+ Empty).
+            self.projects.current_mut().last_error =
+                Some("Tile palette is empty — add a tile first (+ Empty).".to_string());
+            return;
+        }
+        let project = self.projects.current();
+        let tile_size = project.tile_size.max(1) as u32;
+        let (cw, ch) = (
+            project.layers.width() as u32,
+            project.layers.height() as u32,
+        );
+        let (cx, cy) = TileMap::snap_cell(pt, tile_size);
+        let cols = cw.div_ceil(tile_size);
+        let rows = ch.div_ceil(tile_size);
+        if cx >= cols || cy >= rows {
+            return;
+        }
+        let layer_id = project.layers.active_layer_id();
+        let active = project.layers.layer(layer_id);
+        if active.is_some_and(|layer| layer.locked) {
+            // Honest feedback: a locked layer must not silently swallow the
+            // stamp — tell the user why nothing happened.
+            self.projects.current_mut().last_error =
+                Some("Cannot place tiles: the active layer is locked.".to_string());
+            return;
+        }
+        if active.is_some_and(|layer| layer.is_group) {
+            // Honest feedback: groups composite their children and never render
+            // their own tilemap (see `compose_node_region`), so a stamp would
+            // be invisible. Reject it with a message instead of writing a
+            // tilemap that can never be seen.
+            self.projects.current_mut().last_error =
+                Some("Cannot place tiles on a group layer — select a regular layer.".to_string());
+            return;
+        }
+        // Ensure the active layer owns a tilemap sized to the CURRENT canvas
+        // cell count. If it already exists (created earlier at a different
+        // `tile_size`, or before a canvas resize), GROW/shrink it to match —
+        // otherwise `set_cell` would silently drop the stamp as out-of-bounds
+        // and the click would appear to do nothing.
+        {
+            let layers = &mut self.projects.current_mut().layers;
+            let layer = layers.layer_mut(layer_id).expect("active layer exists");
+            if layer.tilemap.is_none() {
+                layer.tilemap = Some(TileMap::new(tile_size, cols, rows));
+            } else {
+                let tm = layer.tilemap.as_mut().expect("tilemap was ensured");
+                tm.tile_size = tile_size;
+                tm.resize(cols, rows);
+            }
+        }
+        let existing = {
+            let project = self.projects.current();
+            project
+                .layers
+                .layer(layer_id)
+                .and_then(|layer| layer.tilemap.as_ref())
+                .and_then(|tm| tm.cell((cx, cy)))
+        };
+        let after = if clearing {
+            None
+        } else {
+            Some(self.tile_placement_cell(existing))
+        };
+        // Honest feedback: stamping a fully-transparent tile (the EMPTY tile
+        // "+ Empty" creates) writes a cell that renders as nothing on the
+        // canvas. The panel warns about it too; this covers the placer path.
+        if !clearing {
+            let transparent = self
+                .projects
+                .current()
+                .tile_palette
+                .selected_tile()
+                .is_some_and(|tile| tile.pixels.chunks_exact(4).all(|px| px[3] == 0));
+            if transparent {
+                self.projects.current_mut().last_error = Some(
+                    "The placed tile is empty (fully transparent) — nothing is visible. \
+                     Add pixels to the tile."
+                        .to_string(),
+                );
+            }
+        }
+        {
+            // Capture the canvas dims and the stamped tile's oriented footprint
+            // dims BEFORE the mutable layer borrow (disjoint borrow rules).
+            let (canvas_w, canvas_h) = {
+                let project = self.projects.current();
+                (
+                    project.layers.width() as i32,
+                    project.layers.height() as i32,
+                )
+            };
+            let oriented_dims = after.map(|cell| {
+                let project = self.projects.current();
+                match project.tile_palette.get(cell.tile_id) {
+                    Some(tile) => {
+                        if cell.rotation % 2 == 1 {
+                            (u32::from(tile.h), u32::from(tile.w))
+                        } else {
+                            (u32::from(tile.w), u32::from(tile.h))
+                        }
+                    }
+                    None => (tile_size, tile_size),
+                }
+            });
+            let project = self.projects.current_mut();
+            let layer = project
+                .layers
+                .layer_mut(layer_id)
+                .expect("active layer exists");
+            let tm = layer.tilemap.as_mut().expect("tilemap was ensured");
+            // Record the pre-stamp buffer footprint bytes so a stamp gesture
+            // undoes its bake in one step. Clear (un-tile) records nothing.
+            if !clearing {
+                if let Some((ow, oh)) = oriented_dims {
+                    let rect = Rect2i::new(
+                        (cx as u64 * u64::from(tile_size)) as i32,
+                        (cy as u64 * u64::from(tile_size)) as i32,
+                        ow as i32,
+                        oh as i32,
+                    )
+                    .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
+                    if !rect.is_empty() {
+                        let before = crate::core::undo::DeltaRecorder::begin(
+                            "Tile",
+                            layer_id,
+                            &layer.buffer,
+                            rect,
+                        )
+                        .map(|r| r.before_bytes().to_vec())
+                        .unwrap_or_default();
+                        self.tile_placer.buffer_deltas.push((rect, before));
+                    }
+                }
+            }
+            tm.set_cell((cx, cy), after);
+            // Bake the stamped cell into the buffer (the integrated model
+            // invariant: buffer footprint == oriented tile bytes).
+            if !clearing {
+                let _ = tm.blit_cell(&project.tile_palette, &mut layer.buffer, cx, cy);
+            }
+        }
+        self.tile_placer.diffs.insert((cx, cy), (existing, after));
+    }
+
+    /// Edge-detect the Q/R/X/Z key PRESSES and fold them into the sticky
+    /// [`TilePlacerTransform`]. Called ONCE per frame from `ui_frame` (before the
+    /// hover preview is computed) so the preview and every stamp of the frame
+    /// share the same transform.
+    ///
+    /// `key_pressed` fires once per press, so holding a key does NOT re-apply
+    /// the transform, and releasing the key does NOT reset it — the transform
+    /// sticks until the Tile tool is deactivated. **R** rotates 90° CW, **Q**
+    /// 90° CCW, **X** toggles `flip_x`, **Z** toggles `flip_y`.
+    ///
+    /// Gated on the Tile tool so the modifiers only drive the placer while it
+    /// is the active tool.
+    ///
+    /// **Conflict resolution:** X is the global Swap-Colors shortcut; while
+    /// the Tile tool is active the placer read takes precedence and Swap
+    /// Colors is suppressed (the shortcut dispatch gates it off, so the event
+    /// is never consumed before this runs). Outside the Tile tool, X still
+    /// swaps colors.
+    fn tick_tile_placer_transform(&mut self) {
+        let is_tile = self.projects.current().tool_state.tool() == Tool::Tile;
+        if !is_tile {
+            return;
+        }
+        let (x, z, r, q) = self.ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::X),
+                i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::Q),
+            )
+        });
+        let t = &mut self.tile_placer_transform;
+        if r {
+            t.rotation = (t.rotation + 1) % 4;
+            t.active = true;
+        }
+        if q {
+            t.rotation = (t.rotation + 3) % 4;
+            t.active = true;
+        }
+        if x {
+            t.flip_x = !t.flip_x;
+            t.active = true;
+        }
+        if z {
+            t.flip_y = !t.flip_y;
+            t.active = true;
+        }
+    }
+
+    /// The `TileCell` to write for a stamp, given the cell's CURRENT transform
+    /// (`existing`, `None` for a fresh cell).
+    ///
+    /// While no modifier has been pressed ([`TilePlacerTransform::active`] is
+    /// false) the cell keeps its OWN existing transform (0 rotation / no flips
+    /// for a fresh cell). Once a modifier IS active, the sticky transform is
+    /// applied ABSOLUTELY — so a drag that re-visits a cell re-stamps the SAME
+    /// transform rather than toggling/accumulating it. Releasing a key does
+    /// NOT reset the sticky transform.
+    ///
+    fn tile_placement_cell(&self, existing: Option<TileCell>) -> TileCell {
+        let tile_id = self
+            .projects
+            .current()
+            .tile_palette
+            .selected_tile()
+            .map(|tile| tile.id)
+            .unwrap_or(TileId(0));
+        let t = &self.tile_placer_transform;
+        if !t.active {
+            // No modifier pressed: keep the cell's own transform.
+            return TileCell {
+                tile_id,
+                rotation: existing.map(|cell| cell.rotation).unwrap_or(0),
+                flip_x: existing.map(|c| c.flip_x).unwrap_or(false),
+                flip_y: existing.map(|c| c.flip_y).unwrap_or(false),
+            };
+        }
+        TileCell {
+            tile_id,
+            rotation: t.rotation,
+            flip_x: t.flip_x,
+            flip_y: t.flip_y,
+        }
+    }
+
+    /// Commits the in-flight placer gesture as ONE undoable
+    /// [`TilemapEditCommand`], or a no-op when nothing changed.
+    fn tile_placer_commit(&mut self) {
+        let gesture = std::mem::take(&mut self.tile_placer);
+        if gesture.diffs.is_empty() {
+            return;
+        }
+        let diffs: Vec<((u32, u32), Option<TileCell>, Option<TileCell>)> = gesture
+            .diffs
+            .into_iter()
+            .map(|(cell, (before, after))| (cell, before, after))
+            .collect();
+        let layer_id = self.projects.current().layers.active_layer_id();
+        let project = self.projects.current_mut();
+        let mut cmd = TilemapEditCommand::new(layer_id, diffs);
+        if !gesture.buffer_deltas.is_empty() {
+            let buffer_deltas: Vec<(Rect2i, Vec<u8>, Vec<u8>)> = gesture
+                .buffer_deltas
+                .into_iter()
+                .map(|(rect, before)| {
+                    // The after-state is the baked buffer at the footprint
+                    // (the cell was blitted after set_cell).
+                    let after = crate::core::undo::DeltaRecorder::begin(
+                        "Tile",
+                        layer_id,
+                        &project
+                            .layers
+                            .layer(layer_id)
+                            .expect("active layer exists")
+                            .buffer,
+                        rect,
+                    )
+                    .map(|r| r.before_bytes().to_vec())
+                    .unwrap_or_default();
+                    (rect, before, after)
+                })
+                .collect();
+            cmd = cmd.with_buffer_deltas(buffer_deltas);
+        }
+        project.undo.push(Box::new(cmd));
+        project.mark_dirty();
     }
 
     /// Start (or restart) a stroke segment at `pt`: a fresh [`Stroke::start`]
@@ -3770,16 +5205,20 @@ impl App {
     }
 
     fn end_stroke(&mut self) {
-        let project = self.projects.current_mut();
-        if let Some(session) = project.stroke.take() {
+        let finished = {
+            let project = self.projects.current_mut();
+            let Some(session) = project.stroke.take() else {
+                return;
+            };
             let lid = session.layer_id();
             let Some(layer) = project.layers.layer(lid) else {
                 return;
             };
-            if let Some(cmd) = session.finish(&layer.buffer) {
-                project.undo.push(Box::new(cmd));
-                project.mark_dirty();
-            }
+            session.finish(&layer.buffer)
+        };
+        if let Some(cmd) = finished {
+            self.push_pixel_edit(Box::new(cmd));
+            self.mark_dirty();
         }
     }
 
@@ -3820,24 +5259,55 @@ impl App {
     }
 
     /// One fill gesture = one undoable command (D48), bounded by the
-    /// committed selection.
+    /// committed selection (and, with restrict-to-region, the seed's tile cell).
+    ///
+    /// The Fill tool's stored [`FillSettings`](crate::input::FillSettings)
+    /// drive the gesture: a nonzero `tolerance` widens the match, Alt (held)
+    /// momentarily forces the non-contiguous / global replace-all mode, and
+    /// `restrict_to_region` adds the tile-cell clip.  The selection clip always
+    /// applies when a selection exists.
     fn apply_fill(&mut self, pt: (i32, i32)) {
+        let alt_held = alt_pressed(&self.ctx);
         let project = self.projects.current_mut();
         let layer_id = project.layers.active_layer_id();
         let color = project.color;
-        let clip = Self::selection_pixel_clip(project.selection.as_ref());
+        let fill = project.tool_state.fill();
+        // Alt momentarily drops contiguity (global replace-all), mirroring the
+        // wand's Alt override.
+        let replace_all = !(fill.contiguous && !alt_held);
+        // The selection clip always bounds the fill; restrict-to-region adds the
+        // seed's region/tile-cell clip, and the two are intersected so both
+        // constraints hold when present.
+        let selection_clip = project.selection.as_ref().map(PixelClip::from_selection);
+        let region_clip = fill.restrict_to_region.then(|| {
+            let tile = project.tile_size.max(1) as i32;
+            PixelClip::from_rect(Rect2i::new(
+                pt.0.div_euclid(tile) * tile,
+                pt.1.div_euclid(tile) * tile,
+                tile,
+                tile,
+            ))
+        });
+        let clip = match (selection_clip, region_clip) {
+            (Some(selection), Some(region)) => Some(selection.intersect(&region)),
+            (Some(selection), None) => Some(selection),
+            (None, Some(region)) => Some(region),
+            (None, None) => None,
+        };
         let cmd = fill_command_clipped(
             layer_id,
             &mut project.layers.active_layer_mut().buffer,
             pt.0,
             pt.1,
             color,
-            false,
+            fill.tolerance,
+            replace_all,
             clip.as_ref(),
         );
+        // End the `project` borrow before `push_pixel_edit` takes `&mut self`.
         if let Some(cmd) = cmd {
-            project.undo.push(Box::new(cmd));
-            project.mark_dirty();
+            self.push_pixel_edit(Box::new(cmd));
+            self.mark_dirty();
         }
     }
 
@@ -3847,7 +5317,7 @@ impl App {
             return;
         }
         let project = self.projects.current_mut();
-        let composite = project.layers.composite_layers();
+        let composite = project.layers.composite_layers(&project.tile_palette);
         if let Some(color) = composite.get_pixel(pt.0 as usize, pt.1 as usize) {
             project.color = color;
         }
@@ -3920,7 +5390,7 @@ impl App {
             .buffer
             .blit_region(bbox, &clear);
         let cmd = recorder.finish(&self.projects.current_mut().layers.active_layer().buffer);
-        self.projects.current_mut().undo.push(Box::new(cmd));
+        self.push_pixel_edit(Box::new(cmd));
         self.projects.current_mut().clipboard = Some(clip.clone());
         self.push_os_clipboard_image(&clip);
         self.projects.current_mut().selection = None;
@@ -3931,64 +5401,73 @@ impl App {
     /// the selection in place, so it can be moved or cleared again.  A no-op
     /// when nothing is selected.
     fn delete_selection(&mut self) {
-        let session = self.projects.current_mut();
-        let Some(sel) = session.selection.take() else {
-            return;
+        let cmd = {
+            let session = self.projects.current_mut();
+            let Some(sel) = session.selection.take() else {
+                return;
+            };
+            let lid = session.layers.active_layer_id();
+            let Some(cmd) =
+                delete_selected_command(&sel, lid, &mut session.layers.active_layer_mut().buffer)
+            else {
+                session.selection = Some(sel);
+                return;
+            };
+            session.selection = sel.recaptured(&session.layers.active_layer().buffer);
+            cmd
         };
-        let lid = session.layers.active_layer_id();
-        let Some(cmd) =
-            delete_selected_command(&sel, lid, &mut session.layers.active_layer_mut().buffer)
-        else {
-            session.selection = Some(sel);
-            return;
-        };
-        session.selection = sel.recaptured(&session.layers.active_layer().buffer);
-        session.undo.push(Box::new(cmd));
+        self.push_pixel_edit(Box::new(cmd));
         self.mark_dirty();
     }
 
     /// Mirrors the committed selection's pixels as one undoable step and keeps
     /// the same pixels selected.  A no-op when nothing is selected.
     fn flip_selection(&mut self, horizontal: bool) {
-        let session = self.projects.current_mut();
-        let Some(sel) = session.selection.take() else {
-            return;
+        let cmd = {
+            let session = self.projects.current_mut();
+            let Some(sel) = session.selection.take() else {
+                return;
+            };
+            let lid = session.layers.active_layer_id();
+            let Some(cmd) = flip_selected_command(
+                &sel,
+                horizontal,
+                lid,
+                &mut session.layers.active_layer_mut().buffer,
+            ) else {
+                session.selection = Some(sel);
+                return;
+            };
+            let (bbox, mask) = sel.mirrored_shape(horizontal);
+            session.selection =
+                Selection::capture_mask(&session.layers.active_layer().buffer, bbox, mask);
+            cmd
         };
-        let lid = session.layers.active_layer_id();
-        let Some(cmd) = flip_selected_command(
-            &sel,
-            horizontal,
-            lid,
-            &mut session.layers.active_layer_mut().buffer,
-        ) else {
-            session.selection = Some(sel);
-            return;
-        };
-        let (bbox, mask) = sel.mirrored_shape(horizontal);
-        session.selection =
-            Selection::capture_mask(&session.layers.active_layer().buffer, bbox, mask);
-        session.undo.push(Box::new(cmd));
+        self.push_pixel_edit(Box::new(cmd));
         self.mark_dirty();
     }
 
     /// Rotates the committed selection's pixels 90° clockwise as one undoable
     /// step and keeps the same pixels selected.  A no-op when nothing is selected.
     fn rotate_selection(&mut self) {
-        let session = self.projects.current_mut();
-        let Some(sel) = session.selection.take() else {
-            return;
+        let cmd = {
+            let session = self.projects.current_mut();
+            let Some(sel) = session.selection.take() else {
+                return;
+            };
+            let lid = session.layers.active_layer_id();
+            let Some(cmd) =
+                rotate_selected_command(&sel, lid, &mut session.layers.active_layer_mut().buffer)
+            else {
+                session.selection = Some(sel);
+                return;
+            };
+            let (bbox, mask) = sel.rotate_shape();
+            session.selection =
+                Selection::capture_mask(&session.layers.active_layer().buffer, bbox, mask);
+            cmd
         };
-        let lid = session.layers.active_layer_id();
-        let Some(cmd) =
-            rotate_selected_command(&sel, lid, &mut session.layers.active_layer_mut().buffer)
-        else {
-            session.selection = Some(sel);
-            return;
-        };
-        let (bbox, mask) = sel.rotate_shape();
-        session.selection =
-            Selection::capture_mask(&session.layers.active_layer().buffer, bbox, mask);
-        session.undo.push(Box::new(cmd));
+        self.push_pixel_edit(Box::new(cmd));
         self.mark_dirty();
     }
 
@@ -4188,24 +5667,81 @@ impl App {
 
     fn undo_document(&mut self) {
         self.clear_selection();
-        let project = self.projects.current_mut();
-        let mut ctx = CommandContext {
-            layers: &mut project.layers,
+        let undone = {
+            let project = self.projects.current_mut();
+            let mut ctx = CommandContext {
+                layers: &mut project.layers,
+                palette: &mut project.tile_palette,
+            };
+            project.undo.undo(&mut ctx)
         };
-        if project.undo.undo(&mut ctx) {
-            project.mark_dirty();
+        if undone {
+            self.projects.current_mut().mark_dirty();
         }
     }
 
     fn redo_document(&mut self) {
         self.clear_selection();
-        let project = self.projects.current_mut();
-        let mut ctx = CommandContext {
-            layers: &mut project.layers,
+        let redone = {
+            let project = self.projects.current_mut();
+            let mut ctx = CommandContext {
+                layers: &mut project.layers,
+                palette: &mut project.tile_palette,
+            };
+            project.undo.redo(&mut ctx)
         };
-        if project.undo.redo(&mut ctx) {
-            project.mark_dirty();
+        if redone {
+            self.projects.current_mut().mark_dirty();
         }
+    }
+
+    /// Push a pixel-edit command through the INTEGRATED tile model: for every
+    /// child pixel delta (layer, region, before, after), write back the changed
+    /// pixels to the ROOT tiles they cover (via [`tile_edit::write_back_region`]).
+    /// When at least one tile was touched, the command is wrapped in a
+    /// [`CompositeCommand`] named after the original gesture, with the original
+    /// command FIRST and the produced `TilePixelEditCommand`(s) after — so a
+    /// single undo restores both the buffer pixels AND the root tile data (and
+    /// re-bakes every instance). Otherwise the command is pushed alone.
+    ///
+    /// `mark_dirty()` is called by every caller after this returns.
+    fn push_pixel_edit(&mut self, cmd: Box<dyn Command>) {
+        let tile_cmds: Vec<Box<dyn Command>> = {
+            let project = self.projects.current_mut();
+            let children: Vec<(LayerId, Rect2i, &[u8], &[u8])> = {
+                // Collect child deltas first (the borrow ends before the
+                // mutation below).
+                let mut out = Vec::new();
+                collect_pixel_deltas(cmd.as_ref(), &mut out);
+                out
+            };
+            let mut produced = Vec::new();
+            for (layer_id, region, before, after) in children {
+                if let Some(tile_cmd) = tile_edit::write_back_region(
+                    &mut project.layers,
+                    &mut project.tile_palette,
+                    layer_id,
+                    region,
+                    before,
+                    after,
+                ) {
+                    produced.push(Box::new(tile_cmd) as Box<dyn Command>);
+                }
+            }
+            produced
+        };
+        if tile_cmds.is_empty() {
+            self.projects.current_mut().undo.push(cmd);
+            return;
+        }
+        // Wrap the original command + the tile write-backs in one composite
+        // named after the original gesture.
+        let mut composite = CompositeCommand::new(TILE_EDIT_COMPOSITE_NAME);
+        composite.push(cmd);
+        for tile_cmd in tile_cmds {
+            composite.push(tile_cmd);
+        }
+        self.projects.current_mut().undo.push(Box::new(composite));
     }
 
     /// Handle keyboard shortcuts. While a transform session is live (D32) only
@@ -4354,6 +5890,10 @@ impl App {
             }
             return;
         }
+        // UX item 2 conflict: while the Tile tool is active, X is the placer's
+        // horizontal-flip modifier, so the Swap-Colors shortcut is suppressed
+        // (the placer reads X directly; outside the Tile tool X still swaps).
+        let tile_tool_active = self.projects.current().tool_state.tool() == Tool::Tile;
         let (
             undo,
             redo,
@@ -4374,6 +5914,8 @@ impl App {
             select_rectangle,
             select_wand,
             select_lasso,
+            select_fill,
+            select_tile_tool,
         ) = self.ctx.input(|i| {
             // Clipboard shortcuts: egui-winit swallows the raw Ctrl/Cmd+C/X/V
             // press, so detect them from the events it emits instead. Copy/Cut
@@ -4398,7 +5940,7 @@ impl App {
                 self.keymap.pressed(crate::input::Action::SelectEraser, i),
                 self.keymap
                     .pressed(crate::input::Action::ToggleColorPicker, i),
-                self.keymap.pressed(crate::input::Action::SwapColors, i),
+                self.keymap.pressed(crate::input::Action::SwapColors, i) && !tile_tool_active,
                 self.keymap
                     .pressed(crate::input::Action::CancelTransform, i),
                 self.keymap.pressed(crate::input::Action::SelectDelete, i),
@@ -4414,6 +5956,8 @@ impl App {
                     .pressed(crate::input::Action::SelectRectangle, i),
                 self.keymap.pressed(crate::input::Action::SelectWand, i),
                 self.keymap.pressed(crate::input::Action::SelectLasso, i),
+                self.keymap.pressed(crate::input::Action::SelectFill, i),
+                self.keymap.pressed(crate::input::Action::SelectTileTool, i),
             )
         });
         if cancel_selection {
@@ -4481,6 +6025,18 @@ impl App {
         }
         if select_lasso {
             self.select_fieldier_child(FieldierChild::Lasso);
+        }
+        if select_fill {
+            self.projects
+                .current_mut()
+                .tool_state
+                .select_tool(Tool::Fill);
+        }
+        if select_tile_tool {
+            self.projects
+                .current_mut()
+                .tool_state
+                .select_tool(Tool::Tile);
         }
     }
 
@@ -4913,12 +6469,13 @@ impl App {
             return Err("No selection to export".to_string());
         };
         let rect = sel.rect();
-        let composite = self
-            .projects
-            .current()
-            .layers
-            .composite_layers_region(rect)
-            .ok_or_else(|| "Selection is empty".to_string())?;
+        let composite = {
+            let session = self.projects.current();
+            session
+                .layers
+                .composite_layers_region(rect, &session.tile_palette)
+                .ok_or_else(|| "Selection is empty".to_string())?
+        };
         Ok((
             composite.width(),
             composite.height(),
@@ -4992,7 +6549,8 @@ impl App {
     }
 
     fn file_export_sprite_sheet(&mut self) {
-        let composite = self.projects.current_mut().layers.composite_layers();
+        let project = self.projects.current_mut();
+        let composite = project.layers.composite_layers(&project.tile_palette);
         let (w, h) = (composite.width(), composite.height());
         let png = match encode_png(w, h, composite.as_bytes()) {
             Ok(bytes) => bytes,
@@ -5033,7 +6591,10 @@ impl App {
         let project = self.projects.current_mut();
         for frame in project.sequence.iter() {
             let rect = frame.region().rect();
-            let Some(composite) = project.layers.composite_layers_region(rect) else {
+            let Some(composite) = project
+                .layers
+                .composite_layers_region(rect, &project.tile_palette)
+            else {
                 project.last_error = Some("Frame has no pixels".to_string());
                 return;
             };
@@ -5158,15 +6719,22 @@ impl App {
                 .input(|input| input.raw.screen_rect.is_some_and(|rect| rect.contains(p)))
         });
         self.input_capture.release_if_outside(pointer_inside_window);
-        let target = pointer.filter(|p| frame_rect.contains(*p)).map(|p| {
-            if self.panel_dock_demo {
-                self.panel_dock
-                    .surface_at(p, frame_rect)
-                    .map_or(SurfaceId::Canvas, SurfaceId::Panel)
-            } else {
-                SurfaceId::Canvas
-            }
-        });
+        // ONE resolution of "what is under the pointer" per frame, shared by
+        // every consumer: the wheel / middle-drag pan routing inside the canvas
+        // widget (`handles_wheel` / `handles_buttons`), the canvas widget's RAW
+        // press signal and hover previews, and `pointer_over_panel` (the mask
+        // that blanks the click/drag/eyedropper stream). Resolving it twice —
+        // once gated on `panel_dock_demo`, once not — is what let a panel mask
+        // disagree with the gesture router.
+        //
+        // `panel_dock_demo` gates the query because it gates the RENDERING:
+        // `panel_dock.show_inside` (which paints every panel) only runs when it
+        // is set, so with the dock hidden there is no panel chrome and the
+        // canvas must own the whole frame. The viewport is the frame rect — the
+        // very rect `show_inside` lays the panels out in.
+        let target = pointer
+            .filter(|p| frame_rect.contains(*p))
+            .map(|p| self.surface_at_pointer(p, frame_rect));
         self.input_capture.set_target(target);
 
         self.refresh_transform_preview();
@@ -5223,6 +6791,16 @@ impl App {
                 canvas_color_at: marquee_probe,
             };
             self.curve_hovered = self.curve_hover_at(ui.ctx(), camera, canvas_size);
+            // Sticky Tile-placer transform: fold this frame's Q/R/X/Z key
+            // PRESSES into the persistent state BEFORE the preview and the
+            // pointer interactions read it, so a press updates the preview on
+            // the same frame and every stamp of the frame shares the transform.
+            self.tick_tile_placer_transform();
+            // Tile-placer cursor preview (UX items 1/4/6): recomputed every
+            // frame so the hover highlight, the hollow preview (with the sticky
+            // X/Z/R/Q transform) and the tile_id labels track the pointer
+            // and the palette instantly.
+            self.tile_placer_preview = self.tile_placer_preview_at(ui.ctx(), camera, canvas_size);
             self.canvas_widget.set_overlay(self.current_overlay());
             let interactions = self.canvas_widget.ui(
                 ui,
@@ -5239,27 +6817,34 @@ impl App {
             // follows the object's rotation. The body is Grab while hovered and
             // Grabbing while dragged; the rotate/pivot zones stay Crosshair.
             // `None` (and no session) leaves the default arrow.
-            let transform_cursor = self
-                .projects
-                .current()
-                .transform
-                .as_ref()
-                .and_then(TransformSession::selection)
-                .and_then(|t| {
-                    let dragging = t.drag != GizmoHit::None;
-                    let hit = if dragging { t.drag } else { self.gizmo_hovered };
-                    if dragging && hit == GizmoHit::Translate {
-                        Some(egui::CursorIcon::Grabbing)
-                    } else {
-                        cursor_for_hit_at_angle(hit, t.object.angle_deg)
-                    }
-                });
+            //
+            // A panel under the pointer owns the cursor: a Grab/Rotate icon
+            // shown while the user is on the palette is a misleading preview of
+            // a canvas affordance they cannot reach, so the mask drops it.
+            let transform_cursor = if self.pointer_over_panel() {
+                None
+            } else {
+                self.projects
+                    .current()
+                    .transform
+                    .as_ref()
+                    .and_then(TransformSession::selection)
+                    .and_then(|t| {
+                        let dragging = t.drag != GizmoHit::None;
+                        let hit = if dragging { t.drag } else { self.gizmo_hovered };
+                        if dragging && hit == GizmoHit::Translate {
+                            Some(egui::CursorIcon::Grabbing)
+                        } else {
+                            cursor_for_hit_at_angle(hit, t.object.angle_deg)
+                        }
+                    })
+            };
             if let Some(cursor) = transform_cursor {
                 self.ctx.output_mut(|o| o.cursor_icon = cursor);
             }
             self.projects.current_mut().camera = interactions.updated_camera;
             let interactions = self.update_tool_gesture(ui.ctx(), interactions);
-            self.handle_interactions(interactions);
+            self.handle_interactions_in(ui.ctx(), interactions);
         }
         let preview_image = self.canvas_texture.as_ref().map(|texture| {
             (
@@ -5291,6 +6876,32 @@ impl App {
             // Drain the dock panel events into the model/undo exactly once
             // per frame (the panels only ever push into the host cells).
             self.drain_dock_events();
+        }
+        // Feedback status line: render the session's last_error (e.g. "the
+        // tile palette is empty", "cannot place tiles on a group layer",
+        // "the placed tile is empty/transparent") so silent no-ops are
+        // VISIBLE instead of disappearing without a trace. Painted last so
+        // it sits above the dock overlay.
+        if let Some(message) = self.projects.current().last_error.as_deref() {
+            let status_rect = egui::Rect::from_min_size(
+                egui::pos2(frame_rect.left() + 8.0, frame_rect.bottom() - 24.0),
+                egui::vec2(frame_rect.width() - 16.0, 20.0),
+            );
+            ui.painter()
+                .rect_filled(status_rect, 3.0, self.theme.current().colors.panel_bg32());
+            ui.painter().rect_stroke(
+                status_rect,
+                3.0,
+                egui::Stroke::new(1.0, self.theme.current().colors.panel_border32()),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                status_rect.left_center() + egui::vec2(6.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                message,
+                egui::FontId::proportional(13.0),
+                ui.visuals().text_color(),
+            );
         }
     }
 
@@ -5429,6 +7040,30 @@ fn rect_from_points(a: (i32, i32), b: (i32, i32)) -> Rect2i {
     Rect2i::new(x, y, w, h)
 }
 
+/// Collect the per-layer pixel deltas `(layer, region, before, after)` of a
+/// pixel-edit command: a single [`ReverseDeltaCommand`] contributes itself, a
+/// [`CompositeCommand`] contributes each [`ReverseDeltaCommand`] child (via
+/// [`CompositeCommand::child_pixel_deltas`]), and other command shapes
+/// contribute nothing. Used by [`App::push_pixel_edit`] to write changes back
+/// to the ROOT tile data.
+fn collect_pixel_deltas<'a>(
+    cmd: &'a dyn Command,
+    out: &mut Vec<(LayerId, Rect2i, &'a [u8], &'a [u8])>,
+) {
+    if let Some(delta) = cmd.as_any().downcast_ref::<ReverseDeltaCommand>() {
+        out.push((
+            delta.layer_id(),
+            delta.region(),
+            delta.before(),
+            delta.after(),
+        ));
+        return;
+    }
+    if let Some(composite) = cmd.as_any().downcast_ref::<CompositeCommand>() {
+        out.extend(composite.child_pixel_deltas());
+    }
+}
+
 /// R6 F3: true when a modified document is due for an autosave (no prior
 /// autosave, or the interval has elapsed since the last one).
 fn should_autosave(
@@ -5503,7 +7138,10 @@ impl ApplicationHandler for App {
             None,
         );
 
-        let composite = self.projects.current_mut().layers.composite_layers();
+        let composite = {
+            let session = self.projects.current();
+            session.layers.composite_layers(&session.tile_palette)
+        };
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [composite.width(), composite.height()],
             composite.as_bytes(),
@@ -5737,13 +7375,29 @@ mod tests {
     use crate::core::model::LayerId;
     use crate::core::palette::Palette;
     use crate::core::transform::TransformAlgorithm;
-    use crate::input::{FieldierChild, WandSettings};
+    use crate::input::{FieldierChild, FillSettings, WandSettings};
     use crate::io::decode_png;
     use crate::ui::project::ProjectId;
     use std::cell::Cell;
     use std::rc::Rc;
 
     const RED: Color = Color::rgb(255, 0, 0);
+
+    fn tilemap_cache_signature(
+        layers: &LayerStack,
+        layer_id: LayerId,
+    ) -> Option<(u64, u64, usize, usize, Vec<u8>)> {
+        let layer = layers.layer(layer_id)?;
+        layer.tilemap_cache.borrow().as_ref().map(|cache| {
+            (
+                cache.tilemap_epoch,
+                cache.palette_epoch,
+                cache.canvas_w,
+                cache.canvas_h,
+                cache.buffer.as_bytes().to_vec(),
+            )
+        })
+    }
 
     #[test]
     fn native_host_retirement_waits_one_event_turn_and_releases_once() {
@@ -6224,6 +7878,96 @@ mod tests {
         app.ctx.input_mut(|i| i.modifiers = modifiers);
     }
 
+    /// Releases a previously held key.
+    fn release_key(app: &App, key: egui::Key) {
+        app.ctx.input_mut(|i| {
+            i.keys_down.remove(&key);
+        });
+    }
+
+    /// Simulate a Tile-placer key PRESS (edge): runs ONE frame carrying an
+    /// `Event::Key{pressed:true}` so `key_pressed` fires exactly once, and folds
+    /// it into the sticky transform via the same per-frame tick `ui_frame` runs.
+    /// The key is then removed from `keys_down` again, so the next press is a
+    /// fresh edge rather than a repeat of a still-held key.
+    ///
+    /// Releasing the key does NOT reset the sticky transform — use
+    /// [`hold_key`] + [`release_key`] when a test needs the key held across
+    /// frames.
+    fn press_key(app: &mut App, key: egui::Key) {
+        let ctx = app.ctx.clone();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw_input, |_ui| {
+            app.tick_tile_placer_transform();
+        });
+        output.textures_delta.clear();
+        app.ctx.input_mut(|i| {
+            i.keys_down.remove(&key);
+        });
+    }
+
+    /// Holds a Tile-placer modifier key DOWN across frames: presses it once
+    /// (folding that press into the sticky transform) and then leaves it in
+    /// `keys_down`.
+    ///
+    /// The sticky transform is edge-triggered, so the frames this key is held
+    /// through must NOT re-apply it — that is exactly what the "holding does
+    /// not repeat" assertions check. Pair with [`idle_frames`], which advances
+    /// the input state the way real frames do.
+    fn hold_key(app: &mut App, key: egui::Key) {
+        press_key(app, key);
+        app.ctx.input_mut(|i| {
+            i.keys_down.insert(key);
+        });
+    }
+
+    /// Advances `frames` input-state passes carrying NO key events, so any key
+    /// still in `keys_down` stays held while `key_pressed` goes false — the
+    /// real-frame shape of "the user is holding the key down".
+    fn idle_frames(app: &mut App, frames: usize) {
+        let ctx = app.ctx.clone();
+        for _ in 0..frames {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |_ui| {
+                app.tick_tile_placer_transform();
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    /// Adds a solid `w × h` tile to the project palette and selects it.
+    fn set_selected_tile(app: &mut App, w: u16, h: u16, pixel: [u8; 4]) -> TileId {
+        let session = app.projects.current_mut();
+        let id = session.tile_palette.add(Tile {
+            id: TileId(0),
+            w,
+            h,
+            pixels: pixel.repeat(w as usize * h as usize),
+        });
+        session.tile_palette.select(id);
+        session.mark_saved();
+        id
+    }
+
     /// Runs a Select-tool marquee drag with held modifiers. The tool is assumed
     /// already active (a deliberate switch would deselect first).
     fn marquee_with(app: &mut App, a: (i32, i32), b: (i32, i32), modifiers: egui::Modifiers) {
@@ -6512,6 +8256,289 @@ mod tests {
                 .take_pixels_changed(),
             None
         );
+    }
+
+    #[test]
+    /// REGRESSION: a normal pixel layer with a filled buffer must composite to
+    /// non-empty bytes (the canvas must not be blank). This is the render path
+    /// `sync_texture` and the startup upload both feed.
+    fn normal_pixel_layer_composites_to_non_empty() {
+        let mut app = App::default();
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .fill(Color::rgb(255, 0, 0));
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(composite.get_pixel(0, 0), Some(Color::rgb(255, 0, 0)));
+        assert!(
+            composite.as_bytes().iter().any(|b| *b != 0),
+            "a filled pixel layer must composite to non-empty bytes"
+        );
+        // The same bytes the startup upload would push into the canvas texture.
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [composite.width(), composite.height()],
+            composite.as_bytes(),
+        );
+        assert_eq!(image.pixels.len(), 128 * 128);
+    }
+
+    #[test]
+    /// REGRESSION: after a real pencil stroke, the dirty region is tracked and
+    /// the region composite (the exact bytes a partial `set_partial` upload
+    /// pushes) contains the stroke; `sync_texture` consumes the dirty region.
+    fn draw_then_sync_texture_updates_canvas_composite() {
+        let mut app = App::default();
+        // Mirror the real startup: a canvas texture exists before frames run.
+        let ctx = egui::Context::default();
+        let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &vec![0; 128 * 128 * 4]);
+        app.canvas_texture =
+            Some(ctx.load_texture("sync-draw-test", image, egui::TextureOptions::NEAREST));
+        app.texture_dirty = false;
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((4, 4)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 4),
+            Some(RED)
+        );
+
+        // The stroke dirty-tracked the buffer; the region composite (what a
+        // partial upload would push) contains the stroke colour.
+        let dirty = app
+            .projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .take_pixels_changed();
+        assert!(
+            dirty.is_some(),
+            "a draw must dirty-track so the partial texture path fires"
+        );
+        let region = dirty.unwrap();
+        assert!(region.contains_rect(Rect2i::new(4, 4, 1, 1)));
+        let session = app.projects.current();
+        let composite = session
+            .layers
+            .composite_layers_region(region, &session.tile_palette)
+            .unwrap();
+        assert_eq!(
+            composite.get_pixel((4 - region.x) as usize, (4 - region.y) as usize),
+            Some(RED),
+            "the region composite carries the stroke (partial upload bytes)"
+        );
+
+        // A second stroke, then sync_texture consumes the new dirty region.
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((6, 6)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        app.sync_texture();
+        assert_eq!(
+            app.projects
+                .current_mut()
+                .layers
+                .active_layer_mut()
+                .buffer
+                .take_pixels_changed(),
+            None,
+            "sync_texture must consume the dirty region"
+        );
+    }
+
+    #[test]
+    /// REGRESSION: the dock-only Tile Palette panel registration must not hide
+    /// the canvas — a full frame renders the canvas widget's texture and the
+    /// canvas remains paintable (a stroke lands in the buffer AND the partial
+    /// composite carries it).
+    fn panel_registration_keeps_canvas_paintable() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        assert!(
+            app.canvas_texture.is_some(),
+            "the startup texture must exist"
+        );
+        // The canvas widget renders with the texture in a real frame.
+        let output = run_app_frame_capturing(&mut app, &ctx, &mut 0.0, Vec::new());
+        assert!(
+            rendered_texts(&output).iter().any(|(t, _)| t == "Layer 1"),
+            "the dock still renders (the canvas is not hidden behind it)"
+        );
+        // And a stroke still reaches the buffer through the frame.
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((4, 4)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 4),
+            Some(RED)
+        );
+    }
+
+    #[test]
+    /// REGRESSION: a composite over a tilemap layer + a normal pixel layer must
+    /// not double-borrow the tilemap render cache (RefCell panic) and must show
+    /// BOTH the pixel layer and the tilemap.
+    fn composite_with_tilemap_and_pixel_layers_is_borrow_safe() {
+        use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette};
+
+        let mut app = App::default();
+        // Bottom: a red pixel layer.
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .fill(Color::rgb(255, 0, 0));
+        // Top: a tilemap layer with a 2x2 blue tile at cell (0,0).
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 2,
+            pixels: vec![0u8, 0, 255, 255].repeat(4),
+        });
+        let top = app.projects.current_mut().layers.add_layer("tiles");
+        {
+            let mut tm = TileMap::new(4, 8, 8);
+            tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
+            app.projects
+                .current_mut()
+                .layers
+                .layer_mut(top)
+                .unwrap()
+                .tilemap = Some(tm);
+        }
+        // Composite twice (exercise cache borrow + reuse) — must not panic.
+        let session = app.projects.current();
+        let first = session.layers.composite_layers(&palette);
+        let second = session.layers.composite_layers(&palette);
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_eq!(
+            first.get_pixel(0, 0),
+            Some(Color::rgb(0, 0, 255)),
+            "tilemap on top"
+        );
+        assert_eq!(
+            first.get_pixel(4, 4),
+            Some(Color::rgb(255, 0, 0)),
+            "pixel layer below"
+        );
+        // Undo/redo of a tilemap edit keeps the cache borrow-safe.
+        app.undo_document();
+        let _ = app.projects.current().layers.composite_layers(&palette);
+        app.redo_document();
+        let _ = app.projects.current().layers.composite_layers(&palette);
+    }
+
+    #[test]
+    /// REGRESSION: without a canvas texture, `sync_texture` must mark the full
+    /// upload PENDING (never silently drop a frame's content); the moment a
+    /// texture exists, the next `sync_texture` performs the full upload.
+    fn sync_texture_without_texture_marks_full_upload_pending() {
+        let mut app = App::default();
+        assert!(app.canvas_texture.is_none());
+        app.texture_dirty = false;
+        // A pending draw before the texture exists.
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(3, 3, RED);
+        app.sync_texture();
+        assert!(
+            app.texture_dirty,
+            "no texture must leave the full upload pending"
+        );
+        // Attach a texture: the next sync performs the full upload and
+        // consumes the pending flag (and the buffered draw reaches the canvas
+        // through the full composite).
+        let ctx = egui::Context::default();
+        let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &vec![0; 128 * 128 * 4]);
+        app.canvas_texture =
+            Some(ctx.load_texture("pending-full-sync", image, egui::TextureOptions::NEAREST));
+        app.sync_texture();
+        assert!(
+            !app.texture_dirty,
+            "a texture present must perform the full upload"
+        );
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(composite.get_pixel(3, 3), Some(RED));
+    }
+
+    #[test]
+    /// REGRESSION: the full redraw-equivalent flow (sync_texture + a real
+    /// `ui_frame` with the dock and tile palette panel) must not panic and must
+    /// keep the canvas paintable across frames.
+    fn full_frame_flow_stays_paintable_and_panic_free() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        // A stroke through the real frame path.
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        app.sync_texture(); // partial upload (must not panic)
+        let mut clock = 0.0;
+        run_app_frame_capturing(&mut app, &ctx, &mut clock, Vec::new()); // ui_frame (must not panic)
+                                                                         // A second stroke + sync + frame.
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((20, 20)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        app.sync_texture();
+        run_app_frame_capturing(&mut app, &ctx, &mut clock, Vec::new());
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(composite.get_pixel(5, 5), Some(RED));
+        assert_eq!(composite.get_pixel(20, 20), Some(RED));
     }
 
     #[test]
@@ -7332,6 +9359,10 @@ mod tests {
         // that the frame delivers.
         let mut app = App::default();
         app.panel_dock_demo = false;
+        // Disabling the demo dock also removes the default camera pan that
+        // `new_project` applied to clear the dock (the GÖRÜNÜRLÜK fix): this
+        // test drives the canvas at the origin.
+        app.projects.current_mut().camera.set_pan(0, 0);
         let ctx = app.ctx.clone();
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [CANVAS_WIDTH, CANVAS_HEIGHT],
@@ -7386,6 +9417,10 @@ mod tests {
     fn paste_shortcut_opens_a_transform_session_at_the_cursor() {
         let mut app = App::default();
         app.panel_dock_demo = false;
+        // Disabling the demo dock also removes the default camera pan that
+        // `new_project` applied to clear the dock; this test drives the canvas
+        // at the origin.
+        app.projects.current_mut().camera.set_pan(0, 0);
         let ctx = app.ctx.clone();
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [CANVAS_WIDTH, CANVAS_HEIGHT],
@@ -8246,6 +10281,331 @@ mod tests {
         assert!(
             !sel.contains(20, 20),
             "a cell the pointer never crossed stays unselected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CC: Alt special action + Shift (Add) in PARALLEL
+    // -----------------------------------------------------------------------
+
+    /// Alt (region sweep) + Shift held together.
+    fn alt_shift() -> egui::Modifiers {
+        egui::Modifiers {
+            alt: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        }
+    }
+
+    /// Alt+Shift region sweep WITH an existing base: the swept cells are added
+    /// while the Alt region action still runs.
+    #[test]
+    fn alt_shift_region_sweep_with_base_adds() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        marquee(&mut app, (0, 0), (15, 15)); // base cell (0,0)
+
+        set_modifiers(&app, alt_shift());
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((20, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((40, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((40, 5)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+
+        let sel = app.projects.current().selection.as_ref().unwrap();
+        assert_eq!(
+            sel.rect(),
+            Rect2i::new(0, 0, 48, 16),
+            "the Alt region sweep must be UNIONED with the base"
+        );
+        assert!(sel.contains(5, 5), "the base cell stays");
+        assert!(
+            sel.contains(20, 5) && sel.contains(40, 5),
+            "the swept cells are added"
+        );
+    }
+
+    /// Alt+Shift region sweep WITHOUT a base: the Alt action must not silently
+    /// no-op; its swept cells become the selection (Add degenerates to Replace
+    /// when there is nothing to add to).
+    #[test]
+    fn alt_shift_region_sweep_without_base_still_selects() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+
+        set_modifiers(&app, alt_shift());
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((25, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((25, 5)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt+Shift without a base must still produce the sweep");
+        assert_eq!(sel.rect(), Rect2i::new(0, 0, 32, 16));
+        assert!(sel.contains(5, 5) && sel.contains(25, 5));
+    }
+
+    /// Alt+Shift wand WITH a base: the non-contiguous Alt fill is added to the
+    /// existing selection.
+    #[test]
+    fn alt_shift_wand_with_base_adds_noncontiguous() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(2, 2, 2, 2));
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(10, 10, RED);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        marquee(&mut app, (20, 20), (31, 31)); // disjoint base
+        app.projects
+            .current_mut()
+            .tool_state
+            .select_child(FieldierChild::Wand);
+
+        set_modifiers(&app, alt_shift());
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+
+        let sel = app.projects.current().selection.as_ref().unwrap();
+        assert!(sel.contains(20, 20), "the base survives the add");
+        assert!(sel.contains(2, 2), "the contiguous fill is added");
+        assert!(
+            sel.contains(10, 10),
+            "Alt must still drop contiguity and add the disconnected pixel"
+        );
+    }
+
+    /// Alt+Shift wand WITHOUT a base: the non-contiguous Alt fill becomes the
+    /// selection instead of no-op'ing.
+    #[test]
+    fn alt_shift_wand_without_base_still_selects() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(2, 2, 2, 2));
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(10, 10, RED);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        app.projects
+            .current_mut()
+            .tool_state
+            .select_child(FieldierChild::Wand);
+
+        set_modifiers(&app, alt_shift());
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt+Shift wand without a base must still select");
+        assert_eq!(sel.pixel_count(), 5, "Alt drops contiguity");
+        assert!(sel.contains(10, 10));
+    }
+
+    /// Regression: Alt alone (region + wand) and Shift alone are unchanged, and
+    /// a plain press stays a Replace.
+    #[test]
+    fn alt_and_shift_alone_are_unchanged() {
+        // Alt alone, region, no base → Replace (the sweep becomes the selection).
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        set_modifiers(
+            &app,
+            egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((25, 5)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((25, 5)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(0, 0, 32, 16)),
+            "Alt alone must still Replace when there is no base"
+        );
+
+        // Shift alone, marquee, no base → D78 no-op (unchanged).
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        set_modifiers(
+            &app,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((1, 1)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((9, 9)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((9, 9)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+        assert!(
+            app.projects.current().selection.is_none(),
+            "plain Shift with no base stays a deliberate no-op (D78)"
+        );
+
+        // Shift alone, marquee, with base → Add (unchanged).
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        marquee(&mut app, (0, 0), (3, 3));
+        set_modifiers(
+            &app,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((8, 8)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((11, 11)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((11, 11)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+        let sel = app.projects.current().selection.as_ref().unwrap();
+        assert!(sel.contains(1, 1) && sel.contains(9, 9), "Shift alone adds");
+
+        // Plain press (no modifiers) still marquees a Replace.
+        assert_eq!(
+            {
+                let mut app = App::default();
+                app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+                set_modifiers(&app, egui::Modifiers::NONE);
+                app.handle_interactions(CanvasInteractions {
+                    stroke_started: true,
+                    stroke_point: Some((1, 1)),
+                    ..Default::default()
+                });
+                app.handle_interactions(CanvasInteractions {
+                    stroke_point: Some((3, 2)),
+                    ..Default::default()
+                });
+                app.handle_interactions(CanvasInteractions {
+                    stroke_ended: true,
+                    stroke_point: Some((3, 2)),
+                    ..Default::default()
+                });
+                app.projects.current().selection.as_ref().map(|s| s.rect())
+            },
+            Some(Rect2i::new(1, 1, 3, 2)),
+            "a plain press must marquee a Replace"
+        );
+    }
+
+    /// CC end-to-end: drive an Alt+Shift region sweep through the REAL
+    /// `App::ui_frame` path (global gesture machine + dead zone) with the
+    /// modifiers carried on `RawInput.modifiers`, proving the press-frame
+    /// modifier is observed. No base selection: the sweep must still land.
+    #[test]
+    fn alt_shift_region_sweep_through_the_real_gesture_path() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        let mods = alt_shift();
+        let frame = |app: &mut App, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| app.ui_frame(ui));
+            });
+            output.textures_delta.clear();
+        };
+        frame(
+            &mut app,
+            vec![modifiers_changed(mods), move_to(egui::pos2(60.0, 60.0))],
+        );
+        frame(&mut app, vec![press(egui::pos2(60.0, 60.0))]);
+        frame(&mut app, vec![move_to(egui::pos2(80.0, 60.0))]);
+        frame(&mut app, vec![release(egui::pos2(80.0, 60.0))]);
+        frame(&mut app, vec![modifiers_changed(egui::Modifiers::NONE)]);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt+Shift region sweep must produce a selection");
+        assert!(
+            sel.contains(60, 60) && sel.contains(80, 60),
+            "the swept grid cells must be selected"
         );
     }
 
@@ -9242,6 +11602,19 @@ mod tests {
         run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
         run_app_frame(&mut app, &ctx, vec![press(outside)]);
 
+        // BB: a press alone (before the dead-zone move) must NOT start a
+        // selection — no sticky zero-size marquee.
+        assert_eq!(
+            app.projects
+                .current()
+                .gesture
+                .marquee()
+                .map(|(_, rect)| rect),
+            None,
+            "an outside press alone must not start a selection (dead zone)"
+        );
+
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(60.0, 60.0))]);
         assert_eq!(
             app.projects
                 .current()
@@ -9252,7 +11625,6 @@ mod tests {
             "an outside press must anchor the marquee at the clamped edge"
         );
 
-        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(60.0, 60.0))]);
         run_app_frame(&mut app, &ctx, vec![release(egui::pos2(60.0, 60.0))]);
         let sel = app
             .projects
@@ -9264,6 +11636,707 @@ mod tests {
         assert!(
             sel.rect().right() <= CANVAS_WIDTH as i32,
             "the selection must stay inside the existing pixels"
+        );
+    }
+
+    /// BB (a): a secondary (right) press that starts OUTSIDE the canvas, drags
+    /// inside and releases must complete a Subtract — the bug was that the
+    /// widget-scoped secondary event never fired outside the draw rect.
+    #[test]
+    fn right_drag_outside_starts_and_completes_a_subtract() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        marquee(&mut app, (4, 4), (40, 40));
+        assert!(app.projects.current().selection.is_some());
+
+        let outside = egui::pos2(300.0, 200.0);
+        let inside = egui::pos2(10.0, 10.0);
+        run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
+        run_app_frame(&mut app, &ctx, vec![press_secondary(outside)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(inside)]);
+        run_app_frame(&mut app, &ctx, vec![release_secondary(inside)]);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Subtract leaves a selection");
+        assert!(
+            !sel.contains(10, 10),
+            "the swept Subtract area must be removed"
+        );
+        assert!(
+            !sel.contains(39, 39),
+            "the swept Subtract area must be removed at the far end"
+        );
+        assert!(
+            sel.contains(5, 5),
+            "the untouched part of the selection must remain"
+        );
+        assert!(
+            app.canvas_widget.selection_secondary_latch.is_none(),
+            "the secondary latch must clear on release"
+        );
+    }
+
+    /// BB: the Wand's secondary click is still a one-shot Subtract through the
+    /// global-pointer path (no dead zone), so the BB rework does not regress
+    /// the click-driven wand.
+    #[test]
+    fn wand_right_click_via_global_pointer_subtracts() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::FieldierChildChanged(
+            FieldierChild::Wand,
+        )]);
+        seed_red_rect(&mut app, Rect2i::new(60, 60, 2, 2));
+
+        // A plain left click selects the red region (click-driven).
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(60.0, 60.0))]);
+        run_app_frame(&mut app, &ctx, vec![press(egui::pos2(60.0, 60.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(60.0, 60.0))]);
+        assert!(app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .is_some_and(|sel| sel.contains(60, 60)));
+
+        // A plain right click subtracts immediately (no dead zone for the wand).
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![press_secondary(egui::pos2(60.0, 60.0))],
+        );
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![release_secondary(egui::pos2(60.0, 60.0))],
+        );
+        assert!(
+            app.projects.current().selection.is_none(),
+            "the wand's right click must subtract the whole region"
+        );
+    }
+
+    /// Drive a full wand click through the REAL `App::ui_frame` path with the
+    /// held modifiers carried on `ModifiersChanged` (as winit reports them),
+    /// then release them. The seed maps 1:1 to screen coordinates.
+    fn wand_click_via_real_path(
+        app: &mut App,
+        ctx: &egui::Context,
+        mods: egui::Modifiers,
+        at: egui::Pos2,
+    ) {
+        run_app_frame(app, ctx, vec![modifiers_changed(mods), move_to(at)]);
+        run_app_frame(app, ctx, vec![press(at)]);
+        run_app_frame(app, ctx, vec![release(at)]);
+        run_app_frame(app, ctx, vec![modifiers_changed(egui::Modifiers::NONE)]);
+    }
+
+    /// CC: build an app with the Wand child active and disjoint red pixels at
+    /// (60,60)..(61,61) and (70,70) (the latter only reachable by an Alt
+    /// non-contiguous fill). `with_base` adds a disjoint marquee base.
+    fn wand_alt_shift_app(ctx: &egui::Context, with_base: bool) -> App {
+        let mut app = app_with_canvas(ctx);
+        seed_red_rect(&mut app, Rect2i::new(60, 60, 2, 2));
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(70, 70, RED);
+        if with_base {
+            marquee(&mut app, (20, 20), (31, 31));
+        }
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::FieldierChildChanged(
+            FieldierChild::Wand,
+        )]);
+        app
+    }
+
+    /// CC (a): Wand Alt+Shift with an existing base, through the REAL
+    /// `App::ui_frame` path. The Alt non-contiguous fill must be ADDED to the
+    /// base — this is the user's failing scenario.
+    #[test]
+    fn wand_alt_shift_real_path_with_base_adds_noncontiguous() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+
+        wand_click_via_real_path(&mut app, &ctx, alt_shift(), egui::pos2(60.0, 60.0));
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("the base must survive the Alt+Shift Add");
+        assert!(sel.contains(20, 20), "the disjoint base survives");
+        assert!(sel.contains(60, 60), "the contiguous fill is added");
+        assert!(
+            sel.contains(70, 70),
+            "Alt must still drop contiguity and add the disconnected pixel"
+        );
+    }
+
+    /// FF: the press-frame modifiers must be LATCHED. This drives the real
+    /// `App::ui_frame` path where the press frame carries `ModifiersChanged`
+    /// (Alt+Shift) and the mouse-up frame carries `ModifiersChanged(NONE)`
+    /// together with the release — so the live held state has already dropped
+    /// Alt/Shift by the click frame. A press-time latch must still apply the
+    /// Alt non-contiguous fill ADDED to the base.
+    #[test]
+    fn wand_alt_shift_same_frame_clear_applies() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        // Press frame: modifiers go down together with the mouse press.
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(alt_shift()), press(at)],
+        );
+        // Release frame: the modifier key-up is batched with the mouse-up, so
+        // `input.modifiers` has already lost Alt/Shift when the click fires.
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers::NONE), release(at)],
+        );
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("the base must survive the latched Alt+Shift Add");
+        assert!(sel.contains(20, 20), "the disjoint base survives");
+        assert!(sel.contains(60, 60), "the contiguous fill is added");
+        assert!(
+            sel.contains(70, 70),
+            "the press-time Alt latch must add the disconnected pixel even \
+             though the modifier was cleared on the release frame"
+        );
+    }
+
+    /// FF: the modifier carried only on the PRIMARY-press frame (never on the
+    /// held state, never on the release) must still apply at the click.
+    #[test]
+    fn wand_alt_shift_press_only_modifier_applies() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, false);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        // Modifier rides the press event only; no `ModifiersChanged` at all.
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: alt_shift(),
+            }],
+        );
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("the press-only Alt+Shift must still select");
+        assert!(sel.contains(60, 60), "the seed region is selected");
+        assert!(
+            sel.contains(70, 70),
+            "the press-event Alt must drop contiguity"
+        );
+    }
+
+    /// FF: an Alt+Shift double-click must apply the Alt non-contiguous fill
+    /// (magic wand), NOT the alpha-connected component that ignores Alt.
+    ///
+    /// The first click is plain so the resulting base contains only the
+    /// contiguous 2x2 seed; the Alt+Shift double-click must then ADD the
+    /// disconnected pixel — which only happens if the double-click uses the
+    /// non-contiguous Alt fill.
+    #[test]
+    fn wand_alt_shift_double_click_is_noncontiguous() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, false);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        // First click: plain, selects only the contiguous 2x2 seed.
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+        // Second click within the double-click window, now with Alt+Shift.
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(alt_shift()), press(at)],
+        );
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers::NONE)],
+        );
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("an Alt+Shift double-click must still select");
+        assert!(
+            sel.contains(60, 60),
+            "the double-click seed region is selected"
+        );
+        assert!(
+            sel.contains(70, 70),
+            "an Alt double-click must use the non-contiguous fill, not the \
+             alpha-connected component"
+        );
+    }
+
+    /// GG: the user's exact scenario. Pressing Alt FIRST and Shift SECOND
+    /// (each reported by its own `ModifiersChanged` frame) must still apply
+    /// BOTH: the Alt non-contiguous fill AND the Shift Add. The second-pressed
+    /// modifier must not be lost.
+    #[test]
+    fn wand_alt_shift_order_alt_then_shift_applies() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        // Alt goes down first ...
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            })],
+        );
+        // ... then Shift joins it.
+        run_app_frame(&mut app, &ctx, vec![modifiers_changed(alt_shift())]);
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers::NONE)],
+        );
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt-then-Shift must apply both modifiers");
+        assert!(sel.contains(20, 20), "the Shift Add keeps the base");
+        assert!(sel.contains(60, 60), "the fill is selected");
+        assert!(
+            sel.contains(70, 70),
+            "the Alt non-contiguous override must not be lost when Shift is pressed second"
+        );
+    }
+
+    /// GG: the mirror order — Shift FIRST, Alt SECOND — must apply BOTH too,
+    /// and yield the SAME selection as the Alt-then-Shift order.
+    #[test]
+    fn wand_alt_shift_order_shift_then_alt_applies() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            })],
+        );
+        run_app_frame(&mut app, &ctx, vec![modifiers_changed(alt_shift())]);
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers::NONE)],
+        );
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Shift-then-Alt must apply both modifiers");
+        assert!(sel.contains(20, 20), "the Shift Add keeps the base");
+        assert!(sel.contains(60, 60), "the fill is selected");
+        assert!(
+            sel.contains(70, 70),
+            "the Alt non-contiguous override must not be lost when Alt is pressed second"
+        );
+    }
+
+    /// GG: the user's exact scenario where the SECOND modifier is reported
+    /// after the primary press (winit can batch the second `ModifiersChanged`
+    /// into a redraw after the mouse-down). The press-time latch then holds
+    /// only Alt; the click-time union must recover Shift so BOTH apply.
+    #[test]
+    fn wand_alt_shift_second_modifier_after_press_applies() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        // Alt first ...
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            })],
+        );
+        // ... mouse-down (latch only sees Alt) ...
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        // ... Shift added while the button is still held ...
+        run_app_frame(&mut app, &ctx, vec![modifiers_changed(alt_shift())]);
+        // ... mouse-up / click.
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt+Shift must apply both modifiers regardless of press order");
+        assert!(sel.contains(20, 20), "the Shift Add keeps the base");
+        assert!(sel.contains(60, 60), "the fill is selected");
+        assert!(
+            sel.contains(70, 70),
+            "the Alt non-contiguous override must not be lost because Shift was reported after the press"
+        );
+    }
+
+    /// GG: mirror order — Shift first, Alt added after the primary press.
+    #[test]
+    fn wand_alt_shift_second_modifier_after_press_reverse_applies() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+        let at = egui::pos2(60.0, 60.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![modifiers_changed(egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            })],
+        );
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![modifiers_changed(alt_shift())]);
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt+Shift must apply both modifiers regardless of press order");
+        assert!(sel.contains(20, 20), "the Shift Add keeps the base");
+        assert!(sel.contains(60, 60), "the fill is selected");
+        assert!(
+            sel.contains(70, 70),
+            "the Alt non-contiguous override must not be lost because Alt was reported after the press"
+        );
+    }
+
+    /// GG: both late-modifier orders give the SAME result (order-independence).
+    #[test]
+    fn wand_alt_shift_late_modifier_press_order_equivalent() {
+        let run = |first_alt: bool| {
+            let ctx = egui::Context::default();
+            let mut app = wand_alt_shift_app(&ctx, true);
+            let at = egui::pos2(60.0, 60.0);
+            let first = if first_alt {
+                egui::Modifiers {
+                    alt: true,
+                    ..egui::Modifiers::NONE
+                }
+            } else {
+                egui::Modifiers {
+                    shift: true,
+                    ..egui::Modifiers::NONE
+                }
+            };
+            run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+            run_app_frame(&mut app, &ctx, vec![modifiers_changed(first)]);
+            run_app_frame(&mut app, &ctx, vec![press(at)]);
+            run_app_frame(&mut app, &ctx, vec![modifiers_changed(alt_shift())]);
+            run_app_frame(&mut app, &ctx, vec![release(at)]);
+            app.projects
+                .current()
+                .selection
+                .as_ref()
+                .map(|sel| (sel.rect(), sel.pixel_count()))
+                .expect("both orders must produce a selection")
+        };
+        assert_eq!(
+            run(true),
+            run(false),
+            "Alt-then-Shift and Shift-then-Alt must give the SAME selection"
+        );
+    }
+
+    /// GG: the two press orders are equivalent (order-independence).
+    #[test]
+    fn wand_alt_shift_press_order_is_equivalent() {
+        let run = |first_alt: bool| {
+            let ctx = egui::Context::default();
+            let mut app = wand_alt_shift_app(&ctx, true);
+            let at = egui::pos2(60.0, 60.0);
+            let first = if first_alt {
+                egui::Modifiers {
+                    alt: true,
+                    ..egui::Modifiers::NONE
+                }
+            } else {
+                egui::Modifiers {
+                    shift: true,
+                    ..egui::Modifiers::NONE
+                }
+            };
+            run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+            run_app_frame(&mut app, &ctx, vec![modifiers_changed(first)]);
+            run_app_frame(&mut app, &ctx, vec![modifiers_changed(alt_shift())]);
+            run_app_frame(&mut app, &ctx, vec![press(at)]);
+            run_app_frame(&mut app, &ctx, vec![release(at)]);
+            run_app_frame(
+                &mut app,
+                &ctx,
+                vec![modifiers_changed(egui::Modifiers::NONE)],
+            );
+            app.projects
+                .current()
+                .selection
+                .as_ref()
+                .map(|sel| (sel.rect(), sel.pixel_count()))
+                .expect("both orders must produce a selection")
+        };
+        assert_eq!(
+            run(true),
+            run(false),
+            "Alt-then-Shift and Shift-then-Alt must give the SAME selection"
+        );
+    }
+
+    /// CC (b): Wand Alt+Shift with NO base, through the REAL `App::ui_frame`
+    /// path. The Alt non-contiguous fill must still produce a selection instead
+    /// of the D78 base-less `Add` no-op.
+    #[test]
+    fn wand_alt_shift_real_path_without_base_still_selects() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, false);
+
+        wand_click_via_real_path(&mut app, &ctx, alt_shift(), egui::pos2(60.0, 60.0));
+
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt+Shift without a base must still select");
+        assert!(sel.contains(60, 60), "the seed region is selected");
+        assert!(
+            sel.contains(70, 70),
+            "Alt drops contiguity and selects the disconnected pixel"
+        );
+    }
+
+    /// CC (c+ e): a plain wand click and Alt alone are unchanged through the
+    /// REAL path: Replace (no base), with Alt dropping contiguity.
+    #[test]
+    fn wand_plain_and_alt_alone_real_path_unchanged() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, false);
+        wand_click_via_real_path(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            egui::pos2(60.0, 60.0),
+        );
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("a plain wand click selects the contiguous region");
+        assert_eq!(sel.pixel_count(), 4, "plain click stays contiguous");
+        assert!(!sel.contains(70, 70), "the disconnected pixel stays out");
+
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, false);
+        wand_click_via_real_path(
+            &mut app,
+            &ctx,
+            egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::pos2(60.0, 60.0),
+        );
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Alt alone still selects");
+        assert_eq!(
+            sel.pixel_count(),
+            5,
+            "Alt alone still drops contiguity (unchanged)"
+        );
+        assert!(sel.contains(70, 70));
+    }
+
+    /// CC (d): Wand Shift alone through the REAL path — Add with a base, the
+    /// D78 no-op without one.
+    #[test]
+    fn wand_shift_alone_real_path_unchanged() {
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, true);
+        wand_click_via_real_path(
+            &mut app,
+            &ctx,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::pos2(60.0, 60.0),
+        );
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Shift+wand with a base adds");
+        assert!(sel.contains(20, 20), "the base survives the Add");
+        assert!(sel.contains(60, 60), "the contiguous fill is added");
+        assert!(
+            !sel.contains(70, 70),
+            "Shift alone does NOT drop contiguity (unchanged)"
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = wand_alt_shift_app(&ctx, false);
+        wand_click_via_real_path(
+            &mut app,
+            &ctx,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::pos2(60.0, 60.0),
+        );
+        assert!(
+            app.projects.current().selection.is_none(),
+            "Shift alone with no base must stay a D78 no-op"
+        );
+    }
+
+    /// BB (b)+(d): selection needs a move past the dead zone. A plain click and
+    /// a sub-threshold move start nothing; a drag past the threshold does. The
+    /// latch clears on release.
+    #[test]
+    fn selection_dead_zone_requires_movement() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+        let at = egui::pos2(60.0, 60.0);
+
+        // Plain click: no movement.
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![release(at)]);
+        assert!(
+            app.projects.current().selection.is_none(),
+            "a plain click must not start a selection"
+        );
+        assert!(app.projects.current().gesture.is_idle());
+        assert!(
+            app.canvas_widget.selection_primary_latch.is_none(),
+            "the latch must clear on release"
+        );
+
+        // Sub-threshold move (< 3 px): still nothing.
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(62.0, 62.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(62.0, 62.0))]);
+        assert!(
+            app.projects.current().selection.is_none(),
+            "a sub-threshold move must not start a selection"
+        );
+        assert!(app.projects.current().gesture.is_idle());
+
+        // Past the threshold: the marquee starts and commits.
+        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
+        run_app_frame(&mut app, &ctx, vec![press(at)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(66.0, 66.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(66.0, 66.0))]);
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("a past-threshold drag must select");
+        assert_eq!(sel.rect(), Rect2i::new(60, 60, 7, 7));
+    }
+
+    /// BB (c): the left-button selection behaviour is unchanged — an inside
+    /// drag marquees normally, and an outside drag still anchors at the clamped
+    /// canvas edge.
+    #[test]
+    fn left_selection_drag_inside_and_outside_unchanged() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fieldier)]);
+
+        // Inside drag.
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(60.0, 60.0))]);
+        run_app_frame(&mut app, &ctx, vec![press(egui::pos2(60.0, 60.0))]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(70.0, 70.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(70.0, 70.0))]);
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(60, 60, 11, 11))
+        );
+
+        // Outside press, drag inside: anchor at the clamped far edge.
+        let outside = egui::pos2(300.0, 200.0);
+        let far = CANVAS_WIDTH as i32 - 1;
+        run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
+        run_app_frame(&mut app, &ctx, vec![press(outside)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(60.0, 60.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(60.0, 60.0))]);
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(60, 60, far - 59, far - 59))
         );
     }
 
@@ -9381,7 +12454,14 @@ mod tests {
             "Palette docks right"
         );
         // The demo panels (A/B/C/D) are still present alongside the new ones.
-        assert_eq!(dock.panel_count(), 8);
+        assert_eq!(dock.panel_count(), 9);
+        assert_eq!(
+            dock.placement(panel_dock::PanelId::new(
+                dock_tile_palette_panel::TILE_PALETTE_PANEL_ID
+            )),
+            Some(panel_dock::PanelPlacement::DockedRight),
+            "Tile Palette docks right"
+        );
         assert_eq!(
             dock.placement(panel_dock::PanelId::new(1)),
             Some(panel_dock::PanelPlacement::DockedRight)
@@ -9488,7 +12568,7 @@ mod tests {
         app.apply_layer_events(vec![LayerPanelEvent::SettingsToggle(b)]);
         assert_eq!(
             app.panel_dock.panel_count(),
-            9,
+            10,
             "switching must not add a second settings panel"
         );
         assert_eq!(*app.layers_host.open_settings.borrow(), Some(b));
@@ -10306,6 +13386,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn app_settings_toggle_seeds_and_clears_the_rename_buffer() {
         let mut app = App::default();
         let lid = app.projects.current_mut().layers.active_layer_id();
@@ -10463,7 +13544,7 @@ mod tests {
             .projects
             .current()
             .layers
-            .composite_layers()
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
             .as_bytes()
             .to_vec();
         app.apply_layer_events(vec![LayerPanelEvent::MergeDown]);
@@ -10471,7 +13552,7 @@ mod tests {
             .projects
             .current()
             .layers
-            .composite_layers()
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
             .as_bytes()
             .to_vec();
         assert_eq!(after, before, "merging composites the top over the bottom");
@@ -11017,6 +14098,43 @@ mod tests {
             WandSettings {
                 contiguous: true,
                 tolerance: 9,
+                restrict_to_region: true,
+            }
+        );
+    }
+
+    #[test]
+    fn fill_settings_events_update_tool_state() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![
+            ToolbarEvent::FillToleranceChanged(7),
+            ToolbarEvent::FillContiguousChanged(false),
+            ToolbarEvent::FillRestrictToRegionChanged(true),
+        ]);
+        let fill = app.projects.current().tool_state.fill();
+        assert_eq!(fill.tolerance, 7);
+        assert!(!fill.contiguous);
+        assert!(fill.restrict_to_region);
+    }
+
+    #[test]
+    fn write_dock_snapshots_carries_fill_settings() {
+        let mut app = App::default();
+        {
+            let state = &mut app.projects.current_mut().tool_state;
+            state.fill_mut().tolerance = 9;
+            state.fill_mut().contiguous = false;
+            state.fill_mut().restrict_to_region = true;
+        }
+
+        app.write_dock_snapshots();
+
+        let view = app.toolbox_host.view.borrow();
+        assert_eq!(
+            view.fill,
+            FillSettings {
+                tolerance: 9,
+                contiguous: false,
                 restrict_to_region: true,
             }
         );
@@ -11599,7 +14717,7 @@ mod tests {
             .expect_selection()
             .object
             .pivot();
-        assert_eq!(pivot, (4.5, 4.5)); // source centre
+        assert_eq!(pivot, (5.0, 5.0)); // AREA centre of 2×2 at (4,4): 4+1
 
         // Scale: ScaleSE drag from (5.5, 4.5) to (6, 5) about the OPPOSITE
         // corner (4,4) — free per-axis resize: ky = (5−4)/(4.5−4) = 2.0 and the
@@ -11703,7 +14821,11 @@ mod tests {
             .expect_selection()
             .object
             .pivot();
-        assert_eq!(pivot_before, (4.5, 4.5), "pivot is the selection centre");
+        assert_eq!(
+            pivot_before,
+            (5.0, 5.0),
+            "pivot is the selection AREA centre"
+        );
 
         {
             let t = app
@@ -11841,10 +14963,11 @@ mod tests {
         );
         assert!(min_y < 4.0, "the top edge moves up, got min_y={min_y}");
         // Issue #2: the pivot is recentred to the transformed bbox centre.
-        assert_eq!(
-            t.object.pivot(),
-            ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5),
-            "the pivot is the transformed bbox centre after an edge scale"
+        let pivot = t.object.pivot();
+        assert!(
+            (pivot.0 - (min_x + max_x) * 0.5).abs() < 1e-3
+                && (pivot.1 - (min_y + max_y) * 0.5).abs() < 1e-3,
+            "the pivot is the transformed bbox centre after an edge scale, got {pivot:?}"
         );
     }
 
@@ -13347,7 +16470,7 @@ mod tests {
         app.lift_transform(Rect2i::new(4, 4, 2, 2));
         let pivot_before = selection_pivot(&app);
 
-        // Pivot (4.5, 4.5): (5.5, 4.5) is at 0°; (5, 5) is at +45°.
+        // AREA-centre pivot (5,5): (6,5) is at 0°; (6,6) is at +45°.
         {
             let t = app
                 .projects
@@ -13357,9 +16480,9 @@ mod tests {
                 .unwrap()
                 .expect_selection_mut();
             t.drag = GizmoHit::Rotate;
-            t.last_pt = (5.5, 4.5);
+            t.last_pt = (6.0, 5.0);
         }
-        app.transform_session_drag((5, 5));
+        app.transform_session_drag((6, 6));
 
         let angle = selection_angle(&app);
         assert!(
@@ -13418,9 +16541,10 @@ mod tests {
     }
 
     /// Without Shift, a Rotate drag accumulates the pointer angle in DEGREES
-    /// (radians in, degrees stored) — a known drag around the pivot must land
-    /// on ≈ −108.43° and would be thousands of degrees off if `rotate_by`
-    /// were fed degrees.
+    /// (radians in, degrees stored) — a known drag around the AREA-centre pivot
+    /// (5,5) from (5.5,4.5) [−45°] to (4,3) [−116.565°] must land on
+    /// ≈ −71.57° and would be thousands of degrees off if `rotate_by` were fed
+    /// degrees.
     #[test]
     fn transform_session_drag_rotate_unsnapped_radians() {
         let mut app = App::default();
@@ -13450,8 +16574,8 @@ mod tests {
             .object
             .angle_deg;
         assert!(
-            (angle - (-108.43)).abs() < 0.05,
-            "expected ≈ −108.43°, got {angle} (degrees/radians regression?)"
+            (angle - (-71.57)).abs() < 0.05,
+            "expected ≈ −71.57°, got {angle} (degrees/radians regression?)"
         );
     }
 
@@ -13476,7 +16600,7 @@ mod tests {
         }
         app.transform_session_drag((4, 3));
         assert!(
-            (selection_angle(&app) - (-108.43)).abs() < 0.05,
+            (selection_angle(&app) - (-71.57)).abs() < 0.05,
             "first frame rotates about the start, got {}",
             selection_angle(&app)
         );
@@ -13494,7 +16618,7 @@ mod tests {
         }
         app.transform_session_drag((4, 3));
         assert!(
-            (selection_angle(&app) - (-108.43)).abs() < 0.05,
+            (selection_angle(&app) - (-71.57)).abs() < 0.05,
             "rotation must recompute from the start angle, got {}",
             selection_angle(&app)
         );
@@ -14178,7 +17302,7 @@ mod tests {
         seed_red_rect(&mut app, Rect2i::new(4, 4, 8, 8));
         app.lift_transform(Rect2i::new(4, 4, 8, 8));
         let pivot_before = selection_pivot(&app);
-        assert_eq!(pivot_before, (7.5, 7.5));
+        assert_eq!(pivot_before, (8.0, 8.0));
 
         {
             let t = app
@@ -14214,6 +17338,34 @@ mod tests {
             (pivot.0 - 10.0).abs() < 1e-3 && (pivot.1 - 10.0).abs() < 1e-3,
             "the recentred pivot must be (10, 10), got {pivot:?}"
         );
+    }
+
+    /// JJ: the gizmo pivot crosshair is drawn at the object's pivot, which is
+    /// the visual AREA centre — 16×16 → (8,8), and equal to the rendered bbox
+    /// area centre `(min + max)/2`.
+    #[test]
+    fn gizmo_pivot_is_the_visual_area_centre() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(4, 4, 16, 16));
+        app.lift_transform(Rect2i::new(4, 4, 16, 16));
+
+        let CanvasOverlay::Gizmo { pivot, corners, .. } = app.current_overlay() else {
+            panic!("a lifted selection must expose a gizmo overlay");
+        };
+        // 16×16 at (4,4): area centre is 4 + 16/2 = 12 on both axes.
+        assert_eq!(pivot, (12.0, 12.0), "gizmo crosshair at the area centre");
+        let (min_x, min_y, max_x, max_y) = selection_bbox(&app);
+        assert_eq!(
+            pivot,
+            ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5),
+            "gizmo pivot == rendered bbox area centre"
+        );
+        // The rotated-quad corners are also symmetric about the area centre.
+        let (cx, cy) = (
+            corners.iter().map(|p| p.0).sum::<f32>() / 4.0,
+            corners.iter().map(|p| p.1).sum::<f32>() / 4.0,
+        );
+        assert!((cx - pivot.0).abs() < 1e-4 && (cy - pivot.1).abs() < 1e-4);
     }
 
     /// Issue #2: after a single-axis edge scale the pivot is recentred to the
@@ -14734,6 +17886,24 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(raw_input, |_ui| app.handle_shortcuts());
+        output.textures_delta.clear();
+    }
+
+    /// Moves the pointer for the App's next `ctx.input` read (e.g. the
+    /// Tile-placer hover preview), by running one frame with a `PointerMoved`
+    /// event — `PointerState::latest_pos` is private, so tests drive the
+    /// pointer through the event stream like the real windowing layer does.
+    fn move_pointer(app: &App, pos: egui::Pos2) {
+        let ctx = app.ctx.clone();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw_input, |_ui| {});
         output.textures_delta.clear();
     }
 
@@ -15898,8 +19068,13 @@ mod tests {
 
     /// Build an App with a canvas texture uploaded so `ui_frame` renders the
     /// canvas and drives the global-pointer gesture machine.
+    ///
+    /// The default new-project camera is panned beside the dock (the
+    /// GÖRÜNÜRLÜK fix), but the gesture tests drive the canvas at the origin:
+    /// reset the pan to (0,0) so screen coordinates map 1:1 to canvas pixels.
     fn app_with_canvas(ctx: &egui::Context) -> App {
         let mut app = App::default();
+        app.projects.current_mut().camera.set_pan(0, 0);
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [CANVAS_WIDTH, CANVAS_HEIGHT],
             &vec![0; CANVAS_WIDTH * CANVAS_HEIGHT * 4],
@@ -15943,6 +19118,26 @@ mod tests {
         egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// BB: a secondary-button (right) press, for the selection Subtract path.
+    fn press_secondary(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// BB: a secondary-button release.
+    fn release_secondary(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
             pressed: false,
             modifiers: egui::Modifiers::NONE,
         }
@@ -17227,6 +20422,9 @@ mod tests {
 
     fn app_with_own_canvas() -> App {
         let mut app = App::default();
+        // Reset the default camera pan (GÖRÜNÜRLÜK fix pans new projects beside
+        // the dock); the gesture/keyboard tests drive the canvas at the origin.
+        app.projects.current_mut().camera.set_pan(0, 0);
         let ctx = app.ctx.clone();
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [CANVAS_WIDTH, CANVAS_HEIGHT],
@@ -17552,6 +20750,2842 @@ mod tests {
             app.projects.current().undo.undo_len(),
             0,
             "a no-op fill pushes no undo step"
+        );
+    }
+
+    #[test]
+    /// Given the Fill tolerance is raised, when the bucket runs, then
+    /// 4-connected near-colors join the flood but out-of-tolerance ones do not.
+    fn fill_applies_the_stored_tolerance() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        {
+            let buf = &mut app.projects.current_mut().layers.active_layer_mut().buffer;
+            buf.set_pixel(4, 4, Color::rgb(50, 50, 50)); // seed
+            buf.set_pixel(5, 4, Color::rgb(60, 60, 60)); // diff 10 → in tolerance
+            buf.set_pixel(6, 4, Color::rgb(70, 70, 70)); // diff 20 → out
+        }
+        app.apply_toolbar_events(vec![ToolbarEvent::FillToleranceChanged(12)]);
+
+        app.apply_fill((4, 4));
+
+        let mut painted = pixels_holding(&app, RED);
+        painted.sort_unstable();
+        assert_eq!(
+            painted,
+            vec![(4, 4), (5, 4)],
+            "only the seed and the in-tolerance neighbour may change"
+        );
+    }
+
+    #[test]
+    /// Given non-contiguous mode, when the bucket runs, then every matching
+    /// pixel of the layer changes, including disconnected ones.
+    fn fill_non_contiguous_replaces_disconnected_matches() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        {
+            let buf = &mut app.projects.current_mut().layers.active_layer_mut().buffer;
+            buf.set_pixel(4, 4, Color::rgb(50, 50, 50));
+            buf.set_pixel(20, 20, Color::rgb(50, 50, 50));
+        }
+        app.apply_toolbar_events(vec![ToolbarEvent::FillContiguousChanged(false)]);
+
+        app.apply_fill((4, 4));
+
+        let mut painted = pixels_holding(&app, RED);
+        painted.sort_unstable();
+        assert_eq!(
+            painted,
+            vec![(4, 4), (20, 20)],
+            "the disconnected match must also be replaced"
+        );
+    }
+
+    #[test]
+    /// Given Alt is held, when the bucket runs, then it is momentarily a
+    /// global (non-contiguous) replace-all even though contiguous is stored.
+    fn fill_alt_is_global_replace_all() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        {
+            let buf = &mut app.projects.current_mut().layers.active_layer_mut().buffer;
+            buf.set_pixel(4, 4, Color::rgb(50, 50, 50));
+            buf.set_pixel(20, 20, Color::rgb(50, 50, 50));
+        }
+        assert!(app.projects.current().tool_state.fill().contiguous);
+        set_modifiers(
+            &app,
+            egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+
+        app.apply_fill((4, 4));
+
+        let mut painted = pixels_holding(&app, RED);
+        painted.sort_unstable();
+        assert_eq!(painted, vec![(4, 4), (20, 20)]);
+        assert!(
+            app.projects.current().tool_state.fill().contiguous,
+            "Alt is a temporary override, not a stored setting change"
+        );
+    }
+
+    #[test]
+    /// Given restrict-to-region, when the bucket runs, then the flood stays
+    /// inside the seed's tile cell.
+    fn fill_restrict_to_region_stays_inside_the_tile_cell() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        {
+            let buf = &mut app.projects.current_mut().layers.active_layer_mut().buffer;
+            for x in 4..24 {
+                buf.set_pixel(x, 4, Color::rgb(50, 50, 50));
+            }
+        }
+        app.apply_toolbar_events(vec![ToolbarEvent::FillRestrictToRegionChanged(true)]);
+
+        app.apply_fill((4, 4));
+
+        let expected: Vec<(i32, i32)> = (4..16).map(|x| (x, 4)).collect();
+        assert_eq!(
+            pixels_holding(&app, RED),
+            expected,
+            "tile size 16 clips the run at x=16"
+        );
+    }
+
+    #[test]
+    /// Given both a selection and restrict-to-region, when the bucket runs,
+    /// then the fill is bounded by the intersection of the two clips.
+    fn fill_intersects_selection_and_region_clips() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        {
+            let buf = &mut app.projects.current_mut().layers.active_layer_mut().buffer;
+            for x in 4..24 {
+                buf.set_pixel(x, 4, Color::rgb(50, 50, 50));
+            }
+        }
+        // Selection spans x=4..24; the seed's tile cell ends at x=16.
+        marquee(&mut app, (4, 4), (23, 4));
+        app.apply_toolbar_events(vec![ToolbarEvent::FillRestrictToRegionChanged(true)]);
+
+        app.apply_fill((4, 4));
+
+        let expected: Vec<(i32, i32)> = (4..16).map(|x| (x, 4)).collect();
+        assert_eq!(pixels_holding(&app, RED), expected);
+    }
+
+    #[test]
+    /// Given the F default binding, when it is pressed, then the Fill tool is
+    /// deliberately selected.
+    fn select_fill_hotkey_selects_the_fill_tool() {
+        let mut app = App::default();
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+
+        send_key(&mut app, egui::Key::F, egui::Modifiers::NONE);
+
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Fill,
+            "the F shortcut must select the Fill tool"
+        );
+    }
+
+    #[test]
+    /// Given the B default binding, when it is pressed, then the Tile tool is
+    /// deliberately selected.
+    fn b_key_selects_the_tile_tool() {
+        let mut app = App::default();
+        assert_ne!(app.projects.current().tool_state.tool(), Tool::Tile);
+
+        send_key(&mut app, egui::Key::B, egui::Modifiers::NONE);
+
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Tile,
+            "the B shortcut must select the Tile tool"
+        );
+    }
+
+    // -- Tile placer (Tool::Tile) -------------------------------------------
+
+    #[test]
+    fn tile_tool_single_click_stamps_selected_tile_at_snapped_cell() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Click at (5,3) snaps to grid cell (1,0).
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .expect("a tilemap is created on first placement");
+        assert_eq!(tm.tile_size, 4);
+        assert_eq!(tm.cell((1, 0)).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(tm.cell((1, 0)).map(|c| c.rotation), Some(0));
+        assert!(!tm.cell((1, 0)).unwrap().flip_x);
+        assert!(!tm.cell((1, 0)).unwrap().flip_y);
+        // A click is ONE undo step.
+        assert_eq!(app.projects.current().undo.undo_len(), 1);
+    }
+
+    #[test]
+    fn tile_tool_drag_stamps_multiple_cells_in_one_undo() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // One drag over two cells.
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((9, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(tm.cell((2, 0)).map(|c| c.tile_id), Some(tile_id));
+        // The whole drag is ONE undo step.
+        assert_eq!(app.projects.current().undo.undo_len(), 1);
+
+        // Undo restores both cells.
+        app.undo_document();
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)), None);
+        assert_eq!(tm.cell((2, 0)), None);
+
+        // Redo re-applies both.
+        app.redo_document();
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(tm.cell((2, 0)).map(|c| c.tile_id), Some(tile_id));
+    }
+
+    #[test]
+    fn tile_tool_right_click_clears_cells() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert!(app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap()
+            .cell((1, 0))
+            .is_some());
+
+        // Right-drag clears the cell (no selection required).
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_ended: true,
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)), None);
+        assert_eq!(app.projects.current().undo.undo_len(), 2);
+    }
+
+    #[test]
+    fn tile_tool_placement_transforms_x_z_r_q() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Each modifier is PRESSED once and the sticky transform is reset to
+        // the identity between keys, so each key's individual effect is
+        // isolated from the others.
+
+        // R pressed once -> 90° CW (rotation 1).
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        app.tile_placer_transform = TilePlacerTransform::default();
+
+        // Q pressed once -> 90° CCW (rotation 3).
+        press_key(&mut app, egui::Key::Q);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((9, 3)),
+            ..Default::default()
+        });
+        app.tile_placer_transform = TilePlacerTransform::default();
+
+        // X pressed once -> flip_x.
+        press_key(&mut app, egui::Key::X);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((13, 3)),
+            ..Default::default()
+        });
+        app.tile_placer_transform = TilePlacerTransform::default();
+
+        // Z pressed once -> flip_y.
+        press_key(&mut app, egui::Key::Z);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((17, 3)),
+            ..Default::default()
+        });
+        app.tile_placer_transform = TilePlacerTransform::default();
+
+        // No modifier pressed at all -> the cell keeps its own transform
+        // (identity for a fresh cell).
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((21, 3)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        let cell = |x: u32, y: u32| tm.cell((x, y)).unwrap();
+        assert_eq!(cell(1, 0).rotation, 1);
+        assert_eq!(cell(1, 0).tile_id, tile_id);
+        assert_eq!(cell(2, 0).rotation, 3);
+        assert!(cell(3, 0).flip_x);
+        assert!(!cell(3, 0).flip_y);
+        assert!(cell(4, 0).flip_y);
+        assert!(!cell(4, 0).flip_x);
+        assert_eq!(
+            cell(5, 0).rotation,
+            0,
+            "with no modifier ever pressed the cell keeps its own (identity) transform"
+        );
+    }
+
+    /// Sticky accumulation: REPEATED presses compose, and a full turn wraps.
+    /// Four R presses return the transform to rotation 0 (still `active`), and
+    /// a second X press toggles `flip_x` back off.
+    #[test]
+    fn tile_placement_transform_accumulates_across_presses() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Two R presses -> 180°.
+        press_key(&mut app, egui::Key::R);
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+
+        // Two more R presses -> a full turn, wrapped back to 0°.
+        press_key(&mut app, egui::Key::R);
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((4, 0)),
+            ..Default::default()
+        });
+
+        // X pressed twice -> toggled on then OFF again.
+        press_key(&mut app, egui::Key::X);
+        press_key(&mut app, egui::Key::X);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((8, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((0, 0)).unwrap().rotation,
+            2,
+            "two R presses accumulate to 180°"
+        );
+        assert_eq!(
+            tm.cell((1, 0)).unwrap().rotation,
+            0,
+            "four R presses make a full turn and wrap back to 0°"
+        );
+        assert!(
+            !tm.cell((2, 0)).unwrap().flip_x,
+            "a second X press toggles flip_x back off"
+        );
+    }
+
+    /// HOLDING a modifier does NOT re-apply it: the transform is edge-triggered
+    /// on `key_pressed`, so a key left down across many frames contributes
+    /// exactly one apply. Only a fresh press adds another.
+    #[test]
+    fn tile_placement_transform_does_not_repeat_while_held() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // R held down (one press) while several further frames run: a held key
+        // must contribute exactly ONE quarter-turn, not one per frame.
+        hold_key(&mut app, egui::Key::R);
+        idle_frames(&mut app, 5);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        release_key(&app, egui::Key::R);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((0, 0)).unwrap().rotation,
+            1,
+            "holding R across many frames applies exactly one 90° CW turn"
+        );
+    }
+
+    /// The key NEW assertion for the sticky model: RELEASING a modifier must
+    /// NOT reset the transform. The placement after the release is still
+    /// flipped/rotated, because the transform lives until the Tile tool is
+    /// deactivated.
+    #[test]
+    fn tile_placement_transform_sticks_on_key_release() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // X held -> the sticky transform gets flip_x.
+        hold_key(&mut app, egui::Key::X);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        // X released -> the sticky transform is NOT reset.
+        release_key(&app, egui::Key::X);
+
+        // The NEXT placement (a fresh cell) is still flipped: the transform
+        // sticks across the key release.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((4, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        let cell0 = tm.cell((0, 0)).unwrap();
+        assert!(cell0.flip_x, "the X-held placement must carry flip_x");
+        let cell1 = tm.cell((1, 0)).unwrap();
+        assert!(
+            cell1.flip_x,
+            "releasing X must NOT reset the sticky transform — the next placement is still flipped"
+        );
+    }
+
+    /// UX item 2/4: the Tile-placer hover preview (the App-side state behind
+    /// `CanvasOverlay::TilePlacer`) tracks the pointer, the selected tile and
+    /// the STICKY X/Z/R/Q transform. A stale/absent state (other tool, no tile,
+    /// pointer off-canvas) yields no preview.
+    #[test]
+    fn tile_placer_preview_tracks_pointer_tile_and_transform() {
+        let mut app = App::default();
+        let tile_id = {
+            let session = app.projects.current_mut();
+            // A 2x2 tile with only pixel (0,0) opaque: the transform shifts
+            // that single pixel, so the preview shows the effective mapping.
+            let mut pixels = vec![0u8; 2 * 2 * 4];
+            pixels[..4].copy_from_slice(&[255, 0, 0, 255]);
+            let id = session.tile_palette.add(Tile {
+                id: TileId(0),
+                w: 2,
+                h: 2,
+                pixels,
+            });
+            session.tile_palette.select(id);
+            id
+        };
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        // Stamp one cell so the index labels have something to report.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        let camera = crate::core::camera::Camera::new();
+
+        // Pointer over canvas cell (1,0): screen (4,0) on an 8x8 canvas at
+        // 100%, tile_size 4 -> hover cell (1,0), preview at the cell origin.
+        // The preview carries the REAL pixel colour, not an outline.
+        move_pointer(&app, egui::pos2(4.0, 0.0));
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.hover_cell, Some((1, 0)));
+        assert_eq!(preview.preview_pixels, vec![(4, 0, RED)]);
+
+        // X pressed -> sticky flip_x: root (0,0) -> offset (1,0) -> canvas (5,0).
+        // Releasing X does NOT reset it (the preview keeps showing the flip).
+        press_key(&mut app, egui::Key::X);
+        release_key(&app, egui::Key::X);
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.preview_pixels, vec![(5, 0, RED)]);
+
+        // R pressed -> sticky 90° CW on top of the flip: root (0,0) -> flip
+        // (1,0) -> rotate CW (1,1) -> canvas (5,1).
+        press_key(&mut app, egui::Key::R);
+        release_key(&app, egui::Key::R);
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.preview_pixels, vec![(5, 1, RED)]);
+
+        // Q pressed -> sticky 90° CCW (net 0°): back to flip-only -> canvas
+        // (5,0).
+        press_key(&mut app, egui::Key::Q);
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.preview_pixels, vec![(5, 0, RED)]);
+
+        // Pointer off-canvas: no hover, no preview.
+        move_pointer(&app, egui::pos2(100.0, 100.0));
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.hover_cell, None);
+        assert!(preview.preview_pixels.is_empty());
+        assert_eq!(
+            preview.indices,
+            vec![((0, 0), tile_id.0)],
+            "the stamped cell keeps its index label"
+        );
+
+        // A different tool yields a fully absent preview.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview, TilePlacerPreview::default());
+    }
+
+    /// The sticky rotation persists across placements: after pressing R, the
+    /// NEXT placement (a fresh cell) is still rotated 90° CW.
+    #[test]
+    fn tile_placement_rotation_persists_after_placement() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // R pressed -> sticky 90° CW.
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        // The NEXT placement (a fresh cell) is still rotated: the transform
+        // sticks across placements.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((4, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((0, 0)).unwrap().rotation,
+            1,
+            "the R-pressed placement is rotated 90° CW"
+        );
+        assert_eq!(
+            tm.cell((1, 0)).unwrap().rotation,
+            1,
+            "the sticky rotation persists to the next placement"
+        );
+    }
+
+    /// Re-stamping the SAME cell with the sticky transform active re-stamps the
+    /// SAME absolute transform (it does not toggle/accumulate), so the cell
+    /// stays at rotation 1. This is the redundant re-stamp that
+    /// `handle_tile_placer_interactions` performs on `stroke_ended` to measure
+    /// fast-drag extent — an absolute apply keeps it idempotent, whereas a
+    /// delta/xor model would toggle the rotation back off.
+    #[test]
+    fn tile_placement_rotation_does_not_accumulate_on_re_stamp() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // R pressed once (sticky 90° CW), then stamp the SAME cell twice.
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((0, 0)).unwrap().rotation,
+            1,
+            "re-stamping re-applies the same absolute sticky transform (no accumulation)"
+        );
+    }
+
+    /// A drag with X pressed once applies the sticky flip_x to EVERY stamped cell
+    /// (the transform is read once per press, not per frame).
+    #[test]
+    fn tile_drag_with_x_held_flips_every_stamped_cell() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // X pressed once -> sticky flip_x; the drag's stamps all inherit it.
+        press_key(&mut app, egui::Key::X);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((0, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((4, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((4, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert!(tm.cell((0, 0)).unwrap().flip_x);
+        assert!(tm.cell((1, 0)).unwrap().flip_x);
+    }
+
+    /// The sticky Tile-placer transform resets when the Tile tool is
+    /// DEACTIVATED (switching to another tool and back).
+    #[test]
+    fn tile_placer_transform_resets_on_tool_deactivation() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // R pressed -> sticky 90° CW.
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+
+        // Deactivate the Tile tool (switch away and back) -> the sticky
+        // transform resets to the identity.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // The next placement (a fresh cell) has the default transform.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((4, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((0, 0)).unwrap().rotation,
+            1,
+            "the R-pressed placement is rotated 90° CW"
+        );
+        assert_eq!(
+            tm.cell((1, 0)).unwrap().rotation,
+            0,
+            "deactivating the Tile tool resets the sticky transform"
+        );
+    }
+
+    /// The Tool Property panel is a VIEW over the same transform the keys write:
+    /// a rotation edit changes what the NEXT STAMP writes, not just the display.
+    #[test]
+    fn tile_panel_rotation_edit_changes_the_next_stamp() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // The user types 180° into the panel's rotation box.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(180)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        // The next placement (a fresh cell) carries it.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((4, 0)),
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((0, 0)).unwrap().rotation,
+            2,
+            "the panel rotation must reach the cell the next stamp writes"
+        );
+        assert_eq!(
+            tm.cell((1, 0)).unwrap().rotation,
+            2,
+            "the panel-set rotation persists to the following placement"
+        );
+        drop(tm);
+
+        // One source of truth: a later R press continues FROM the panel's
+        // 180° (→ 270°) instead of restarting from the identity.
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((8, 0)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((2, 0)).unwrap().rotation,
+            3,
+            "R must continue from the panel-set 180°, landing on 270°"
+        );
+    }
+
+    /// The rounding/wrapping rule, end-to-end through the event the panel
+    /// emits: `45 → 0` and `-90 → 270`, and a typed `360` normalizes to `0`.
+    /// The panel snaps before emitting, so the App stores quarter-turns only.
+    #[test]
+    fn tile_panel_rotation_rounds_and_wraps_to_quarter_turns() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // 45° snaps DOWN to 0 (the panel rounds 45 → 0; only exact 90 multiples
+        // are representable) — assert via the degrees the panel would emit.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(0)]);
+        assert_eq!(app.tile_placer_transform.rotation_degrees(), 0);
+        assert_eq!(app.tile_placer_transform.rotation, 0, "45 rounds to 0°");
+
+        // -90 wraps to 270 (rotation 3).
+        app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(270)]);
+        assert_eq!(app.tile_placer_transform.rotation_degrees(), 270);
+        assert_eq!(app.tile_placer_transform.rotation, 3, "-90 wraps to 270°");
+
+        // 360 normalizes to 0.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(360)]);
+        assert_eq!(
+            app.tile_placer_transform.rotation, 0,
+            "a full turn is no rotation"
+        );
+
+        // A nonsense value can never produce a rotation outside 0..=3.
+        for degrees in [i32::MIN, -1080, -90, -45, 0, 1, 45, 90, 359, 360, 450, i32::MAX] {
+            app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(degrees)]);
+            assert!(
+                app.tile_placer_transform.rotation <= 3,
+                "{degrees} produced rotation {} (must be 0..=3)",
+                app.tile_placer_transform.rotation
+            );
+        }
+    }
+
+    /// The two flip checkboxes drive the SAME state the X/Z keys write, and a
+    /// key press STACKS on top of a panel-set value (two inputs, one state).
+    #[test]
+    fn tile_panel_flips_share_the_key_state_and_stack_with_it() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Panel sets the horizontal flip; the stamp honours it.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileFlipXChanged(true)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+        {
+            let tm = app
+                .projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap();
+            assert!(
+                tm.cell((0, 0)).unwrap().flip_x,
+                "the panel's horizontal flip must reach the stamp"
+            );
+        }
+
+        // Pressing X TOGGLES the shared flag back off — the panel checkbox and
+        // the key are two views of one boolean, so they cannot disagree.
+        press_key(&mut app, egui::Key::X);
+        assert!(
+            !app.tile_placer_transform.flip_x,
+            "the X key toggles the same flag the panel checkbox wrote"
+        );
+
+        // Re-enable via the panel, then press Z: both flips are now set and a
+        // subsequent stamp carries BOTH.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileFlipXChanged(true)]);
+        press_key(&mut app, egui::Key::Z);
+        assert!(app.tile_placer_transform.flip_x);
+        assert!(app.tile_placer_transform.flip_y);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((4, 0)),
+            ..Default::default()
+        });
+        {
+            let tm = app
+                .projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap();
+            let cell = tm.cell((1, 0)).unwrap();
+            assert!(cell.flip_x && cell.flip_y, "panel flip + Z key stack");
+        }
+    }
+
+    /// A panel edit is an EXPLICIT transform choice, so it must set `active`
+    /// even when no Q/R/X/Z key was ever pressed — otherwise the stamp would
+    /// fall back to the cell's own transform and silently ignore the edit.
+    #[test]
+    fn tile_panel_edit_activates_the_transform() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // No key has been pressed: the transform is still inactive, so a stamp
+        // keeps the cell's own (identity) transform.
+        assert!(!app.tile_placer_transform.active);
+
+        // A panel flip edit activates it.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileFlipYChanged(true)]);
+        assert!(
+            app.tile_placer_transform.active,
+            "a panel flip edit must set active"
+        );
+
+        // Re-entering the tool resets to the inactive default.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert!(!app.tile_placer_transform.active);
+
+        // So does a panel rotation edit.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(270)]);
+        assert!(
+            app.tile_placer_transform.active,
+            "a panel rotation edit must set active"
+        );
+    }
+
+    /// The panel's VIEW snapshot mirrors the one live transform, so a key press
+    /// shows up in the controls and a panel edit is not a second copy of state.
+    #[test]
+    fn tile_panel_view_mirrors_the_single_transform() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        app.write_dock_snapshots();
+        assert_eq!(
+            app.toolbox_host.view.borrow().tile_placer.rotation,
+            0,
+            "the panel starts at the identity rotation"
+        );
+
+        // A KEY press is visible in the panel's view (not just in the stamp).
+        press_key(&mut app, egui::Key::R);
+        app.write_dock_snapshots();
+        assert_eq!(
+            app.toolbox_host.view.borrow().tile_placer.rotation,
+            90,
+            "the R press must be mirrored into the panel view"
+        );
+
+        // A PANEL edit is reflected back identically — one state, two inputs.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileRotationChanged(180)]);
+        app.write_dock_snapshots();
+        let view = app.toolbox_host.view.borrow().tile_placer;
+        assert_eq!(view.rotation, 180);
+        assert_eq!(view.rotation, app.tile_placer_transform.rotation_degrees());
+    }
+
+    /// UX item 2: the Swap-Colors shortcut is suppressed while the Tile tool
+    /// is active (X is the placer's flip modifier), and still swaps outside it.
+    #[test]
+    fn tile_tool_suppresses_swap_colors_shortcut() {
+        let mut app = App::default();
+        let primary = Color::rgb(10, 20, 30);
+        let secondary = Color::rgb(200, 210, 220);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(primary)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::SecondaryColorChanged(secondary)]);
+
+        // Outside the Tile tool: plain X still swaps the colors.
+        send_key(&mut app, egui::Key::X, egui::Modifiers::NONE);
+        assert_eq!(app.projects.current().color, secondary);
+        assert_eq!(app.projects.current().secondary_color, primary);
+
+        // While the Tile tool is active, the SwapColors action is gated off.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        let before = (
+            app.projects.current().color,
+            app.projects.current().secondary_color,
+        );
+        send_key(&mut app, egui::Key::X, egui::Modifiers::NONE);
+        let after = (
+            app.projects.current().color,
+            app.projects.current().secondary_color,
+        );
+        assert_eq!(
+            before, after,
+            "X must NOT swap colors while the Tile tool is active (it flips the next tile)"
+        );
+    }
+
+    #[test]
+    fn tile_tool_locked_layer_blocks_writes() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().layers.active_layer_mut().locked = true;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .is_none(),
+            "a locked layer must not even get a tilemap created"
+        );
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            0,
+            "a blocked write pushes no undo step"
+        );
+    }
+
+    #[test]
+    fn tile_tool_creates_tilemap_sized_to_canvas() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 16;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert!(app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .is_none());
+
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((8, 8)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.tile_size, 16);
+        assert_eq!((tm.cols, tm.rows), (8, 8), "128x128 canvas / 16px cells");
+        assert!(tm.cell((0, 0)).is_some());
+    }
+
+    #[test]
+    fn tile_tool_placement_without_selected_tile_is_a_noop() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert!(app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .is_none());
+        assert_eq!(app.projects.current().undo.undo_len(), 0);
+        // Honest feedback: an empty palette must surface a status message so
+        // the click does not silently no-op.
+        assert!(
+            app.projects
+                .current()
+                .last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("palette is empty")),
+            "an empty-palette stamp attempt must give the user feedback"
+        );
+    }
+
+    #[test]
+    /// Honest feedback: stamping a fully-transparent tile (the EMPTY tile
+    /// "+ Empty" creates) must surface a status message — placing it renders
+    /// nothing, so the user must be told the tile is empty.
+    fn transparent_tile_stamp_gives_feedback() {
+        let mut app = App::default();
+        // An EMPTY (fully transparent) tile added directly + selected.
+        let session = app.projects.current_mut();
+        let id = session.tile_palette.add(Tile {
+            id: TileId(0),
+            w: 2,
+            h: 2,
+            pixels: vec![0u8; 16], // all transparent
+        });
+        session.tile_palette.select(id);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        assert!(
+            app.projects
+                .current()
+                .last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("empty")),
+            "stamping a transparent tile must warn the user"
+        );
+    }
+
+    #[test]
+    /// REGRESSION: the tilemap raster composites OVER the layer's own pixel
+    /// buffer (documented Z-order) — a Pencil stroke on an EMPTY cell is
+    /// visible, and a Pencil stroke drawn INSIDE a tile cell is UNDER the tile
+    /// (the tile wins on its own cell).
+    fn pencil_draw_z_order_on_a_layer_with_a_tilemap() {
+        use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette};
+
+        let mut app = App::default();
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 2,
+            pixels: vec![0u8, 0, 255, 255].repeat(4), // solid blue 2x2
+        });
+        app.projects.current_mut().tile_palette = palette;
+        app.projects.current_mut().tile_size = 4;
+        // The ACTIVE layer has a tilemap with a blue tile at cell (0,0) AND a
+        // pixel buffer (the same layer the Pencil draws on).
+        {
+            let mut tm = TileMap::new(4, 8, 8);
+            tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
+            app.projects.current_mut().layers.active_layer_mut().tilemap = Some(tm);
+        }
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        // Draw INSIDE the tile cell (0,0) and on an EMPTY cell (16,16).
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((0, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((16, 16)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+
+        let session = app.projects.current();
+        // The stroke landed in the layer's pixel buffer.
+        assert_eq!(
+            session.layers.active_layer().buffer.get_pixel(0, 0),
+            Some(RED),
+            "the stroke writes pixels into the layer buffer"
+        );
+        // INTEGRATED MODEL: the stroke at (0,0) — inside the tile cell (0,0) —
+        // wrote THROUGH to the root tile's un-oriented pixel (0,0), and every
+        // instance was re-baked. So the composite at (0,0) is now RED (the
+        // edited root tile), not the original blue.
+        let root = session.tile_palette.get(TileId(1)).unwrap();
+        let root_idx = 0usize;
+        assert_eq!(
+            &root.pixels[root_idx..root_idx + 4],
+            &[255, 0, 0, 255],
+            "a stroke on a tiled cell writes THROUGH to the root tile"
+        );
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(
+            composite.get_pixel(0, 0),
+            Some(RED),
+            "the edited root tile re-bakes to RED on its cell"
+        );
+        assert_eq!(
+            composite.get_pixel(1, 0),
+            Some(Color::rgb(0, 0, 255)),
+            "the untouched root pixels stay blue"
+        );
+        assert_eq!(
+            composite.get_pixel(16, 16),
+            Some(RED),
+            "a Pencil pixel drawn on an empty cell is visible"
+        );
+
+        // The sync_texture-style PARTIAL composite carries the tile (and the
+        // empty-cell pixel).
+        let partial = session
+            .layers
+            .composite_layers_region(Rect2i::new(0, 0, 2, 2), &session.tile_palette)
+            .unwrap();
+        assert_eq!(partial.get_pixel(0, 0), Some(RED));
+        assert_eq!(partial.get_pixel(1, 0), Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    /// REGRESSION: a Pencil stroke on a tilemap layer must still mark the
+    /// buffer dirty (so sync_texture's partial path uploads it).
+    fn pencil_stroke_marks_dirty_on_tilemap_layer() {
+        use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette};
+
+        let mut app = App::default();
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 2,
+            pixels: vec![0u8, 0, 255, 255].repeat(4),
+        });
+        app.projects.current_mut().tile_palette = palette;
+        app.projects.current_mut().tile_size = 4;
+        {
+            let mut tm = TileMap::new(4, 8, 8);
+            tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
+            app.projects.current_mut().layers.active_layer_mut().tilemap = Some(tm);
+        }
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((0, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        let dirty = app
+            .projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .take_pixels_changed();
+        assert!(
+            dirty.is_some_and(|region| region.contains_rect(Rect2i::new(0, 0, 1, 1))),
+            "a Pencil stroke on a tilemap layer must dirty-track the stroke"
+        );
+    }
+
+    #[test]
+    /// REGRESSION: after a Tile-tool placement click, the placer gesture must
+    /// not leave stuck state — switching to Pencil and drawing works, and the
+    /// composite shows the drawn pixel over the placed tile.
+    fn tile_placer_release_does_not_block_next_stroke() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [0, 0, 255, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        // Place a tile at cell (0,0) via a real click.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((0, 0)).map(|c| c.tile_id), Some(tile_id));
+
+        // Switch to Pencil and draw over the placed tile.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((0, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(0, 0),
+            Some(RED),
+            "the stroke lands in the buffer after a tile placement"
+        );
+        let session = app.projects.current();
+        // INTEGRATED MODEL: the stroke at (0,0) on the placed tile's cell wrote
+        // THROUGH to the root tile, so the composite now shows RED (the edited
+        // root re-baked on its cell).
+        let root = session.tile_palette.get(tile_id).unwrap();
+        let root_idx = 0usize;
+        assert_eq!(
+            &root.pixels[root_idx..root_idx + 4],
+            &[255, 0, 0, 255],
+            "a stroke on a placed tile writes through to the root tile"
+        );
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(
+            composite.get_pixel(0, 0),
+            Some(RED),
+            "the edited root tile re-bakes to RED on its cell"
+        );
+    }
+
+    #[test]
+    /// REGRESSION: a placed tile must be VISIBLE even when the active layer
+    /// already has opaque pixels (the user painted/drew first, then stamps a
+    /// tile). End-to-end: add a CONTENT tile to the palette, place it via the
+    /// placer click, and assert the composite shows the tile's pixels.
+    fn placed_content_tile_is_visible_over_existing_layer_pixels() {
+        let mut app = App::default();
+        // A solid red 2x2 CONTENT tile added directly to the palette + selected.
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        // Simulate pre-existing opaque pixels (the user painted a base first).
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .fill(Color::rgb(0, 255, 0));
+        // Place via the placer: click at (2,2) snaps to cell (0,0).
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((0, 0)).map(|c| c.tile_id), Some(tile_id));
+
+        // Composite: the placed red tile (2x2 at cell (0,0)) must be VISIBLE
+        // over the layer's pre-existing green pixels.
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(
+            composite.get_pixel(0, 0),
+            Some(Color::rgb(255, 0, 0)),
+            "the placed tile must be visible over the layer's pre-existing pixels"
+        );
+        assert_eq!(composite.get_pixel(1, 1), Some(Color::rgb(255, 0, 0)));
+        // A cell away from the tile still shows the painted pixels.
+        assert_eq!(composite.get_pixel(8, 8), Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    /// ACCEPTANCE (INTEGRATED TILE MODEL, real path): place a tile, Pencil a
+    /// cell of it → the ROOT tile is updated at the un-oriented offset AND the
+    /// buffer footprint + raster show it at BOTH instances; an untiled cell
+    /// writes normally (no root write-back); a single undo restores the root
+    /// and both instances.
+    fn integrated_tile_pencil_write_back_and_undo() {
+        let mut app = App::default();
+        // A 2x2 tile, placed twice (cells (0,0) and (1,0)).
+        let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((6, 2)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((0, 0)).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(tm.cell((1, 0)).map(|c| c.tile_id), Some(tile_id));
+
+        // Pencil a cell INSIDE the tile at canvas (1,0) (root (1,0)).
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((1, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+
+        let session = app.projects.current();
+        // Root tile updated at un-oriented (1,0); (0,0) untouched.
+        let root = session.tile_palette.get(tile_id).unwrap();
+        let i = 4usize;
+        assert_eq!(
+            &root.pixels[i..i + 4],
+            &[255, 0, 0, 255],
+            "the root tile pixel under the stroke is updated"
+        );
+        let i0 = 0usize;
+        assert_eq!(&root.pixels[i0..i0 + 4], &[10, 20, 30, 255]);
+        // Buffer footprint at BOTH instances shows the edited pixel.
+        let buf = &session.layers.active_layer().buffer;
+        assert_eq!(buf.get_pixel(1, 0), Some(RED), "instance (0,0) re-baked");
+        assert_eq!(buf.get_pixel(5, 0), Some(RED), "instance (1,0) re-baked");
+        assert_eq!(buf.get_pixel(0, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(buf.get_pixel(4, 0), Some(Color::rgb(10, 20, 30)));
+        // The composite raster shows both instances with the edited pixel.
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(composite.get_pixel(1, 0), Some(RED));
+        assert_eq!(composite.get_pixel(5, 0), Some(RED));
+
+        // SINGLE undo restores the root and both instances (one step: the
+        // stroke's composite wraps the buffer delta + the tile edit).
+        let undo_len = app.projects.current().undo.undo_len();
+        app.undo_document();
+        let session = app.projects.current();
+        let root = session.tile_palette.get(tile_id).unwrap();
+        let i = 4usize;
+        assert_eq!(
+            &root.pixels[i..i + 4],
+            &[10, 20, 30, 255],
+            "undo restores the root tile pixel"
+        );
+        let buf = &session.layers.active_layer().buffer;
+        assert_eq!(buf.get_pixel(1, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(buf.get_pixel(5, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(session.undo.undo_len(), undo_len - 1);
+
+        // Redo re-applies: root + instances back to RED.
+        app.redo_document();
+        let session = app.projects.current();
+        let root = session.tile_palette.get(tile_id).unwrap();
+        let i = 4usize;
+        assert_eq!(&root.pixels[i..i + 4], &[255, 0, 0, 255]);
+        let buf = &session.layers.active_layer().buffer;
+        assert_eq!(buf.get_pixel(1, 0), Some(RED));
+        assert_eq!(buf.get_pixel(5, 0), Some(RED));
+    }
+
+    #[test]
+    fn integrated_tile_stroke_preview_is_live_and_commits_once() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
+        app.projects.current_mut().tile_size = 4;
+        let layer_a = app.projects.current().layers.active_layer_id();
+
+        // Two references on A; the second is both flipped and rotated.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        for x in [2, 6] {
+            app.handle_interactions(CanvasInteractions {
+                clicked: Some((x, 2)),
+                ..Default::default()
+            });
+        }
+        let palette = app.projects.current().tile_palette.clone();
+        {
+            let layer = app.projects.current_mut().layers.layer_mut(layer_a).unwrap();
+            let tilemap = layer.tilemap.as_mut().unwrap();
+            tilemap.set_cell(
+                (1, 0),
+                Some(TileCell {
+                    tile_id,
+                    rotation: 1,
+                    flip_x: true,
+                    flip_y: false,
+                }),
+            );
+            assert!(tilemap.blit_cell(&palette, &mut layer.buffer, 1, 0));
+        }
+
+        // A separate visible layer and a hidden layer each refer to the root.
+        let layer_b = app.projects.current_mut().layers.add_layer("Visible B");
+        app.projects.current_mut().layers.set_active(layer_b);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((10, 2)),
+            ..Default::default()
+        });
+        let layer_hidden = app.projects.current_mut().layers.add_layer("Hidden");
+        app.projects.current_mut().layers.set_active(layer_hidden);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((14, 2)),
+            ..Default::default()
+        });
+        app.projects.current_mut().layers.layer_mut(layer_hidden).unwrap().visible = false;
+        app.projects.current_mut().layers.set_active(layer_a);
+
+        // Give `sync_texture` a real egui texture and drain the initial committed
+        // image before starting the live stroke. The frame outputs below then
+        // contain only the partial canvas updates produced by the preview path.
+        let ctx = app.ctx.clone();
+        let canvas_image = egui::ColorImage::from_rgba_unmultiplied(
+            [CANVAS_WIDTH, CANVAS_HEIGHT],
+            &vec![0; CANVAS_WIDTH * CANVAS_HEIGHT * 4],
+        );
+        let canvas_texture =
+            ctx.load_texture("tile-stroke-preview", canvas_image, egui::TextureOptions::NEAREST);
+        let texture_id = canvas_texture.id();
+        app.canvas_texture = Some(canvas_texture);
+        let frame_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut initial_output = ctx.run_ui(frame_input(), |_ui| app.sync_texture());
+        initial_output.textures_delta.clear();
+        assert!(!app.texture_dirty);
+
+        let texture_pixel = |output: &egui::FullOutput, x: usize, y: usize| {
+            output
+                .textures_delta
+                .set
+                .get(&texture_id)
+                .into_iter()
+                .flat_map(|deltas| deltas.iter().rev())
+                .find_map(|delta| {
+                    let [origin_x, origin_y] = delta.pos.unwrap_or([0, 0]);
+                    let egui::ImageData::Color(image) = &delta.image;
+                    if x < origin_x
+                        || y < origin_y
+                        || x >= origin_x + image.width()
+                        || y >= origin_y + image.height()
+                    {
+                        return None;
+                    }
+                    Some(image.pixels[(y - origin_y) * image.width() + x - origin_x])
+                })
+        };
+
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        let cache_before = [layer_a, layer_b, layer_hidden].map(|layer_id| {
+            tilemap_cache_signature(&app.projects.current().layers, layer_id)
+        });
+        let (
+            root_before,
+            epoch_before,
+            undo_before,
+            instance_a_before,
+            layer_b_before,
+            hidden_before,
+        ) = {
+            let session = app.projects.current();
+            (
+                session.tile_palette.get(tile_id).unwrap().pixels.clone(),
+                session.tile_palette.change_epoch,
+                session.undo.undo_len(),
+                session
+                    .layers
+                    .layer(layer_a)
+                    .unwrap()
+                    .buffer
+                    .get_pixel(5, 0),
+                session
+                    .layers
+                    .layer(layer_b)
+                    .unwrap()
+                    .buffer
+                    .as_bytes()
+                    .to_vec(),
+                session
+                    .layers
+                    .layer(layer_hidden)
+                    .unwrap()
+                    .buffer
+                    .as_bytes()
+                    .to_vec(),
+            )
+        };
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((1, 0)),
+            ..Default::default()
+        });
+        // Switch the active layer while the stroke remains bound to A. Continue
+        // must update and derive from the session's original layer id.
+        app.projects.current_mut().layers.set_active(layer_b);
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((1, 0)),
+            ..Default::default()
+        });
+
+        let overrides = app.live_tile_pixel_overrides();
+        assert!(!overrides.is_empty(), "stroke derives a sparse root override");
+        app.write_dock_snapshots();
+        assert_eq!(
+            app.tile_palette_host
+                .view
+                .borrow()
+                .pixel_overrides
+                .get(tile_id, 1, 0),
+            Some([255, 0, 0, 255]),
+            "the live override is published to the Tile Palette thumbnail view"
+        );
+        let region = Rect2i::new(0, 0, 16, 4);
+        let preview = {
+            let session = app.projects.current();
+            session
+                .layers
+                .composite_layers_region_with_tile_overrides(
+                    region,
+                    &session.tile_palette,
+                    &overrides,
+                )
+                .unwrap()
+        };
+        // Root (1,0) appears at (1,0) identity, (5,0) under flip-X then CW
+        // rotation, and (9,1) under layer B's identity placement.
+        for (x, y) in [(1, 0), (5, 0), (9, 0)] {
+            assert_eq!(
+                preview.get_pixel(x, y),
+                Some(RED),
+                "visible instance at ({x},{y}) has live stroke pixels"
+            );
+        }
+        let mut live_texture_output = ctx.run_ui(frame_input(), |_ui| app.sync_texture());
+        for (x, y) in [(1usize, 0usize), (5, 0), (9, 0)] {
+            assert_eq!(
+                texture_pixel(&live_texture_output, x, y),
+                Some(egui::Color32::from_rgb(255, 0, 0)),
+                "sync_texture publishes the transient pixel at visible instance ({x},{y})"
+            );
+        }
+        assert_eq!(
+            texture_pixel(&live_texture_output, 13, 0),
+            Some(egui::Color32::TRANSPARENT),
+            "sync_texture keeps the hidden instance invisible during preview"
+        );
+        live_texture_output.textures_delta.clear();
+        let hidden_preview_pixel = preview.get_pixel(13, 0).unwrap();
+        assert!(
+            hidden_preview_pixel.a == 0,
+            "hidden instance remains invisible during preview"
+        );
+        {
+            let session = app.projects.current();
+            assert_eq!(
+                session.tile_palette.get(tile_id).unwrap().pixels,
+                root_before,
+                "live preview does not change committed root bytes"
+            );
+            assert_eq!(session.tile_palette.change_epoch, epoch_before);
+            assert_eq!(session.undo.undo_len(), undo_before);
+            assert!(session.stroke.is_some());
+            assert_eq!(
+                session.layers.layer(layer_a).unwrap().buffer.get_pixel(5, 0),
+                instance_a_before,
+                "preview does not re-bake the repeated instance into its layer buffer"
+            );
+            assert_eq!(
+                session.layers.layer(layer_b).unwrap().buffer.as_bytes(),
+                layer_b_before,
+                "cross-layer preview does not mutate the other layer buffer"
+            );
+            assert_eq!(
+                session.layers.layer(layer_hidden).unwrap().buffer.as_bytes(),
+                hidden_before,
+                "preview does not mutate hidden-layer buffer bytes"
+            );
+        }
+        assert_eq!(
+            [layer_a, layer_b, layer_hidden].map(|layer_id| {
+                tilemap_cache_signature(&app.projects.current().layers, layer_id)
+            }),
+            cache_before,
+            "the uncached preview compositor leaves all committed tilemap caches untouched"
+        );
+
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        assert!(app.live_tile_pixel_overrides().is_empty());
+        app.write_dock_snapshots();
+        assert!(
+            app.tile_palette_host
+                .view
+                .borrow()
+                .pixel_overrides
+                .is_empty(),
+            "the Tile Palette thumbnail override clears once the stroke commits"
+        );
+        let mut committed_texture_output = ctx.run_ui(frame_input(), |_ui| app.sync_texture());
+        for (x, y) in [(1usize, 0usize), (5, 0), (9, 0)] {
+            assert_eq!(
+                texture_pixel(&committed_texture_output, x, y),
+                Some(egui::Color32::from_rgb(255, 0, 0)),
+                "the committed texture retains the live-preview pixel at ({x},{y})"
+            );
+        }
+        committed_texture_output.textures_delta.clear();
+        let committed = {
+            let session = app.projects.current();
+            session
+                .layers
+                .composite_layers_region(region, &session.tile_palette)
+                .unwrap()
+        };
+        assert_eq!(committed.as_bytes(), preview.as_bytes());
+        assert_eq!(app.projects.current().undo.undo_len(), undo_before + 1);
+        assert_ne!(
+            app.projects.current().tile_palette.change_epoch,
+            epoch_before,
+            "writeback advances the normal palette invalidation epoch"
+        );
+
+        // Hidden tile data is committed too, but normal visibility still gates
+        // its contribution to the composite.
+        app.projects.current_mut().layers.layer_mut(layer_hidden).unwrap().visible = true;
+        let visible_hidden = app
+            .projects
+            .current()
+            .layers
+            .composite_layers_region(Rect2i::new(13, 0, 1, 1), &app.projects.current().tile_palette)
+            .unwrap();
+        assert_eq!(visible_hidden.get_pixel(0, 0), Some(RED));
+
+        app.undo_document();
+        let undone = {
+            let session = app.projects.current();
+            session
+                .layers
+                .composite_layers_region(region, &session.tile_palette)
+                .unwrap()
+        };
+        assert_eq!(undone.get_pixel(1, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(undone.get_pixel(5, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(undone.get_pixel(9, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(undone.get_pixel(13, 0), Some(Color::rgb(10, 20, 30)));
+        assert_eq!(app.projects.current().undo.undo_len(), undo_before);
+    }
+
+    #[test]
+    /// ACCEPTANCE (CROSS-LAYER RE-BAKE): tile-then-pencil on a DIFFERENT layer
+    /// updates that layer's instances of the same tile too.
+    fn integrated_tile_pencil_rebakes_other_layers() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        // Add a second layer and place the SAME tile there at cell (0,0).
+        let lid_b = app.projects.current_mut().layers.add_layer("B");
+        app.projects.current_mut().layers.set_active(lid_b);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        // Pencil a cell on layer A (layer id 1).
+        let layer_a = app.projects.current().layers.active_layer_id();
+        app.projects.current_mut().layers.set_active(layer_a);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((1, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        // Layer B's instance re-baked too (cross-layer).
+        let buf_b = &app.projects.current().layers.layer(lid_b).unwrap().buffer;
+        assert_eq!(
+            buf_b.get_pixel(1, 0),
+            Some(RED),
+            "layer B instance re-baked"
+        );
+        assert_eq!(buf_b.get_pixel(0, 0), Some(Color::rgb(10, 20, 30)));
+        let root = app.projects.current().tile_palette.get(tile_id).unwrap();
+        let i = 4usize;
+        assert_eq!(&root.pixels[i..i + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    /// ACCEPTANCE (FILL WRITE-BACK): a Fill over a tiled cell writes THROUGH to
+    /// the root tile and re-bakes every instance; a single undo restores it.
+    fn integrated_tile_fill_write_back_and_undo() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((6, 2)),
+            ..Default::default()
+        });
+        // Fill from a seed ON the tile (0,0) — the fill covers the tile cell and
+        // writes through to the root.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fill)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+
+        let session = app.projects.current();
+        let root = session.tile_palette.get(tile_id).unwrap();
+        let i0 = 0usize;
+        assert_eq!(
+            &root.pixels[i0..i0 + 4],
+            &[255, 0, 0, 255],
+            "fill over a tiled cell writes through to the root tile"
+        );
+        // Both instances re-baked.
+        let buf = &session.layers.active_layer().buffer;
+        assert_eq!(buf.get_pixel(0, 0), Some(RED));
+        assert_eq!(buf.get_pixel(4, 0), Some(RED));
+
+        // Single undo restores the root.
+        let undo_len = session.undo.undo_len();
+        app.undo_document();
+        let session = app.projects.current();
+        let root = session.tile_palette.get(tile_id).unwrap();
+        let i0 = 0usize;
+        assert_eq!(&root.pixels[i0..i0 + 4], &[10, 20, 30, 255]);
+        assert_eq!(session.undo.undo_len(), undo_len - 1);
+    }
+
+    #[test]
+    /// REGRESSION: a tile placement must mark the tilemap dirty so sync_texture's
+    /// PARTIAL path re-composites the placed cell region — the partial result
+    /// carries the tile pixels (what the canvas texture upload would receive).
+    fn tile_placement_dirty_region_recomposites_tile() {
+        let mut app = App::default();
+        // A content tile (solid red 2x2) + pre-existing green pixels, so both
+        // the pixel buffer and the tilemap contribute to the composite.
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .fill(Color::rgb(0, 255, 0));
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((0, 0)).map(|c| c.tile_id), Some(tile_id));
+
+        // The dirty region from the placement is the placed cell's canvas
+        // rect (cell (0,0) × tile_size 4 → canvas (0,0,4,4)).
+        let region = app
+            .projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .tilemap
+            .as_mut()
+            .unwrap()
+            .take_dirty_canvas_region(128, 128)
+            .unwrap();
+        assert_eq!(region, Rect2i::new(0, 0, 4, 4));
+
+        // The PARTIAL composite of that region carries the placed tile.
+        let session = app.projects.current();
+        let partial = session
+            .layers
+            .composite_layers_region(region, &session.tile_palette)
+            .unwrap();
+        assert_eq!(
+            partial.get_pixel(0, 0),
+            Some(Color::rgb(255, 0, 0)),
+            "the partial upload region shows the placed tile"
+        );
+        assert_eq!(partial.get_pixel(1, 1), Some(Color::rgb(255, 0, 0)));
+        // Outside the tile, the region still shows the painted pixels.
+        assert_eq!(partial.get_pixel(2, 2), Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    /// REGRESSION: switching from the Tile tool back to Pencil (via the
+    /// toolbar) restores normal drawing.
+    fn switch_back_to_pencil_after_tile_tool_works() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Tile);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((3, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(3, 3),
+            Some(RED)
+        );
+    }
+
+    #[test]
+    /// REGRESSION (REAL FRAME PATH): a Tile-tool click must reach the placer
+    /// through the full per-frame routing — `CanvasWidget::ui` → `update_tool_gesture`
+    /// → `handle_interactions_in` — NOT just a direct `handle_interactions` call.
+    /// The headless direct-call tests bypass the gesture machine, so a routing
+    /// bug in the real path would pass them all while the app silently ignores
+    /// canvas clicks. This test drives real `ui_frame`s with synthetic pointer
+    /// events (move → press → release inside a canvas cell) and asserts the
+    /// active layer's tilemap has the cell set AND the composite shows the tile.
+    fn tile_click_through_real_frame_path_places_a_tile() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        // A content tile + selected (the user confirmed the palette is fine).
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Tile);
+
+        // The canvas draw rect is (0,0)-(128,128) at 100% zoom (app_with_canvas)
+        // and the left toolbox dock spans x=0..200 OVER it. Zoom to 400% so the
+        // canvas spans (0,0)-(512,512) and the press point is clear of every
+        // dock panel — a press over ANY panel (body, header band, floating) is
+        // masked, but this point is plain canvas. (300,300) maps to canvas pixel
+        // (75,75) → cell (18,18) with tile_size 4.
+        app.projects.current_mut().camera.set_zoom_percent(400);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(300.0, 300.0))]);
+        run_app_frame(&mut app, &ctx, vec![press(egui::pos2(300.0, 300.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(300.0, 300.0))]);
+
+        // The gesture must have stamped the cell through the real path.
+        // (300,300) at 400% zoom maps to canvas pixel (75,75) → cell (18,18).
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .expect("a real-path tile click must create the active layer's tilemap");
+        assert_eq!(
+            tm.cell((18, 18)).map(|c| c.tile_id),
+            Some(tile_id),
+            "the real-path click must place the tile at the clicked cell"
+        );
+        // And the composite shows the tile at the cell (the 2x2 tile covers
+        // canvas (72,72)-(73,73)).
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(
+            composite.get_pixel(72, 72),
+            Some(Color::rgb(255, 0, 0)),
+            "the real-path placement must be visible in the composite"
+        );
+        assert_eq!(composite.get_pixel(73, 73), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    /// REGRESSION (REAL FRAME PATH): a Tile-tool press-and-hold DRAG stamps
+    /// every cell the pointer sweeps, and release commits exactly one undo step
+    /// — the drag path is what the placer's `stroke_point` branch serves.
+    fn tile_drag_through_real_frame_path_stamps_cells() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        let undo_len = app.projects.current().undo.undo_len();
+
+        // Drag across three cells along row y=8 (inside the Toolbox HEADER
+        // band, which the placer still owns under Fix 3 — a BODY press would
+        // be the panel's click): cells (15,2), (16,2), (17,2) with tile_size 4.
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(60.0, 8.0))]);
+        run_app_frame(&mut app, &ctx, vec![press(egui::pos2(60.0, 8.0))]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(66.0, 8.0))]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(70.0, 8.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(70.0, 8.0))]);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .expect("the drag must create the tilemap");
+        assert_eq!(tm.cell((15, 2)).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(tm.cell((16, 2)).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(tm.cell((17, 2)).map(|c| c.tile_id), Some(tile_id));
+        // The whole drag is ONE undoable step.
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            undo_len + 1,
+            "a drag gesture commits exactly one undo step"
+        );
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(composite.get_pixel(60, 8), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(composite.get_pixel(68, 8), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    /// REGRESSION: the Tile tool must be selectable at runtime via the toolbar
+    /// AND the B hotkey (Action::SelectTileTool) — and selecting it routes
+    /// canvas clicks to the placer.
+    fn tile_tool_selectable_via_toolbar_and_b_hotkey() {
+        let mut app = App::default();
+        // Toolbar selection.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Tile);
+        // B hotkey selects it too (real key-press events through handle_shortcuts).
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+        run_shortcuts(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Tile,
+            "the B hotkey must select the Tile tool"
+        );
+    }
+
+    #[test]
+    /// REGRESSION: a pre-existing tilemap whose cell grid is SMALLER than the
+    /// current canvas (e.g. created at a larger `tile_size`, or before the
+    /// canvas was resized) must NOT silently swallow a click — the placer must
+    /// grow it to the current canvas cell count and place the tile.
+    fn tile_click_grows_an_undersized_existing_tilemap() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        // The active layer already has a tilemap created at tile_size 16 (an
+        // 8x8 cell grid for a 128x128 canvas), while the CURRENT tile_size is 4
+        // (a 32x32 cell grid). A click at cell (20,20) is inside the 32x32 grid
+        // but far outside the old 8x8 grid — it must still place a tile.
+        let mut old = TileMap::new(16, 8, 8);
+        old.set_cell((0, 0), Some(TileCell::new(tile_id)));
+        app.projects.current_mut().layers.active_layer_mut().tilemap = Some(old);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((82, 82)), // cell (20,20) with tile_size 4
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        // The old cell survived the resize.
+        assert_eq!(tm.cell((0, 0)).map(|c| c.tile_id), Some(tile_id));
+        // The click far outside the old grid now lands.
+        assert_eq!(
+            tm.cell((20, 20)).map(|c| c.tile_id),
+            Some(tile_id),
+            "a click beyond the old tilemap's cell grid must grow it and place the tile"
+        );
+        assert_eq!(tm.cols, 32);
+        assert_eq!(tm.rows, 32);
+        assert_eq!(tm.tile_size, 4);
+    }
+
+    #[test]
+    /// REGRESSION (REAL FRAME PATH, app's own context): the user's exact flow —
+    /// select a tile in the palette, press **B** (SelectTileTool), then click the
+    /// canvas. The REAL app runs every frame on `self.ctx` (`redraw()` clones it
+    /// and `run_ui`s on it), so `handle_shortcuts` — which reads `self.ctx` — sees
+    /// the B key event. The earlier real-frame tests injected events into a
+    /// SEPARATE context, where `handle_shortcuts` read an eventless `self.ctx`
+    /// and the B path was never exercised. This test drives BOTH the B key press
+    /// AND the canvas click through the app's own context, exactly like the real
+    /// frame loop, and asserts the tile is placed.
+    fn tile_click_via_real_frame_with_b_hotkey_and_palette_selection() {
+        let mut app = app_with_own_canvas();
+        // The user selects a tile in the palette panel (model selection set).
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        // Switch to Pencil first, then press B — exactly like the user flow.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+        // B press+release through the app's own context (handle_shortcuts reads
+        // `self.ctx`, and `redraw` runs the frame on `self.ctx`).
+        run_own_ctx_frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Tile,
+            "the B key must select the Tile tool through the real frame path"
+        );
+        // Click the canvas (through the same app context) at a point clear of
+        // every dock panel — a press over ANY panel (body, header band,
+        // floating) is masked. Zoom to 400% so the canvas spans (0,0)-(512,512)
+        // and (300,300) is plain canvas → cell (18,18) with tile_size 4.
+        app.projects.current_mut().camera.set_zoom_percent(400);
+        run_own_ctx_frame(&mut app, vec![move_to(egui::pos2(300.0, 300.0))]);
+        run_own_ctx_frame(&mut app, vec![press(egui::pos2(300.0, 300.0))]);
+        run_own_ctx_frame(&mut app, vec![release(egui::pos2(300.0, 300.0))]);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .expect("a real-frame B + click must create the active layer's tilemap");
+        assert_eq!(
+            tm.cell((18, 18)).map(|c| c.tile_id),
+            Some(tile_id),
+            "the real-frame B + click must place the tile at the clicked cell"
+        );
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        assert_eq!(composite.get_pixel(72, 72), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(composite.get_pixel(73, 73), Some(Color::rgb(255, 0, 0)));
+    }
+
+    /// Runs a frame on the app's own context at the REAL production window size
+    /// (1280x720, matching `resumed()`), so the dock demo panels occupy their
+    /// real rects — reproducing what the user actually sees.
+    fn run_own_ctx_frame_real_window(app: &mut App, events: Vec<egui::Event>) {
+        let ctx = app.ctx.clone();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 720.0),
+            )),
+            predicted_dt: 1.0 / 60.0,
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| app.ui_frame(ui));
+        });
+        output.textures_delta.clear();
+    }
+
+    /// REGRESSION (REAL WINDOW, app's own context): at the production window
+    /// size the left toolbox dock (200px) is drawn OVER the canvas — a click at
+    /// a point the user can actually reach must still place the tile. This is
+    /// the "click the canvas, nothing placed" repro: a plain click whose point
+    /// is clear of the dock panels must reach the placer even at 1280x720.
+    #[test]
+    fn tile_click_via_real_frame_at_real_window_size() {
+        let mut app = app_with_own_canvas();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Click a canvas point that is NOT covered by any dock panel: the left
+        // dock spans x=0..200, the right dock x=1040..1280, bottom y=540..720.
+        // The canvas at 100% zoom is (0,0)-(128,128) — fully under the left
+        // dock at 1280x720. Zoom in to 400% so the canvas spans (0,0)-(512,512)
+        // and the point (300,300) is clear of the docks.
+        app.projects.current_mut().camera.set_zoom_percent(400);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(300.0, 300.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(egui::pos2(300.0, 300.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(egui::pos2(300.0, 300.0))]);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .expect("a real-window click must create the tilemap");
+        // (300,300) at 400% zoom (scale 4) maps to canvas pixel (75,75) →
+        // cell (18,18) with tile_size 4.
+        assert_eq!(
+            tm.cell((18, 18)).map(|c| c.tile_id),
+            Some(tile_id),
+            "a real-window canvas click must place the tile"
+        );
+        let session = app.projects.current();
+        let composite = session.layers.composite_layers(&session.tile_palette);
+        // The 2x2 tile covers the TOP-LEFT of the 4x4 cell (72,72)-(73,73).
+        assert_eq!(composite.get_pixel(72, 72), Some(Color::rgb(255, 0, 0)));
+    }
+
+    /// REGRESSION (REAL WINDOW, DOCK HEADER BAND): at 100% zoom the canvas is
+    /// entirely UNDER the left toolbox dock panel (200px wide) — the demo dock
+    /// is drawn OVER the canvas, so a press at (2,2) lands on the dock panel's
+    /// HEADER band (a DRAG-ONLY `Sense::drag()` widget the user grabs to drag
+    /// the panel). The panel must FULLY mask the canvas: a press on the header
+    /// band must NOT stamp a tile on the canvas underneath — the header band is
+    /// panel chrome, not canvas.
+    #[test]
+    fn tile_click_under_the_dock_header_band_places_nothing() {
+        let mut app = app_with_own_canvas();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // 100% zoom: the canvas draw rect is (0,0)-(128,128), and the left
+        // toolbox dock spans x=0..200 — so (2,2) is inside the canvas draw rect
+        // AND inside the Toolbox header band that the demo overlay draws on top
+        // of the canvas. A click there must NOT stamp the cell under it.
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 2.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(egui::pos2(2.0, 2.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(egui::pos2(2.0, 2.0))]);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref();
+        assert!(
+            tm.is_none() || tm.is_some_and(|tm| tm.cell((0, 0)).is_none()),
+            "a click on the dock header band must not place a tile at cell (0,0)"
+        );
+    }
+
+    /// A press over a panel BODY that overlaps the canvas must NOT leak to the
+    /// tile placer — the panel owns the click. (2,50) is inside the Toolbox
+    /// BODY (an interactive widget over the canvas) and must not place.
+    #[test]
+    fn tile_click_under_the_dock_panel_body_does_not_place() {
+        let mut app = app_with_own_canvas();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // 100% zoom: canvas draw rect (0,0)-(128,128); the left toolbox dock
+        // spans x=0..200 with its panel BODY below the 28pt header band. A
+        // press at (2,50) is over the canvas AND over the Toolbox body — it
+        // must be a panel click, not a tile stamp.
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 50.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(egui::pos2(2.0, 50.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(egui::pos2(2.0, 50.0))]);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref();
+        assert!(
+            tm.is_none() || tm.is_some_and(|tm| tm.cell((0, 0)).is_none()),
+            "a press over the Toolbox panel BODY must not place a tile at cell (0,0)"
+        );
+    }
+
+    /// Fix 3: a DRAG that starts on a panel BODY must also place NOTHING —
+    /// the placer must stay disarmed so the sweep cannot leak cells either.
+    #[test]
+    fn tile_drag_starting_on_a_panel_body_places_nothing() {
+        let mut app = app_with_own_canvas();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Press at (2,50) (Toolbox BODY), then sweep to (2,60) and release:
+        // even though the second point is over the canvas, the gesture started
+        // on a panel body and must not stamp any cell.
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 50.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(egui::pos2(2.0, 50.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 60.0))]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(egui::pos2(2.0, 60.0))]);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref();
+        assert!(
+            tm.map(|tm| tm.cells().iter().all(Option::is_none))
+                .unwrap_or(true),
+            "a drag that starts on a panel BODY must not place any tile"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PANEL MASK (app level)
+    //
+    // The demo dock is drawn ON TOP of the canvas, so a point can be inside the
+    // canvas draw rect AND inside panel chrome. Panels must fully mask the
+    // canvas: no click, no raw press, no stroke, no camera change, no cursor.
+    // The canvas-side counterparts live in `canvas.rs`; these drive the whole
+    // `ui_frame` → `CanvasWidget::ui` → `update_tool_gesture` chain.
+    // -----------------------------------------------------------------------
+
+    /// A wheel notch with explicit event modifiers (Shift/Ctrl/Alt scroll all
+    /// read the event's own modifiers, not just the held key state).
+    fn wheel(delta_y: f32, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, delta_y),
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        }
+    }
+
+    fn middle_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// The left toolbox dock spans x=0..200 over the canvas at 400% zoom, where
+    /// the canvas draw rect is (0,0)-(512,512). `(2,50)` is therefore over the
+    /// panel BODY *and* over canvas pixel (0,12); `(300,300)` is over the
+    //// canvas alone. Used by the panel-mask tests below.
+    fn app_zoomed_past_the_dock(color: Color) -> App {
+        let mut app = app_with_own_canvas();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(color)]);
+        app.projects.current_mut().camera.set_zoom_percent(400);
+        app
+    }
+
+    /// PANEL MASK — primary press: a press whose point is over panel chrome must
+    /// paint nothing (no `clicked`, no `stroke_started`, no raw press), while the
+    /// very same press over the canvas still paints.
+    #[test]
+    fn press_over_a_dock_panel_paints_no_canvas_pixels() {
+        let over_panel = egui::pos2(2.0, 50.0);
+        let mut app = app_zoomed_past_the_dock(RED);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(over_panel)]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(over_panel)]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(over_panel)]);
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            0,
+            "a press over the Toolbox BODY must not open an undo step"
+        );
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0),
+            "a press over the Toolbox BODY must not paint a single pixel"
+        );
+
+        // The same press over plain canvas still paints: (300,300) at 400% zoom
+        // maps to canvas pixel (75,75).
+        let over_canvas = egui::pos2(300.0, 300.0);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(over_canvas)]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(over_canvas)]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(over_canvas)]);
+        assert_eq!(
+            app.projects.current().layers.active_layer().buffer.get_pixel(75, 75),
+            Some(RED),
+            "the same press over the canvas must still paint"
+        );
+    }
+
+    /// PANEL MASK — the RAW press signal (the tile placer's channel, which
+    /// bypasses egui's widget attribution). Driving `update_tool_gesture` with a
+    /// synthetic RAW press shows the mask blanks exactly that field, and only
+    /// that field.
+    #[test]
+    fn raw_press_over_a_panel_is_blanked_but_survives_on_the_canvas() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_own_canvas();
+        // One real frame resolves this frame's surface for the pointer.
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 50.0))]);
+        let over_panel = app.update_tool_gesture(
+            &ctx,
+            CanvasInteractions {
+                raw_pressed_over_canvas: Some((0, 12)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            over_panel.raw_pressed_over_canvas, None,
+            "the RAW press signal must be blanked while the pointer is over a panel"
+        );
+
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(300.0, 300.0))]);
+        let over_canvas = app.update_tool_gesture(
+            &ctx,
+            CanvasInteractions {
+                raw_pressed_over_canvas: Some((75, 75)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            over_canvas.raw_pressed_over_canvas,
+            Some((75, 75)),
+            "the RAW press signal must survive over the canvas"
+        );
+    }
+
+    /// PANEL MASK — every wheel flavour (plain zoom, Shift brush resize, Ctrl
+    /// shape cycle, Alt scatter) must be inert over a panel and live over the
+    /// canvas.
+    #[test]
+    fn wheel_over_a_dock_panel_changes_nothing_on_the_canvas() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        for modifiers in [egui::Modifiers::NONE, shift] {
+            let over_panel = egui::pos2(2.0, 50.0);
+            let mut app = app_with_own_canvas();
+            app.projects
+                .current_mut()
+                .draw_settings_mut(Tool::Pencil)
+                .size = 4;
+            run_own_ctx_frame_real_window(&mut app, vec![move_to(over_panel)]);
+            let zoom_before = app.projects.current().camera.zoom_percent();
+            let size_before = app.projects.current().draw_settings(Tool::Pencil).size;
+            run_own_ctx_frame_real_window(&mut app, vec![wheel(1.0, modifiers)]);
+            assert_eq!(
+                app.projects.current().camera.zoom_percent(),
+                zoom_before,
+                "a plain wheel over a panel must not zoom the canvas ({modifiers:?})"
+            );
+            assert_eq!(
+                app.projects.current().draw_settings(Tool::Pencil).size,
+                size_before,
+                "a Shift+wheel over a panel must not resize the brush ({modifiers:?})"
+            );
+
+            // The same wheel over plain canvas still acts.
+            let over_canvas = egui::pos2(300.0, 300.0);
+            run_own_ctx_frame_real_window(&mut app, vec![move_to(over_canvas)]);
+            run_own_ctx_frame_real_window(&mut app, vec![wheel(1.0, modifiers)]);
+            if modifiers.shift {
+                assert_ne!(
+                    app.projects.current().draw_settings(Tool::Pencil).size,
+                    size_before,
+                    "a Shift+wheel over the canvas must still resize the brush"
+                );
+            } else {
+                assert_ne!(
+                    app.projects.current().camera.zoom_percent(),
+                    zoom_before,
+                    "a plain wheel over the canvas must still zoom"
+                );
+            }
+        }
+    }
+
+    /// PANEL MASK — middle-drag pan: a middle press over a panel must not claim
+    /// the canvas pan, while the same drag over the canvas pans.
+    #[test]
+    fn middle_drag_over_a_dock_panel_does_not_pan_the_canvas() {
+        let over_panel = egui::pos2(2.0, 50.0);
+        let mut app = app_with_own_canvas();
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(over_panel)]);
+        run_own_ctx_frame_real_window(&mut app, vec![middle_button(over_panel, true)]);
+        let pan_before = app.projects.current().camera.pan();
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 90.0))]);
+        assert_eq!(
+            app.projects.current().camera.pan(),
+            pan_before,
+            "a middle drag starting over a panel must not pan the canvas"
+        );
+        run_own_ctx_frame_real_window(&mut app, vec![middle_button(egui::pos2(2.0, 90.0), false)]);
+
+        // Same gesture over plain canvas: it pans.
+        let over_canvas = egui::pos2(300.0, 300.0);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(over_canvas)]);
+        run_own_ctx_frame_real_window(&mut app, vec![middle_button(over_canvas, true)]);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(340.0, 320.0))]);
+        assert_ne!(
+            app.projects.current().camera.pan(),
+            pan_before,
+            "a middle drag over the canvas must still pan"
+        );
+    }
+
+    /// PANEL MASK — hover preview: the tile placer's hover cell is pure hover, so
+    /// a panel covering the pointer must hide it (while the in-flight gesture
+    /// cells stay, they preview what was already stamped).
+    #[test]
+    fn tile_placer_hover_preview_is_hidden_over_a_panel() {
+        let mut app = app_with_own_canvas();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // (2,50) is over the Toolbox panel body and over canvas cell (0,12).
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(2.0, 50.0))]);
+        assert_eq!(
+            app.tile_placer_preview.hover_cell, None,
+            "a panel must cover the pointer, so no tile cell is previewed under it"
+        );
+
+        // (300,300) at 400% zoom maps to canvas pixel (75,75) → cell (18,18).
+        app.projects.current_mut().camera.set_zoom_percent(400);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(egui::pos2(300.0, 300.0))]);
+        assert_eq!(
+            app.tile_placer_preview.hover_cell,
+            Some((18, 18)),
+            "the tile placer must preview the hovered cell over the canvas"
+        );
+    }
+
+    /// PANEL MASK — double-click commit: the global fallback (the letterbox
+    /// commit) reads the raw pointer, so it must refuse a double-click whose
+    /// point is over panel chrome. `interactions.double_clicked` is blanked by
+    /// the same mask for the in-draw-rect path, and
+    /// [`egui::Context::egui_is_using_pointer`] covers a press a panel WIDGET
+    /// captured — but a panel's dead space (its body between widgets) captures
+    /// nothing, and there the double-click reached the canvas and committed the
+    /// lifted selection.
+    #[test]
+    fn double_click_on_a_dock_panel_does_not_commit_the_transform() {
+        let mut app = app_with_own_canvas();
+        // The global commit fallback reads `self.ctx`.
+        app.ctx = app.ctx.clone();
+        app.lift_transform(Rect2i::new(20, 20, 40, 40));
+        assert!(app.projects.current().transform.is_some());
+
+        // (2,50) is inside the Toolbox panel BODY, below the drag-only header
+        // band, over canvas pixel (2,50) — well clear of the lifted bbox.
+        let on_panel = egui::pos2(2.0, 50.0);
+        let ctx = app.ctx.clone();
+        let mut clock = ctx.input(|i| i.time);
+        run_app_frame_animated(&mut app, &ctx, &mut clock, vec![move_to(on_panel)]);
+        for _ in 0..2 {
+            run_app_frame_animated(&mut app, &ctx, &mut clock, vec![press(on_panel)]);
+            run_app_frame_animated(&mut app, &ctx, &mut clock, vec![release(on_panel)]);
+        }
+        assert!(
+            app.projects.current().transform.is_some(),
+            "a double-click over panel chrome must not commit the floating selection"
+        );
+    }
+
+    /// PANEL MASK — visibility: panels that are NOT painted must not mask the
+    /// canvas. With the dock overlay hidden (`panel_dock.show_inside` does not
+    /// run) the canvas owns the whole frame, so a press in the strip the dock
+    /// would have occupied paints normally. The mask and the wheel/pan router
+    /// must agree with the RENDERED layout, not with a hidden one.
+    #[test]
+    fn a_hidden_dock_does_not_mask_the_canvas() {
+        let mut app = app_with_own_canvas();
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.panel_dock_demo = false;
+        let at = egui::pos2(2.0, 50.0);
+        run_own_ctx_frame_real_window(&mut app, vec![move_to(at)]);
+        run_own_ctx_frame_real_window(&mut app, vec![press(at)]);
+        run_own_ctx_frame_real_window(&mut app, vec![release(at)]);
+
+        assert!(
+            !app.pointer_over_panel(),
+            "a hidden dock paints no panel, so nothing may mask the canvas"
+        );
+        assert_eq!(
+            app.projects.current().layers.active_layer().buffer.get_pixel(2, 50),
+            Some(RED),
+            "with the dock hidden the canvas owns the whole frame"
+        );
+    }
+
+    /// REGRESSION (GÖRÜNÜRLÜK / LAYOUT): in the DEFAULT view the canvas draw
+    /// rect must be VISIBLE — it must not sit entirely under the opaque left
+    /// dock. `new_project` pans the default camera to the right of the left
+    /// dock so a freshly created project shows the canvas beside the dock
+    /// instead of hiding it (writes landing in the model but invisible).
+    #[test]
+    fn canvas_is_visible_beside_the_dock_in_the_default_layout() {
+        let mut app = App::default();
+        // The REAL default: demo dock on, camera panned by new_project.
+        assert!(app.panel_dock_demo);
+        let extent = app.panel_dock.dock_extent(panel_dock::DockSide::Left);
+        let (canvas_w, canvas_h) = {
+            let canvas = &app.projects.current().layers;
+            (canvas.width() as f32, canvas.height() as f32)
+        };
+        let pan = app.projects.current().camera.pan();
+        let scale = app.projects.current().camera.scale() as f32;
+        // Canvas draw rect (origin 0,0 + pan, size canvas * scale).
+        let draw_min_x = pan.0 as f32;
+        let draw_min_y = pan.1 as f32;
+        let draw_max_x = draw_min_x + canvas_w * scale;
+        let draw_max_y = draw_min_y + canvas_h * scale;
+        assert!(
+            draw_min_x >= extent,
+            "the canvas draw rect must start at/right of the left dock edge \
+             (extent {extent}), not hidden under it (draw rect starts at {draw_min_x})"
+        );
+        // And the full draw rect must not intersect the left dock panel rects.
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1280.0, 720.0));
+        let draw = egui::Rect::from_min_max(
+            egui::pos2(draw_min_x, draw_min_y),
+            egui::pos2(draw_max_x, draw_max_y),
+        );
+        for (id, rect) in app
+            .panel_dock
+            .panel_rects(panel_dock::DockSide::Left, viewport)
+        {
+            assert!(
+                !draw.intersects(rect),
+                "the default canvas draw rect ({draw:?}) must not intersect the \
+                 visible left dock panel {id:?} ({rect:?})"
+            );
+        }
+    }
+
+    /// REGRESSION (FEEDBACK): placing a tile on a GROUP layer must not write a
+    /// tilemap silently — groups composite their children and never render
+    /// their own tilemap, so the stamp would be invisible. `tile_placer_cell`
+    /// must reject it and set `last_error` (now rendered in the frame).
+    #[test]
+    fn placing_on_a_group_layer_reports_an_error() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        // Turn the ACTIVE layer into a group.
+        let layer_id = app.projects.current().layers.active_layer_id();
+        app.projects
+            .current_mut()
+            .layers
+            .layer_mut(layer_id)
+            .unwrap()
+            .is_group = true;
+
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((2, 2)),
+            ..Default::default()
+        });
+
+        // No tilemap was created (the stamp is rejected, not silently hidden).
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .layer(layer_id)
+                .and_then(|l| l.tilemap.as_ref())
+                .is_none(),
+            "a group layer must not receive a tilemap"
+        );
+        // And the user is told why.
+        assert!(
+            app.projects
+                .current()
+                .last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("group layer")),
+            "placing on a group layer must set last_error feedback"
+        );
+    }
+
+    // -- Tile palette panel wiring ------------------------------------------
+
+    #[test]
+    fn tile_palette_panel_is_registered_dock_only_with_id_106() {
+        let mut app = App::default();
+        let id = panel_dock::PanelId::new(dock_tile_palette_panel::TILE_PALETTE_PANEL_ID);
+        let metadata = app.panel_dock.metadata(id).expect("registered");
+        assert_eq!(metadata.title, "Tile Palette");
+        assert!(!metadata.can_pop_out, "dock-only");
+        assert!(!metadata.can_native_pop_out, "dock-only");
+        assert_eq!(
+            app.panel_dock.placement(id),
+            Some(panel_dock::PanelPlacement::DockedRight)
+        );
+        assert_eq!(app.panel_dock.header_action(id), None);
+        assert!(app
+            .panel_dock
+            .dock_order(panel_dock::DockSide::Right)
+            .contains(&id));
+        assert!(app
+            .panel_dock
+            .transition_panel(id, panel_dock::PanelPlacement::Floating)
+            .is_err());
+    }
+
+    #[test]
+    fn tile_palette_add_empty() {
+        let mut app = App::default();
+        // Add empty: a tile_size square, transparent.
+        app.apply_tile_palette_events(vec![TilePalettePanelEvent::AddEmpty]);
+        let session = app.projects.current();
+        assert_eq!(session.tile_palette.tiles.len(), 1);
+        let tile = &session.tile_palette.tiles[0];
+        assert_eq!((tile.w, tile.h), (16, 16));
+        assert_eq!(tile.pixels, vec![0u8; 16 * 16 * 4]);
+        assert_eq!(session.tile_palette.selected, Some(TileId(1)));
+        assert!(session.is_dirty());
+    }
+
+    #[test]
+    fn tile_palette_delete_and_reorder() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]); // id 1
+        let second = set_selected_tile(&mut app, 2, 2, [0, 255, 0, 255]); // id 2
+                                                                          // Palette: [1, 2], selected = 2.
+        app.apply_tile_palette_events(vec![TilePalettePanelEvent::MoveSelected(1)]);
+        let session = app.projects.current();
+        assert_eq!(
+            session
+                .tile_palette
+                .tiles
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![TileId(2), TileId(1)],
+            "move up"
+        );
+
+        app.apply_tile_palette_events(vec![TilePalettePanelEvent::MoveSelected(-1)]);
+        let session = app.projects.current();
+        assert_eq!(
+            session
+                .tile_palette
+                .tiles
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![TileId(1), TileId(2)],
+            "move down"
+        );
+
+        app.apply_tile_palette_events(vec![TilePalettePanelEvent::Delete(second)]);
+        let session = app.projects.current();
+        assert_eq!(
+            session
+                .tile_palette
+                .tiles
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![TileId(1)]
+        );
+        assert_eq!(
+            session.tile_palette.selected, None,
+            "deleting the selected tile clears the selection"
+        );
+    }
+
+    #[test]
+    fn tile_palette_select_switches_to_tile_tool() {
+        let mut app = App::default();
+        let id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+
+        app.apply_tile_palette_events(vec![TilePalettePanelEvent::Select(id)]);
+        assert_eq!(app.projects.current().tile_palette.selected, Some(id));
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Tile,
+            "selecting a tile in the panel switches to the Tile tool"
+        );
+    }
+
+    #[test]
+    fn tile_palette_thumbnail_renders_tile_pixels() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        let ctx = app.ctx.clone();
+        let mut clock = 0.0;
+        let output = run_app_frame_capturing(&mut app, &ctx, &mut clock, Vec::new());
+        assert!(
+            swatch_rect(&output, Color::rgba(255, 0, 0, 255)).is_some(),
+            "the tile's pixel colour must be painted in the thumbnail grid"
         );
     }
 

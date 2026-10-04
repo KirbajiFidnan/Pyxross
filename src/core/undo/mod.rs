@@ -12,6 +12,8 @@ use std::any::Any;
 use crate::core::buffer::PixelBuffer;
 use crate::core::math::Rect2i;
 use crate::core::model::{LayerId, LayerStack};
+use crate::core::tile_edit;
+use crate::core::tilemap::{TileCell, TileId, TilePalette};
 
 // ---------------------------------------------------------------------------
 // CommandContext
@@ -21,6 +23,18 @@ use crate::core::model::{LayerId, LayerStack};
 /// Commands reach the layer stack through here — never through a bare buffer.
 pub struct CommandContext<'a> {
     pub layers: &'a mut LayerStack,
+    /// The project's tile palette, mutable — used by the integrated tile
+    /// model's write-back commands (editing a canvas cell writes through to
+    /// the ROOT tile data, so undo/redo restore the root bytes and re-bake
+    /// every instance).
+    pub palette: &'a mut TilePalette,
+}
+
+impl<'a> CommandContext<'a> {
+    /// Build a context from a layer stack and a palette.
+    pub fn new(layers: &'a mut LayerStack, palette: &'a mut TilePalette) -> Self {
+        Self { layers, palette }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +109,26 @@ impl ReverseDeltaCommand {
             after,
             undone: false,
         }
+    }
+
+    /// The canvas region this command touches.
+    pub fn region(&self) -> Rect2i {
+        self.region
+    }
+
+    /// The layer this command targets.
+    pub fn layer_id(&self) -> LayerId {
+        self.layer
+    }
+
+    /// The region's before bytes.
+    pub fn before(&self) -> &[u8] {
+        &self.before
+    }
+
+    /// The region's after bytes.
+    pub fn after(&self) -> &[u8] {
+        &self.after
     }
 }
 
@@ -174,6 +208,33 @@ impl CompositeCommand {
     pub fn commands_mut(&mut self) -> &mut Vec<Box<dyn Command>> {
         &mut self.commands
     }
+
+    /// The canvas regions of every child that is a [`ReverseDeltaCommand`]
+    /// (children of other shapes contribute nothing).
+    pub fn regions(&self) -> Vec<Rect2i> {
+        self.commands
+            .iter()
+            .filter_map(|cmd| {
+                cmd.as_any()
+                    .downcast_ref::<ReverseDeltaCommand>()
+                    .map(|c| c.region())
+            })
+            .collect()
+    }
+
+    /// The per-child pixel deltas `(layer, region, before, after)` of every
+    /// child that is a [`ReverseDeltaCommand`] (like [`Self::regions`], but
+    /// carrying the bytes too, for the tile write-back path).
+    pub fn child_pixel_deltas(&self) -> Vec<(LayerId, Rect2i, &[u8], &[u8])> {
+        self.commands
+            .iter()
+            .filter_map(|cmd| {
+                cmd.as_any()
+                    .downcast_ref::<ReverseDeltaCommand>()
+                    .map(|c| (c.layer_id(), c.region(), c.before(), c.after()))
+            })
+            .collect()
+    }
 }
 
 impl Command for CompositeCommand {
@@ -209,6 +270,217 @@ impl Command for CompositeCommand {
             }
         }
         all_ok
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TilemapEditCommand
+// ---------------------------------------------------------------------------
+
+/// One Tile-tool gesture: a set of per-cell tilemap edits, committed as a
+/// single undo step.
+///
+/// `diffs` holds `(cell, before, after)` in deterministic (cell-sorted) order.
+/// `buffer_deltas` holds each edited cell's FOOTPRINT rect and its before/after
+/// buffer bytes (the integrated model bakes the oriented tile into the buffer,
+/// so a stamp changes BOTH the tilemap cell and the buffer footprint; undo
+/// restores the pre-stamp buffer bytes, redo re-applies the baked bytes).
+/// `undo` restores the `before` cells + buffer, `redo` re-applies the `after`
+/// cells + buffer, by writing them back through [`TileMap::set_cell`] /
+/// [`PixelBuffer::blit_region`] on the layer (a missing layer/tilemap is a safe
+/// no-op returning `false`). Because `set_cell` bumps the tilemap epoch, the
+/// render cache re-rasterizes automatically after undo/redo.
+pub struct TilemapEditCommand {
+    layer: LayerId,
+    diffs: Vec<((u32, u32), Option<TileCell>, Option<TileCell>)>,
+    buffer_deltas: Vec<(Rect2i, Vec<u8>, Vec<u8>)>,
+}
+
+impl TilemapEditCommand {
+    /// Build a command that reverts `diffs`' `before` on undo and re-applies
+    /// `after` on redo.
+    pub fn new(
+        layer: LayerId,
+        diffs: Vec<((u32, u32), Option<TileCell>, Option<TileCell>)>,
+    ) -> Self {
+        Self {
+            layer,
+            diffs,
+            buffer_deltas: Vec::new(),
+        }
+    }
+
+    /// Attach per-cell buffer footprint deltas `(rect, before, after)` so a
+    /// stamp gesture undoes its buffer bake in one step.
+    pub fn with_buffer_deltas(mut self, deltas: Vec<(Rect2i, Vec<u8>, Vec<u8>)>) -> Self {
+        self.buffer_deltas = deltas;
+        self
+    }
+
+    /// The number of cell diffs this gesture recorded.
+    pub fn len(&self) -> usize {
+        self.diffs.len()
+    }
+
+    /// Whether no cells were changed.
+    pub fn is_empty(&self) -> bool {
+        self.diffs.is_empty()
+    }
+
+    /// The per-cell buffer footprint deltas `(rect, before, after)`.
+    pub fn buffer_deltas(&self) -> &[(Rect2i, Vec<u8>, Vec<u8>)] {
+        &self.buffer_deltas
+    }
+}
+
+impl Command for TilemapEditCommand {
+    fn name(&self) -> &str {
+        "Tile"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn undo(&mut self, context: &mut CommandContext) -> bool {
+        let Some(layer) = context.layers.layer_mut(self.layer) else {
+            return false;
+        };
+        let Some(tm) = layer.tilemap.as_mut() else {
+            return false;
+        };
+        for (cell, before, _after) in &self.diffs {
+            tm.set_cell(*cell, *before);
+        }
+        // Restore the pre-stamp buffer bytes (the footprint keeps the baked
+        // content of the restored cell; a cleared cell's last baked content
+        // becomes ordinary visible pixels and is untouched).
+        for (rect, before, _after) in &self.buffer_deltas {
+            let _ = layer.buffer.blit_region(*rect, before);
+        }
+        true
+    }
+
+    fn redo(&mut self, context: &mut CommandContext) -> bool {
+        let Some(layer) = context.layers.layer_mut(self.layer) else {
+            return false;
+        };
+        let Some(tm) = layer.tilemap.as_mut() else {
+            return false;
+        };
+        for (cell, _before, after) in &self.diffs {
+            tm.set_cell(*cell, *after);
+        }
+        // Re-bake the after cells onto the buffer (maintains the invariant).
+        let palette = &mut *context.palette;
+        for (cell, _before, after) in &self.diffs {
+            if after.is_none() {
+                continue;
+            }
+            let _ = tm.blit_cell(palette, &mut layer.buffer, cell.0, cell.1);
+        }
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TilePixelEditCommand
+// ---------------------------------------------------------------------------
+
+/// One pixel-edit gesture's write-back to the ROOT tile data: per-tile diffs
+/// that a single undo restores (and redo re-applies), followed by a re-bake of
+/// every instance of the edited tiles.
+///
+/// `diffs` holds one entry per edited tile, in deterministic
+/// `(tile_id, ty, tx)` sorted order (see [`TilePixelDiff`]).
+pub struct TilePixelEditCommand {
+    diffs: Vec<TilePixelDiff>,
+}
+
+/// The changed root pixels of one tile: the coordinates and their before/after
+/// RGBA8 bytes (4 bytes per pixel, `pixels` and `before`/`after` are parallel).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TilePixelDiff {
+    pub tile_id: TileId,
+    /// Sorted by `(ty, tx)` — deterministic order.
+    pub pixels: Vec<(u32, u32)>,
+    /// The root byte before the edit (the FIRST root-before per pixel).
+    pub before: Vec<u8>,
+    /// The root byte after the edit (the LAST after per pixel).
+    pub after: Vec<u8>,
+}
+
+impl TilePixelEditCommand {
+    pub fn new(diffs: Vec<TilePixelDiff>) -> Self {
+        Self { diffs }
+    }
+
+    /// The per-tile diffs, in deterministic `(tile_id, ty, tx)` order.
+    pub fn diffs(&self) -> &[TilePixelDiff] {
+        &self.diffs
+    }
+}
+
+impl Command for TilePixelEditCommand {
+    fn name(&self) -> &str {
+        "Tile Edit"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn undo(&mut self, context: &mut CommandContext) -> bool {
+        // Restore the root bytes and re-bake every instance.
+        for diff in &self.diffs {
+            let Some(tile) = context.palette.get_mut(diff.tile_id) else {
+                continue;
+            };
+            let tw = usize::from(tile.w);
+            for (i, &(tx, ty)) in diff.pixels.iter().enumerate() {
+                let index = (ty as usize * tw + tx as usize) * 4;
+                let end = (index + 4).min(tile.pixels.len());
+                if index < end {
+                    tile.pixels[index..end].copy_from_slice(&diff.before[i * 4..i * 4 + 4]);
+                }
+            }
+        }
+        context.palette.change_epoch = context.palette.change_epoch.wrapping_add(1);
+        let ids: Vec<TileId> = self.diffs.iter().map(|d| d.tile_id).collect();
+        let layers = &mut *context.layers;
+        let palette = &*context.palette;
+        tile_edit::re_stamp_tile_instances(layers, palette, &ids);
+        true
+    }
+
+    fn redo(&mut self, context: &mut CommandContext) -> bool {
+        for diff in &self.diffs {
+            let Some(tile) = context.palette.get_mut(diff.tile_id) else {
+                continue;
+            };
+            let tw = usize::from(tile.w);
+            for (i, &(tx, ty)) in diff.pixels.iter().enumerate() {
+                let index = (ty as usize * tw + tx as usize) * 4;
+                let end = (index + 4).min(tile.pixels.len());
+                if index < end {
+                    tile.pixels[index..end].copy_from_slice(&diff.after[i * 4..i * 4 + 4]);
+                }
+            }
+        }
+        context.palette.change_epoch = context.palette.change_epoch.wrapping_add(1);
+        let ids: Vec<TileId> = self.diffs.iter().map(|d| d.tile_id).collect();
+        let layers = &mut *context.layers;
+        let palette = &*context.palette;
+        tile_edit::re_stamp_tile_instances(layers, palette, &ids);
+        true
     }
 }
 
@@ -368,6 +640,11 @@ impl DeltaRecorder {
         self.region
     }
 
+    /// The captured before bytes.
+    pub fn before_bytes(&self) -> &[u8] {
+        &self.before
+    }
+
     /// Returns `true` when the buffer region is unchanged since `begin`.
     pub fn is_empty_delta(&self, buf: &PixelBuffer) -> bool {
         let current = capture_region(buf, self.region);
@@ -415,9 +692,15 @@ mod tests {
 
     // -- helpers for tests --------------------------------------------------
 
-    /// Build a `CommandContext` borrowing the given layer stack.
+    /// Build a `CommandContext` borrowing the given layer stack. The palette is
+    /// leaked so the returned context outlives the `&mut ctx(...)` temporary
+    /// (test-only; no leak concern in tests).
     fn ctx(layers: &mut LayerStack) -> CommandContext<'_> {
-        CommandContext { layers }
+        let palette = Box::leak(Box::new(TilePalette::new()));
+        CommandContext {
+            layers,
+            palette: &mut *palette,
+        }
     }
 
     /// Fill a `PixelBuffer` with a known per-pixel pattern derived from (x, y).
@@ -835,6 +1118,73 @@ mod tests {
             read_region(&layers.active_layer().buffer, region),
             vec![0u8; 2 * 2 * 4]
         );
+    }
+
+    // -- TilemapEditCommand ------------------------------------------------
+
+    #[test]
+    fn tilemap_edit_command_undo_redos_and_name() {
+        use crate::core::tilemap::{TileCell, TileId, TileMap};
+
+        let mut layers = LayerStack::new(8, 8);
+        let lid = layers.active_layer_id();
+        layers.layer_mut(lid).unwrap().tilemap = Some(TileMap::new(4, 2, 2));
+        let before = TileCell::new(TileId(1));
+        let after = TileCell {
+            tile_id: TileId(2),
+            rotation: 1,
+            flip_x: true,
+            flip_y: false,
+        };
+        let mut cmd = TilemapEditCommand::new(
+            lid,
+            vec![((0, 0), None, Some(after)), ((1, 1), Some(before), None)],
+        );
+        assert_eq!(cmd.name(), "Tile");
+        assert_eq!(cmd.len(), 2);
+
+        // Apply the "after" state (as the placer did via set_cell).
+        let tm = layers.layer_mut(lid).unwrap().tilemap.as_mut().unwrap();
+        tm.set_cell((0, 0), Some(after));
+        tm.set_cell((1, 1), None);
+
+        // Undo restores the before cells.
+        assert!(cmd.undo(&mut ctx(&mut layers)));
+        let tm = layers.layer(lid).unwrap().tilemap.as_ref().unwrap();
+        assert_eq!(tm.cell((0, 0)), None);
+        assert_eq!(tm.cell((1, 1)), Some(before));
+
+        // Redo re-applies the after cells.
+        assert!(cmd.redo(&mut ctx(&mut layers)));
+        let tm = layers.layer(lid).unwrap().tilemap.as_ref().unwrap();
+        assert_eq!(tm.cell((0, 0)), Some(after));
+        assert_eq!(tm.cell((1, 1)), None);
+
+        // Undo again round-trips deterministically.
+        assert!(cmd.undo(&mut ctx(&mut layers)));
+        let tm = layers.layer(lid).unwrap().tilemap.as_ref().unwrap();
+        assert_eq!(tm.cell((0, 0)), None);
+        assert_eq!(tm.cell((1, 1)), Some(before));
+    }
+
+    #[test]
+    fn tilemap_edit_command_missing_layer_or_tilemap_is_safe_noop() {
+        use crate::core::tilemap::{TileCell, TileId};
+
+        let mut layers = LayerStack::new(4, 4);
+        let lid = layers.active_layer_id();
+        let cell = Some(TileCell::new(TileId(1)));
+
+        // Missing tilemap on the target layer -> undo/redo return false safely.
+        let mut cmd = TilemapEditCommand::new(lid, vec![((0, 0), None, cell)]);
+        assert!(!cmd.undo(&mut ctx(&mut layers)));
+        assert!(!cmd.redo(&mut ctx(&mut layers)));
+        assert_eq!(layers.layer(lid).unwrap().tilemap, None);
+
+        // Missing layer entirely -> false.
+        let mut cmd = TilemapEditCommand::new(LayerId::new(999), vec![((0, 0), None, cell)]);
+        assert!(!cmd.undo(&mut ctx(&mut layers)));
+        assert!(!cmd.redo(&mut ctx(&mut layers)));
     }
 
     // -- DeltaRecorder begin / finish / round-trip --------------------------

@@ -1,31 +1,51 @@
 //! Fill tool core algorithms — contiguous flood fill and replace-all.
 //!
-//! D48: two fill modes — CONTIGUOUS (default) and REPLACE_ALL — with a shared
-//! tolerance of 0 (exact byte equality against the seed pixel's color is the
-//! match criterion).  One fill gesture produces exactly one undo step via
-//! [`fill_command`].
+//! D48: two fill modes — CONTIGUOUS (default) and REPLACE_ALL — share a
+//! per-channel color tolerance; a pixel matches the seed when every channel
+//! (RGBA, alpha included) differs by at most that tolerance.  A tolerance of 0
+//! therefore reproduces the original exact byte-equality behavior.  One fill
+//! gesture produces exactly one undo step via [`fill_command_with`].
 
 use crate::core::buffer::PixelBuffer;
 use crate::core::clip::PixelClip;
 use crate::core::color::Color;
 use crate::core::math::Rect2i;
 use crate::core::model::LayerId;
+use crate::core::selection_ops::within_tolerance;
 use crate::core::undo::{DeltaRecorder, ReverseDeltaCommand};
 
 /// The static label stamped on every fill-derived undo command.
 const FILL_UNDO_NAME: &str = "Fill";
 
-/// Contiguous 4-connectivity flood fill with tolerance 0.
+/// Whether a candidate pixel matches the seed under `tolerance`: every channel
+/// (RGBA, alpha included) within `tolerance`.  A `None` candidate never
+/// matches.  Tolerance 0 is exact byte equality.
+fn matches_seed(candidate: Option<Color>, seed: Color, tolerance: u8) -> bool {
+    candidate.is_some_and(|c| within_tolerance(c, seed, tolerance))
+}
+
+/// Contiguous 4-connectivity flood fill.
 ///
-/// Every pixel reachable from `(x, y)` through 4-connected neighbors whose
-/// color exactly equals the seed pixel's color is replaced with `color`.
-/// Diagonal neighbors are never filled.  The buffer is mutated in place and
-/// its change tracking is updated per pixel.
+/// Every pixel reachable from `(x, y)` through 4-connected neighbors that
+/// match the seed pixel's color within `tolerance` (per channel, alpha
+/// included) is replaced with `color`.  Diagonal neighbors are never filled.
+/// Tolerance 0 reproduces exact byte-equality matching.  The buffer is mutated
+/// in place and its change tracking is updated per pixel.
+///
+/// The `seed == color` early return is an exact check, independent of
+/// `tolerance`: tolerance widens which pixels match the seed, it does not make
+/// "paint the seed with its own color" meaningful.
 ///
 /// Returns the minimal bounding rect of the pixels actually changed, or `None`
 /// when the seed is out of bounds or already equals `color`.
-pub fn fill_region(buffer: &mut PixelBuffer, x: i32, y: i32, color: Color) -> Option<Rect2i> {
-    fill_region_clipped(buffer, x, y, color, None)
+pub fn fill_region(
+    buffer: &mut PixelBuffer,
+    x: i32,
+    y: i32,
+    color: Color,
+    tolerance: u8,
+) -> Option<Rect2i> {
+    fill_region_clipped(buffer, x, y, color, tolerance, None)
 }
 
 fn fill_region_clipped(
@@ -33,6 +53,7 @@ fn fill_region_clipped(
     x: i32,
     y: i32,
     color: Color,
+    tolerance: u8,
     clip: Option<&PixelClip>,
 ) -> Option<Rect2i> {
     let w = buffer.width() as i32;
@@ -45,59 +66,46 @@ fn fill_region_clipped(
         return None;
     }
 
-    // Iterative scanline fill.  The buffer itself is the visited marker: once
-    // a pixel is written with `color` (which != seed), it can never match the
-    // seed again, so it is never re-visited.  No recursion, so arbitrarily
-    // large canvases cannot overflow the stack.  O(n) in the region size.
+    // Iterative 4-neighbor flood with an explicit visited set.  No recursion,
+    // so arbitrarily large canvases cannot overflow the stack.  The visited set
+    // (rather than the old buffer-as-marker trick) is mandatory once tolerance
+    // is nonzero: a pixel written with `color` can still match `seed` within
+    // tolerance, so the write itself can no longer mark a pixel as done.
+    let mut visited = vec![false; (w as usize) * (h as usize)];
+    visited[(y as usize) * (w as usize) + (x as usize)] = true;
     let mut stack = vec![(x, y)];
     let mut min_x = x;
     let mut min_y = y;
     let mut max_x = x;
     let mut max_y = y;
-    while let Some((sx, sy)) = stack.pop() {
-        // Walk left to the first matching pixel of this row's span.
-        let mut cx = sx;
-        while cx > 0
-            && pixel_allowed(clip, cx - 1, sy)
-            && buffer.get_pixel((cx - 1) as usize, sy as usize) == Some(seed)
-        {
-            cx -= 1;
-        }
-        let span_start = cx;
-        // Walk right, filling every matching pixel of the span.
-        while cx < w
-            && pixel_allowed(clip, cx, sy)
-            && buffer.get_pixel(cx as usize, sy as usize) == Some(seed)
-        {
-            buffer.set_pixel(cx as usize, sy as usize, color);
-            min_x = min_x.min(cx);
-            max_x = max_x.max(cx);
-            cx += 1;
-        }
-        let span_end = cx;
-        // Scan the rows above and below for spans overlapping this one.
-        for ny in [sy - 1, sy + 1] {
-            if ny < 0 || ny >= h {
+    while let Some((cx, cy)) = stack.pop() {
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let nx = cx + dx;
+            let ny = cy + dy;
+            if nx < 0 || ny < 0 || nx >= w || ny >= h || !pixel_allowed(clip, nx, ny) {
                 continue;
             }
-            let mut nx = span_start;
-            while nx < span_end {
-                if pixel_allowed(clip, nx, ny)
-                    && buffer.get_pixel(nx as usize, ny as usize) == Some(seed)
-                {
-                    stack.push((nx, ny));
-                    min_y = min_y.min(ny);
-                    max_y = max_y.max(ny);
-                    // Skip the rest of this run in the adjacent row.
-                    while nx < span_end
-                        && pixel_allowed(clip, nx, ny)
-                        && buffer.get_pixel(nx as usize, ny as usize) == Some(seed)
-                    {
-                        nx += 1;
-                    }
-                } else {
-                    nx += 1;
-                }
+            let idx = (ny as usize) * (w as usize) + (nx as usize);
+            if visited[idx] {
+                continue;
+            }
+            if !matches_seed(buffer.get_pixel(nx as usize, ny as usize), seed, tolerance) {
+                continue;
+            }
+            visited[idx] = true;
+            stack.push((nx, ny));
+            min_x = min_x.min(nx);
+            min_y = min_y.min(ny);
+            max_x = max_x.max(nx);
+            max_y = max_y.max(ny);
+        }
+    }
+    // Apply in a second pass, so the flood above only ever read the original
+    // pixels (never the color it was writing).
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            if visited[(py as usize) * (w as usize) + (px as usize)] {
+                buffer.set_pixel(px as usize, py as usize, color);
             }
         }
     }
@@ -109,14 +117,20 @@ fn fill_region_clipped(
     ))
 }
 
-/// Replace mode (D48): every pixel in the canvas whose color exactly equals
-/// the seed pixel's color is replaced with `color`, including pixels in
-/// regions disconnected from the seed.
+/// Replace mode (D48): every pixel in the canvas whose color matches the seed
+/// pixel's color within `tolerance` is replaced with `color`, including pixels
+/// in regions disconnected from the seed.
 ///
 /// Returns the minimal bounding rect of the changed pixels, or `None` when the
 /// seed is out of bounds or already equals `color`.
-pub fn fill_replace_all(buffer: &mut PixelBuffer, x: i32, y: i32, color: Color) -> Option<Rect2i> {
-    fill_replace_all_clipped(buffer, x, y, color, None)
+pub fn fill_replace_all(
+    buffer: &mut PixelBuffer,
+    x: i32,
+    y: i32,
+    color: Color,
+    tolerance: u8,
+) -> Option<Rect2i> {
+    fill_replace_all_clipped(buffer, x, y, color, tolerance, None)
 }
 
 fn fill_replace_all_clipped(
@@ -124,6 +138,7 @@ fn fill_replace_all_clipped(
     x: i32,
     y: i32,
     color: Color,
+    tolerance: u8,
     clip: Option<&PixelClip>,
 ) -> Option<Rect2i> {
     let w = buffer.width() as i32;
@@ -142,7 +157,7 @@ fn fill_replace_all_clipped(
     for py in 0..h {
         for px in 0..w {
             if pixel_allowed(clip, px, py)
-                && buffer.get_pixel(px as usize, py as usize) == Some(seed)
+                && matches_seed(buffer.get_pixel(px as usize, py as usize), seed, tolerance)
             {
                 buffer.set_pixel(px as usize, py as usize, color);
                 min_x = min_x.min(px);
@@ -175,9 +190,10 @@ pub fn fill_command(
     x: i32,
     y: i32,
     color: Color,
+    tolerance: u8,
     replace_all: bool,
 ) -> Option<ReverseDeltaCommand> {
-    fill_command_clipped(layer, buffer, x, y, color, replace_all, None)
+    fill_command_clipped(layer, buffer, x, y, color, tolerance, replace_all, None)
 }
 
 /// Applies a clipped fill and records it as a single undo step.
@@ -187,19 +203,20 @@ pub fn fill_command_clipped(
     x: i32,
     y: i32,
     color: Color,
+    tolerance: u8,
     replace_all: bool,
     clip: Option<&PixelClip>,
 ) -> Option<ReverseDeltaCommand> {
     let bbox = if replace_all {
-        replace_all_bbox(buffer, x, y, color, clip)?
+        replace_all_bbox(buffer, x, y, color, tolerance, clip)?
     } else {
-        contiguous_bbox(buffer, x, y, color, clip)?
+        contiguous_bbox(buffer, x, y, color, tolerance, clip)?
     };
     let recorder = DeltaRecorder::begin(FILL_UNDO_NAME, layer, buffer, bbox)?;
     let applied = if replace_all {
-        fill_replace_all_clipped(buffer, x, y, color, clip)
+        fill_replace_all_clipped(buffer, x, y, color, tolerance, clip)
     } else {
-        fill_region_clipped(buffer, x, y, color, clip)
+        fill_region_clipped(buffer, x, y, color, tolerance, clip)
     };
     debug_assert_eq!(applied, Some(bbox));
     Some(recorder.finish(buffer))
@@ -212,6 +229,7 @@ fn contiguous_bbox(
     x: i32,
     y: i32,
     color: Color,
+    tolerance: u8,
     clip: Option<&PixelClip>,
 ) -> Option<Rect2i> {
     let w = buffer.width() as i32;
@@ -242,7 +260,7 @@ fn contiguous_bbox(
             if visited[idx] {
                 continue;
             }
-            if buffer.get_pixel(nx as usize, ny as usize) != Some(seed) {
+            if !matches_seed(buffer.get_pixel(nx as usize, ny as usize), seed, tolerance) {
                 continue;
             }
             visited[idx] = true;
@@ -268,6 +286,7 @@ fn replace_all_bbox(
     x: i32,
     y: i32,
     color: Color,
+    tolerance: u8,
     clip: Option<&PixelClip>,
 ) -> Option<Rect2i> {
     let w = buffer.width() as i32;
@@ -286,7 +305,7 @@ fn replace_all_bbox(
     for py in 0..h {
         for px in 0..w {
             if pixel_allowed(clip, px, py)
-                && buffer.get_pixel(px as usize, py as usize) == Some(seed)
+                && matches_seed(buffer.get_pixel(px as usize, py as usize), seed, tolerance)
             {
                 min_x = min_x.min(px);
                 min_y = min_y.min(py);
@@ -320,6 +339,7 @@ mod tests {
     use crate::core::clip::PixelClip;
     use crate::core::model::LayerStack;
     use crate::core::select::Selection;
+    use crate::core::tilemap::TilePalette;
     use crate::core::undo::{Command, CommandContext, UndoStack};
 
     const WALL: Color = Color::rgb(1, 1, 1);
@@ -328,7 +348,14 @@ mod tests {
 
     /// Build a `CommandContext` borrowing the given layer stack.
     fn ctx(layers: &mut LayerStack) -> CommandContext<'_> {
-        CommandContext { layers }
+        // Test-only: the palette is leaked so the returned context outlives the
+        // `&mut ctx(...)` temporary (no tile-edit command flows through these
+        // tests).
+        let palette = Box::leak(Box::new(TilePalette::new()));
+        CommandContext {
+            layers,
+            palette: &mut *palette,
+        }
     }
 
     /// 5x5 buffer: a 3x3 `REGION` block at (1,1)..(4,4) surrounded by `WALL`.
@@ -357,7 +384,8 @@ mod tests {
         .unwrap();
         let clip = PixelClip::from_selection(&selection);
 
-        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, false, Some(&clip)).unwrap();
+        let command =
+            fill_command_clipped(layer, buffer, 0, 0, NEW, 0, false, Some(&clip)).unwrap();
 
         assert_eq!(command.name(), "Fill");
         assert_eq!(buffer.get_pixel(0, 0), Some(NEW));
@@ -382,7 +410,7 @@ mod tests {
         let before = buffer.as_bytes().to_vec();
         let epoch = buffer.change_epoch();
 
-        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, false, Some(&clip));
+        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, 0, false, Some(&clip));
 
         assert!(command.is_none());
         assert_eq!(buffer.as_bytes(), before.as_slice());
@@ -400,7 +428,7 @@ mod tests {
                 .unwrap();
         let clip = PixelClip::from_selection(&selection);
 
-        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, true, Some(&clip)).unwrap();
+        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, 0, true, Some(&clip)).unwrap();
 
         assert_eq!(command.name(), "Fill");
         assert_eq!(buffer.get_pixel(0, 0), Some(NEW));
@@ -427,7 +455,7 @@ mod tests {
             let clip = PixelClip::from_selection(&selection);
             let before = buffer.as_bytes().to_vec();
             let command =
-                fill_command_clipped(layer, buffer, 0, 0, NEW, false, Some(&clip)).unwrap();
+                fill_command_clipped(layer, buffer, 0, 0, NEW, 0, false, Some(&clip)).unwrap();
             assert_eq!(buffer.get_pixel(0, 0), Some(NEW));
             (command, before)
         };
@@ -448,7 +476,7 @@ mod tests {
     #[test]
     fn fill_region_replaces_exact_block_and_leaves_walls() {
         let mut buf = walled_region_buffer();
-        let bbox = fill_region(&mut buf, 1, 1, NEW).unwrap();
+        let bbox = fill_region(&mut buf, 1, 1, NEW, 0).unwrap();
         assert_eq!(bbox, Rect2i::new(1, 1, 3, 3));
         for y in 1..4 {
             for x in 1..4 {
@@ -472,7 +500,7 @@ mod tests {
         buf.fill(WALL);
         buf.set_pixel(1, 1, REGION);
         buf.set_pixel(0, 0, REGION);
-        let bbox = fill_region(&mut buf, 1, 1, NEW).unwrap();
+        let bbox = fill_region(&mut buf, 1, 1, NEW, 0).unwrap();
         assert_eq!(bbox, Rect2i::new(1, 1, 1, 1));
         assert_eq!(buf.get_pixel(1, 1), Some(NEW));
         assert_eq!(buf.get_pixel(0, 0), Some(REGION)); // diagonal only → untouched
@@ -485,7 +513,7 @@ mod tests {
         buf.set_pixel(1, 1, Color::rgb(10, 10, 10));
         // 4-connected neighbor differing by 1 in one channel.
         buf.set_pixel(0, 1, Color::rgb(11, 10, 10));
-        let bbox = fill_region(&mut buf, 1, 1, NEW).unwrap();
+        let bbox = fill_region(&mut buf, 1, 1, NEW, 0).unwrap();
         assert_eq!(bbox, Rect2i::new(1, 1, 1, 1));
         assert_eq!(buf.get_pixel(1, 1), Some(NEW));
         assert_eq!(buf.get_pixel(0, 1), Some(Color::rgb(11, 10, 10)));
@@ -495,9 +523,99 @@ mod tests {
     fn fill_region_seed_already_target_returns_none() {
         let mut buf = walled_region_buffer();
         let epoch = buf.change_epoch();
-        assert_eq!(fill_region(&mut buf, 1, 1, REGION), None);
+        assert_eq!(fill_region(&mut buf, 1, 1, REGION, 0), None);
         assert_eq!(buf.change_epoch(), epoch);
         assert_eq!(buf.get_pixel(1, 1), Some(REGION));
+    }
+
+    /// D48 tolerance: a nonzero tolerance floods into 4-connected near-colors
+    /// but stops at pixels further than the tolerance away.
+    #[test]
+    fn fill_region_nonzero_tolerance_matches_near_colors_and_stops_at_the_boundary() {
+        let mut buf = PixelBuffer::new(4, 1);
+        buf.fill(Color::rgb(0, 0, 0));
+        buf.set_pixel(0, 0, Color::rgb(10, 10, 10)); // seed
+        buf.set_pixel(1, 0, Color::rgb(12, 9, 11)); // diffs 2/1/1 → within 3
+        buf.set_pixel(2, 0, Color::rgb(14, 10, 10)); // diff 4 → outside 3
+        buf.set_pixel(3, 0, Color::rgb(200, 200, 200)); // far away
+
+        let bbox = fill_region(&mut buf, 0, 0, NEW, 3).unwrap();
+
+        assert_eq!(
+            bbox,
+            Rect2i::new(0, 0, 2, 1),
+            "the flood must cover the seed and the in-tolerance pixel only"
+        );
+        assert_eq!(buf.get_pixel(0, 0), Some(NEW));
+        assert_eq!(buf.get_pixel(1, 0), Some(NEW));
+        assert_eq!(buf.get_pixel(2, 0), Some(Color::rgb(14, 10, 10)));
+        assert_eq!(buf.get_pixel(3, 0), Some(Color::rgb(200, 200, 200)));
+    }
+
+    /// The tolerance is inclusive on every channel: a difference equal to the
+    /// tolerance matches, one past it does not.
+    #[test]
+    fn fill_region_tolerance_boundary_is_inclusive() {
+        let mut buf = PixelBuffer::new(3, 1);
+        buf.fill(Color::rgb(0, 0, 0));
+        buf.set_pixel(0, 0, Color::rgb(100, 100, 100)); // seed
+        buf.set_pixel(1, 0, Color::rgb(105, 100, 100)); // diff exactly 5
+        buf.set_pixel(2, 0, Color::rgb(106, 100, 100)); // diff 6
+
+        let bbox = fill_region(&mut buf, 0, 0, NEW, 5).unwrap();
+
+        assert_eq!(bbox, Rect2i::new(0, 0, 2, 1));
+        assert_eq!(buf.get_pixel(1, 0), Some(NEW));
+        assert_eq!(buf.get_pixel(2, 0), Some(Color::rgb(106, 100, 100)));
+    }
+
+    /// A target color that is itself within tolerance of the seed must not
+    /// confuse the flood's visited tracking (the old buffer-as-marker trick
+    /// could loop forever here).
+    #[test]
+    fn fill_region_tolerant_target_within_tolerance_terminates() {
+        let mut buf = PixelBuffer::new(4, 1);
+        buf.fill(Color::rgb(10, 10, 10));
+        let target = Color::rgb(12, 10, 10); // within 5 of the seed
+
+        let bbox = fill_region(&mut buf, 0, 0, target, 5).unwrap();
+
+        assert_eq!(bbox, Rect2i::new(0, 0, 4, 1));
+        for x in 0..4 {
+            assert_eq!(buf.get_pixel(x, 0), Some(target));
+        }
+    }
+
+    /// Replace-all honours the tolerance across the whole canvas.
+    #[test]
+    fn fill_replace_all_nonzero_tolerance_matches_near_colors() {
+        let mut buf = PixelBuffer::new(5, 1);
+        buf.fill(Color::rgb(0, 0, 0));
+        buf.set_pixel(0, 0, Color::rgb(50, 50, 50)); // seed
+        buf.set_pixel(2, 0, Color::rgb(53, 50, 50)); // within 3
+        buf.set_pixel(4, 0, Color::rgb(54, 50, 50)); // diff 4
+
+        let bbox = fill_replace_all(&mut buf, 0, 0, NEW, 3).unwrap();
+
+        assert_eq!(bbox, Rect2i::new(0, 0, 3, 1));
+        assert_eq!(buf.get_pixel(0, 0), Some(NEW));
+        assert_eq!(buf.get_pixel(2, 0), Some(NEW));
+        assert_eq!(buf.get_pixel(4, 0), Some(Color::rgb(54, 50, 50)));
+    }
+
+    /// The alpha channel counts toward the tolerance (the doc promises RGBA).
+    #[test]
+    fn fill_region_tolerance_counts_alpha() {
+        let mut buf = PixelBuffer::new(2, 1);
+        buf.fill(Color::rgba(10, 10, 10, 10));
+        buf.set_pixel(1, 0, Color::rgba(10, 10, 10, 13)); // alpha diff 3
+        let bbox = fill_region(&mut buf, 0, 0, NEW, 3).unwrap();
+        assert_eq!(
+            bbox,
+            Rect2i::new(0, 0, 2, 1),
+            "an alpha-only near match must join the flood"
+        );
+        assert_eq!(buf.get_pixel(1, 0), Some(NEW));
     }
 
     #[test]
@@ -505,7 +623,7 @@ mod tests {
         let mut buf = walled_region_buffer();
         let epoch = buf.change_epoch();
         for (x, y) in [(-1, 0), (0, -1), (5, 0), (0, 5), (100, 100), (-100, -100)] {
-            assert_eq!(fill_region(&mut buf, x, y, NEW), None);
+            assert_eq!(fill_region(&mut buf, x, y, NEW, 0), None);
         }
         assert_eq!(buf.change_epoch(), epoch);
     }
@@ -518,7 +636,7 @@ mod tests {
         for (x, y) in [(2, 2), (3, 2), (4, 2), (2, 3), (2, 4)] {
             buf.set_pixel(x, y, REGION);
         }
-        let bbox = fill_region(&mut buf, 3, 2, NEW).unwrap();
+        let bbox = fill_region(&mut buf, 3, 2, NEW, 0).unwrap();
         assert_eq!(bbox, Rect2i::new(2, 2, 3, 3));
         for (x, y) in [(2, 2), (3, 2), (4, 2), (2, 3), (2, 4)] {
             assert_eq!(buf.get_pixel(x, y), Some(NEW));
@@ -536,7 +654,7 @@ mod tests {
         buf.fill(WALL);
         buf.set_pixel(1, 1, REGION);
         buf.set_pixel(5, 1, REGION);
-        let bbox = fill_replace_all(&mut buf, 1, 1, NEW).unwrap();
+        let bbox = fill_replace_all(&mut buf, 1, 1, NEW, 0).unwrap();
         assert_eq!(bbox, Rect2i::new(1, 1, 5, 1));
         assert_eq!(buf.get_pixel(1, 1), Some(NEW));
         assert_eq!(buf.get_pixel(5, 1), Some(NEW));
@@ -552,7 +670,7 @@ mod tests {
     fn fill_replace_all_seed_already_target_returns_none() {
         let mut buf = walled_region_buffer();
         let epoch = buf.change_epoch();
-        assert_eq!(fill_replace_all(&mut buf, 1, 1, REGION), None);
+        assert_eq!(fill_replace_all(&mut buf, 1, 1, REGION, 0), None);
         assert_eq!(buf.change_epoch(), epoch);
         assert_eq!(buf.get_pixel(1, 1), Some(REGION));
     }
@@ -576,8 +694,16 @@ mod tests {
             .export_region(Rect2i::new(0, 0, 5, 5), None)
             .unwrap();
 
-        let cmd =
-            fill_command(lid, &mut layers.active_layer_mut().buffer, 1, 1, NEW, false).unwrap();
+        let cmd = fill_command(
+            lid,
+            &mut layers.active_layer_mut().buffer,
+            1,
+            1,
+            NEW,
+            0,
+            false,
+        )
+        .unwrap();
         assert_eq!(cmd.name(), "Fill");
         assert_eq!(layers.active_layer().buffer.get_pixel(1, 1), Some(NEW));
 
@@ -596,9 +722,16 @@ mod tests {
         assert_eq!(layers.active_layer().buffer.get_pixel(1, 1), Some(NEW));
 
         // Nothing changed → None (seed color now equals the target).
-        assert!(
-            fill_command(lid, &mut layers.active_layer_mut().buffer, 1, 1, NEW, false).is_none()
-        );
+        assert!(fill_command(
+            lid,
+            &mut layers.active_layer_mut().buffer,
+            1,
+            1,
+            NEW,
+            0,
+            false
+        )
+        .is_none());
         // Out-of-bounds seed → None.
         assert!(fill_command(
             lid,
@@ -606,6 +739,7 @@ mod tests {
             -1,
             0,
             NEW,
+            0,
             false
         )
         .is_none());
@@ -627,8 +761,16 @@ mod tests {
             .export_region(Rect2i::new(0, 0, 7, 3), None)
             .unwrap();
 
-        let cmd =
-            fill_command(lid, &mut layers.active_layer_mut().buffer, 1, 1, NEW, true).unwrap();
+        let cmd = fill_command(
+            lid,
+            &mut layers.active_layer_mut().buffer,
+            1,
+            1,
+            NEW,
+            0,
+            true,
+        )
+        .unwrap();
         assert_eq!(cmd.name(), "Fill");
         assert_eq!(layers.active_layer().buffer.get_pixel(5, 1), Some(NEW));
 
@@ -653,7 +795,7 @@ mod tests {
         // Seed at the canvas corner (0,0); the whole canvas is one region.
         let mut buf = PixelBuffer::new(4, 4);
         buf.fill(REGION);
-        let bbox = fill_region(&mut buf, 0, 0, NEW).unwrap();
+        let bbox = fill_region(&mut buf, 0, 0, NEW, 0).unwrap();
         assert_eq!(bbox, Rect2i::new(0, 0, 4, 4));
         for y in 0..4 {
             for x in 0..4 {
@@ -677,7 +819,8 @@ mod tests {
         .unwrap();
         let clip = PixelClip::from_selection(&selection);
 
-        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, false, Some(&clip)).unwrap();
+        let command =
+            fill_command_clipped(layer, buffer, 0, 0, NEW, 0, false, Some(&clip)).unwrap();
 
         assert_eq!(command.name(), "Fill");
         assert_eq!(buffer.get_pixel(0, 0), Some(NEW));
@@ -698,7 +841,7 @@ mod tests {
                 .unwrap();
         let clip = PixelClip::from_selection(&selection);
 
-        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, true, Some(&clip)).unwrap();
+        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, 0, true, Some(&clip)).unwrap();
 
         assert_eq!(command.name(), "Fill");
         assert_eq!(buffer.get_pixel(0, 0), Some(NEW));
@@ -726,7 +869,7 @@ mod tests {
         let before = buffer.as_bytes().to_vec();
         let epoch = buffer.change_epoch();
 
-        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, false, Some(&clip));
+        let command = fill_command_clipped(layer, buffer, 0, 0, NEW, 0, false, Some(&clip));
 
         assert!(command.is_none());
         assert_eq!(buffer.as_bytes(), before.as_slice());
@@ -750,7 +893,7 @@ mod tests {
             let clip = PixelClip::from_selection(&selection);
             let before = buffer.as_bytes().to_vec();
             let command =
-                fill_command_clipped(layer, buffer, 0, 0, NEW, false, Some(&clip)).unwrap();
+                fill_command_clipped(layer, buffer, 0, 0, NEW, 0, false, Some(&clip)).unwrap();
             assert_eq!(buffer.get_pixel(0, 0), Some(NEW));
             assert_eq!(buffer.get_pixel(1, 0), Some(REGION));
             (command, before)

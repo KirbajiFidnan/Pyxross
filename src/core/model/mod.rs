@@ -62,11 +62,14 @@
 //! and `std` — no egui/wgpu/winit, keeping the core layer pure
 //! (ARCHITECTURE.md §8).
 
+use std::cell::RefCell;
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::buffer::PixelBuffer;
 use crate::core::color::Color;
 use crate::core::math::Rect2i;
+use crate::core::tilemap::{TileMap, TilePalette, TilePixelOverrides};
 
 // R3 frame model: the canvas is the sprite sheet; frames are rect windows
 // into it — never pixel copies.
@@ -110,7 +113,7 @@ pub enum BlendMode {
 ///
 /// Groups are layers with `is_group == true` and an empty (transparent)
 /// buffer; their pixels come from compositing their children.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub struct Layer {
     pub id: LayerId,
     pub name: String,
@@ -122,6 +125,49 @@ pub struct Layer {
     pub parent: Option<LayerId>,
     /// True for group layers (which carry an empty buffer).
     pub is_group: bool,
+    /// Per-layer tilemap (grid of tile-cell references); `None` when the layer
+    /// has no tilemap.
+    pub tilemap: Option<TileMap>,
+    /// Whether the layer is locked against edits (does NOT affect rendering).
+    pub locked: bool,
+    /// Rasterize cache for the tilemap (keyed by tilemap/palette epochs and
+    /// canvas size); pure render state, never persisted.
+    pub tilemap_cache: RefCell<Option<TilemapRenderCache>>,
+}
+
+impl PartialEq for Layer {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.visible == other.visible
+            && self.opacity == other.opacity
+            && self.blend == other.blend
+            && self.buffer == other.buffer
+            && self.parent == other.parent
+            && self.is_group == other.is_group
+            && self.tilemap == other.tilemap
+            && self.locked == other.locked
+        // `tilemap_cache` is render state and excluded from equality.
+    }
+}
+
+/// Rasterize cache for a layer's tilemap.
+///
+/// The cached buffer is sized to the LAYER's canvas so it composites
+/// identically to the pixel path. It is re-rasterized only when the tilemap's
+/// `change_epoch`, the palette's `change_epoch`, or the canvas size changed.
+#[derive(Clone, Debug)]
+pub struct TilemapRenderCache {
+    /// The tilemap's `change_epoch` at last rasterize.
+    pub tilemap_epoch: u64,
+    /// The palette's `change_epoch` at last rasterize.
+    pub palette_epoch: u64,
+    /// Canvas width the cached buffer was rasterized for.
+    pub canvas_w: usize,
+    /// Canvas height the cached buffer was rasterized for.
+    pub canvas_h: usize,
+    /// The rasterized tilemap over the full canvas (transparent elsewhere).
+    pub buffer: PixelBuffer,
 }
 
 /// Bottom-to-top stack of layers over a fixed-size canvas.
@@ -161,6 +207,9 @@ impl LayerStack {
             buffer: PixelBuffer::try_new(width, height)?,
             parent: None,
             is_group: false,
+            tilemap: None,
+            locked: false,
+            tilemap_cache: RefCell::new(None),
         };
         Some(Self {
             layers: vec![layer],
@@ -193,6 +242,9 @@ impl LayerStack {
             buffer,
             parent: None,
             is_group: false,
+            tilemap: None,
+            locked: false,
+            tilemap_cache: RefCell::new(None),
         });
         self.changed = true;
         id
@@ -426,14 +478,16 @@ impl LayerStack {
     }
 
     /// Composites all visible layers (bottom-to-top) over the full canvas.
-    pub fn composite_layers(&self) -> PixelBuffer {
+    ///
+    /// `palette` supplies the tile pixels for any layer with a tilemap.
+    pub fn composite_layers(&self, palette: &TilePalette) -> PixelBuffer {
         let full = Rect2i::new(
             0,
             0,
             self.width.min(i32::MAX as usize) as i32,
             self.height.min(i32::MAX as usize) as i32,
         );
-        self.composite_layers_region(full)
+        self.composite_layers_region(full, palette)
             .unwrap_or_else(|| PixelBuffer::new(self.width, self.height))
     }
 
@@ -441,10 +495,15 @@ impl LayerStack {
     /// the canvas. Returns `None` when `rect` is empty or does not intersect
     /// the canvas; the result is `clipped_w * clipped_h` pixels.
     ///
-    /// The result equals the full composite clipped to `rect`. Flat stacks
-    /// (no groups) take a fast path byte-identical to the pre-group
+    /// `palette` supplies the tile pixels for any layer with a tilemap. The
+    /// result equals the full composite clipped to `rect`. Flat stacks (no
+    /// groups) take a fast path byte-identical to the pre-group
     /// implementation; stacks with groups composite recursively.
-    pub fn composite_layers_region(&self, rect: Rect2i) -> Option<PixelBuffer> {
+    pub fn composite_layers_region(
+        &self,
+        rect: Rect2i,
+        palette: &TilePalette,
+    ) -> Option<PixelBuffer> {
         if rect.is_empty() {
             return None;
         }
@@ -458,7 +517,36 @@ impl LayerStack {
         if clipped.is_empty() {
             return None;
         }
-        Some(composite::composite_stack_region(self, clipped))
+        Some(composite::composite_stack_region(self, palette, clipped))
+    }
+
+    /// Composites a region with transient root-tile pixel replacements.
+    ///
+    /// This uncached preview path preserves ordinary z-order, visibility,
+    /// opacity, blend modes, and group isolation, while bypassing all committed
+    /// tilemap render caches.
+    pub fn composite_layers_region_with_tile_overrides(
+        &self,
+        rect: Rect2i,
+        palette: &TilePalette,
+        overrides: &TilePixelOverrides,
+    ) -> Option<PixelBuffer> {
+        if rect.is_empty() {
+            return None;
+        }
+        let canvas = Rect2i::new(
+            0,
+            0,
+            self.width.min(i32::MAX as usize) as i32,
+            self.height.min(i32::MAX as usize) as i32,
+        );
+        let clipped = rect.clamp_to(canvas);
+        if clipped.is_empty() {
+            return None;
+        }
+        Some(composite::composite_stack_region_with_tile_overrides(
+            self, palette, overrides, clipped,
+        ))
     }
 }
 
@@ -780,7 +868,12 @@ mod tests {
             layer.buffer.set_pixel(2, 1, Color::rgba(70, 80, 90, 200));
         }
         let expected = Compositing::composite(3, 2, &[&stack.active_layer().buffer]).unwrap();
-        assert_eq!(stack.composite_layers().as_bytes(), expected);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            expected
+        );
     }
 
     #[test]
@@ -796,7 +889,9 @@ mod tests {
         let rect = Rect2i::new(1, 0, 3, 3);
         let expected =
             Compositing::composite_region(rect, 4, 3, &[&stack.active_layer().buffer]).unwrap();
-        let out = stack.composite_layers_region(rect).unwrap();
+        let out = stack
+            .composite_layers_region(rect, &crate::core::tilemap::TilePalette::new())
+            .unwrap();
         assert_eq!(out.as_bytes(), expected);
     }
 
@@ -823,16 +918,22 @@ mod tests {
                 top_layer.opacity = 0.5;
                 top_layer.blend = mode;
             }
-            let full = stack.composite_layers();
+            let full = stack.composite_layers(&crate::core::tilemap::TilePalette::new());
             let region = stack
-                .composite_layers_region(Rect2i::new(0, 0, 4, 3))
+                .composite_layers_region(
+                    Rect2i::new(0, 0, 4, 3),
+                    &crate::core::tilemap::TilePalette::new(),
+                )
                 .unwrap();
             assert_eq!(full.as_bytes(), region.as_bytes(), "mode {mode:?}");
 
             stack.layer_mut(top).unwrap().visible = false;
-            let hidden_full = stack.composite_layers();
+            let hidden_full = stack.composite_layers(&crate::core::tilemap::TilePalette::new());
             let hidden_region = stack
-                .composite_layers_region(Rect2i::new(0, 0, 4, 3))
+                .composite_layers_region(
+                    Rect2i::new(0, 0, 4, 3),
+                    &crate::core::tilemap::TilePalette::new(),
+                )
                 .unwrap();
             assert_eq!(
                 hidden_full.as_bytes(),
@@ -866,7 +967,12 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(stack.composite_layers().as_bytes(), expected);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            expected
+        );
     }
 
     #[test]
@@ -884,11 +990,26 @@ mod tests {
             .unwrap()
             .buffer
             .fill(Color::rgb(255, 0, 0));
-        assert_eq!(stack.composite_layers().as_bytes(), &[255, 0, 0, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[255, 0, 0, 255]
+        );
         assert!(stack.set_visible(top, false));
-        assert_eq!(stack.composite_layers().as_bytes(), &[0, 0, 255, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[0, 0, 255, 255]
+        );
         assert!(stack.set_visible(top, true));
-        assert_eq!(stack.composite_layers().as_bytes(), &[255, 0, 0, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[255, 0, 0, 255]
+        );
     }
 
     #[test]
@@ -922,7 +1043,12 @@ mod tests {
             .buffer
             .fill(Color::rgb(255, 0, 0));
         assert!(stack.set_opacity(top, 0.0));
-        assert_eq!(stack.composite_layers().as_bytes(), &[0, 0, 255, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[0, 0, 255, 255]
+        );
     }
 
     #[test]
@@ -936,7 +1062,12 @@ mod tests {
             .fill(Color::rgb(255, 0, 0));
         assert!(stack.set_opacity(id, 0.5));
         // 255 * 0.5 = 127.5 -> round -> 128; over transparent -> (255,0,0,128)
-        assert_eq!(stack.composite_layers().as_bytes(), &[255, 0, 0, 128]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[255, 0, 0, 128]
+        );
     }
 
     fn two_layer_stack() -> (LayerStack, LayerId, LayerId) {
@@ -959,7 +1090,12 @@ mod tests {
     #[test]
     fn normal_blend_known_bytes() {
         let (stack, _bottom, _top) = two_layer_stack();
-        assert_eq!(stack.composite_layers().as_bytes(), &[50, 100, 150, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[50, 100, 150, 255]
+        );
     }
 
     #[test]
@@ -967,7 +1103,12 @@ mod tests {
         let (mut stack, _bottom, top) = two_layer_stack();
         assert!(stack.set_blend(top, BlendMode::Multiply));
         // 50*100/255=20, 100*150/255=59, 150*200/255=118
-        assert_eq!(stack.composite_layers().as_bytes(), &[20, 59, 118, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[20, 59, 118, 255]
+        );
     }
 
     #[test]
@@ -975,7 +1116,12 @@ mod tests {
         let (mut stack, _bottom, top) = two_layer_stack();
         assert!(stack.set_blend(top, BlendMode::Screen));
         // 255-(205*155)/255=130, 255-(155*105)/255=191, 255-(105*55)/255=232
-        assert_eq!(stack.composite_layers().as_bytes(), &[130, 191, 232, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[130, 191, 232, 255]
+        );
     }
 
     #[test]
@@ -983,7 +1129,12 @@ mod tests {
         let (mut stack, _bottom, top) = two_layer_stack();
         assert!(stack.set_blend(top, BlendMode::Add));
         // min(255,50+100)=150, min(255,100+150)=250, min(255,150+200)=255
-        assert_eq!(stack.composite_layers().as_bytes(), &[150, 250, 255, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[150, 250, 255, 255]
+        );
     }
 
     #[test]
@@ -1003,7 +1154,12 @@ mod tests {
             .fill(Color::rgba(50, 100, 150, 128));
         assert!(stack.set_blend(top, BlendMode::Multiply));
         // blended (20,59,118,128) over opaque (100,150,200,255)
-        assert_eq!(stack.composite_layers().as_bytes(), &[60, 104, 159, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[60, 104, 159, 255]
+        );
     }
 
     #[test]
@@ -1016,7 +1172,12 @@ mod tests {
             .buffer
             .fill(Color::rgb(50, 100, 150));
         assert!(stack.set_blend(id, BlendMode::Multiply));
-        assert_eq!(stack.composite_layers().as_bytes(), &[50, 100, 150, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[50, 100, 150, 255]
+        );
     }
 
     #[test]
@@ -1030,7 +1191,12 @@ mod tests {
             .buffer
             .fill(Color::rgb(50, 100, 150));
         assert!(stack.set_blend(top, BlendMode::Multiply));
-        assert_eq!(stack.composite_layers().as_bytes(), &[50, 100, 150, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[50, 100, 150, 255]
+        );
     }
 
     #[test]
@@ -1043,7 +1209,7 @@ mod tests {
             .unwrap()
             .buffer
             .fill(Color::rgb(255, 0, 0));
-        let out = stack.composite_layers();
+        let out = stack.composite_layers(&crate::core::tilemap::TilePalette::new());
         assert_eq!(out.get_pixel(0, 0), Some(Color::rgb(255, 0, 0)));
         assert_eq!(out.get_pixel(1, 0), Some(Color::TRANSPARENT));
         assert_eq!(out.get_pixel(2, 2), Some(Color::TRANSPARENT));
@@ -1290,7 +1456,12 @@ mod tests {
     fn active_layer_mut_edits_active_buffer() {
         let mut stack = LayerStack::new(1, 1);
         stack.active_layer_mut().buffer.fill(Color::rgb(1, 2, 3));
-        assert_eq!(stack.composite_layers().as_bytes(), &[1, 2, 3, 255]);
+        assert_eq!(
+            stack
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            &[1, 2, 3, 255]
+        );
     }
 
     #[test]
@@ -1308,7 +1479,10 @@ mod tests {
             }
         }
         let out = stack
-            .composite_layers_region(Rect2i::new(1, 1, 2, 2))
+            .composite_layers_region(
+                Rect2i::new(1, 1, 2, 2),
+                &crate::core::tilemap::TilePalette::new(),
+            )
             .unwrap();
         assert_eq!(out.width(), 2);
         assert_eq!(out.height(), 2);
@@ -1319,15 +1493,30 @@ mod tests {
     #[test]
     fn composite_region_empty_or_outside_returns_none() {
         let stack = LayerStack::new(2, 2);
-        assert_eq!(stack.composite_layers_region(Rect2i::ZERO), None);
-        assert_eq!(stack.composite_layers_region(Rect2i::new(5, 5, 2, 2)), None);
-        assert_eq!(stack.composite_layers_region(Rect2i::new(0, 0, 0, 2)), None);
+        assert_eq!(
+            stack.composite_layers_region(Rect2i::ZERO, &crate::core::tilemap::TilePalette::new()),
+            None
+        );
+        assert_eq!(
+            stack.composite_layers_region(
+                Rect2i::new(5, 5, 2, 2),
+                &crate::core::tilemap::TilePalette::new()
+            ),
+            None
+        );
+        assert_eq!(
+            stack.composite_layers_region(
+                Rect2i::new(0, 0, 0, 2),
+                &crate::core::tilemap::TilePalette::new()
+            ),
+            None
+        );
     }
 
     #[test]
     fn composite_layers_zero_canvas_returns_empty_buffer() {
         let stack = LayerStack::new(0, 0);
-        let out = stack.composite_layers();
+        let out = stack.composite_layers(&crate::core::tilemap::TilePalette::new());
         assert_eq!(out.width(), 0);
         assert_eq!(out.height(), 0);
     }

@@ -11,7 +11,10 @@ use super::nest::{nest_is_usable, nest_viewport, NEST_PADDING};
 use super::skin::PanelChrome;
 use super::state::{DockAction, DockManager, DockSide, PanelHeaderAction, PanelId, PanelPlacement};
 
-const HEADER_HEIGHT: f32 = 28.0;
+/// Height of a docked panel's header band, in points. `pub(super)` so the
+/// placer's panel-body vs header-band press distinction (Fix 3) can compute
+/// the body rects without duplicating the constant.
+pub(super) const HEADER_HEIGHT: f32 = 28.0;
 const HANDLE_SIZE: f32 = 6.0;
 /// Inset between a docked panel's skinned frame border and its content.
 const FRAME_PADDING: f32 = 2.0;
@@ -94,8 +97,9 @@ impl DockManager {
         self.order_floating(&ctx);
     }
 
-    /// The rect a dock side occupies inside `viewport`.
-    fn dock_rect(&self, side: DockSide, viewport: Rect) -> Rect {
+    /// The rect a dock side occupies inside `viewport`. `pub(super)` so the
+    /// panel-body rect query in geometry.rs shares the exact same geometry.
+    pub(super) fn dock_rect(&self, side: DockSide, viewport: Rect) -> Rect {
         let left_edge = viewport.left() + self.dock_extent(DockSide::Left);
         let right_edge = viewport.right() - self.dock_extent(DockSide::Right);
         match side {

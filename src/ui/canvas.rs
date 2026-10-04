@@ -7,8 +7,8 @@ use crate::core::color::Color;
 use crate::core::math::Rect2i;
 use crate::render::gizmo::GizmoHit;
 use crate::render::overlay::{
-    ant_segments, ant_stroke_color, ant_under_stroke_color, mask_dash_segments, mask_polyline,
-    BoundarySegment, OnionGhost,
+    ant_segments, ant_stroke_color, ant_under_stroke_color, mask_dash_segments_from_polylines,
+    mask_polylines, BoundarySegment, OnionGhost,
 };
 use crate::ui::input_capture::{ctrl_wheel, shift_wheel, InputCapture, SurfaceId};
 use crate::ui::theme::ThemeColors;
@@ -73,6 +73,28 @@ pub struct CanvasInteractions {
     /// The canvas pixel under the cursor when the primary button was
     /// double-clicked this frame.
     pub double_clicked: Option<(i32, i32)>,
+    /// RAW primary-press signal, independent of egui's widget attribution.
+    ///
+    /// egui 0.36 resolves a press on a DRAG-ONLY widget (a dock panel header
+    /// band, a resize handle, a scrollbar) as `click: None, drag: Some`, so the
+    /// widget-scoped `clicked`/`stroke_started` never fire for those presses
+    /// even when the pointer is geometrically over the canvas draw rect. The
+    /// tile placer must stamp from this RAW press point instead: set whenever
+    /// the primary button went down this frame AND the press position maps to a
+    /// canvas pixel inside the draw rect (the press origin when available,
+    /// otherwise the latest pointer position).
+    pub raw_pressed_over_canvas: Option<(i32, i32)>,
+    /// The PRIMARY-press-frame modifiers latched by the widget (D78), attached
+    /// to [`Self::clicked`] / [`Self::double_clicked`] so click-driven tools
+    /// (the Wand) observe Alt/Shift as they were at the press, not as they are
+    /// at the release. winit batches events per redraw, so the modifier key-up
+    /// can land in the same batch as the mouse-up; re-reading the live
+    /// modifiers at the click frame would then silently drop them.
+    ///
+    /// `None` when no press-frame snapshot exists (a synthetic/direct
+    /// `CanvasInteractions` built by tests); callers then fall back to the
+    /// live held state.
+    pub click_modifiers: Option<egui::Modifiers>,
     /// A secondary-button (right) press/drag began this frame over the canvas.
     pub eyedropper_started: bool,
     /// The canvas pixel under the cursor this frame during a secondary-button
@@ -130,6 +152,35 @@ pub enum CanvasOverlay {
     /// Marching-ants border around an arbitrary mask shape: the boundary unit
     /// segments in canvas coordinates (see `Selection::outline_segments`).
     AntsMask(Vec<((i32, i32), (i32, i32))>),
+    /// Tile-placer cursor preview (UX items 1/4/6): the hovered grid cell's
+    /// green outline, the REAL flip+rotated preview pixels (at the hovered cell
+    /// AND at every cell of the in-flight gesture), and the green tile_id labels
+    /// of every assigned cell. Only emitted while the Tile tool is active, so it
+    /// never overlaps the gizmo/selection overlays.
+    ///
+    /// Z-ORDER: the whole variant is painted in a DEDICATED final pass
+    /// ([`paint_tile_placer_overlay`], the last thing `ui` paints), so the
+    /// preview always lands ON TOP of the baked tile content — nothing the
+    /// canvas draws afterwards can bury it.
+    TilePlacer {
+        /// The hovered grid cell `(cx, cy)`, when the pointer is over the
+        /// canvas and a tile is selected. `None` (no outline) otherwise.
+        hover_cell: Option<(u32, u32)>,
+        /// Every grid cell the in-flight placer gesture has stamped/cleared.
+        /// Each gets a green outline of its own, so a drag shows the whole
+        /// painted trail rather than only the pointer's cell. Empty when no
+        /// gesture is active.
+        gesture_cells: Vec<(u32, u32)>,
+        /// The oriented tile's OPAQUE pixels in CANVAS coordinates with their
+        /// straight-alpha RGBA colour — the REAL tile content to be placed
+        /// (flip/rotation applied; transparent pixels omitted). Covers the
+        /// hovered cell and every `gesture_cells` entry. Empty when there is
+        /// nothing to preview (no tile selected, or an empty tile).
+        preview_pixels: Vec<(i32, i32, Color)>,
+        /// Assigned cells: `(cell_x, cell_y)` + the placed tile's id, for the
+        /// green index labels at each cell's top-left.
+        indices: Vec<((u32, u32), u64)>,
+    },
     /// Transform gizmo overlay (R4, D57): floating lifted pixels (D32) beneath
     /// the quad outline, then the scale/rotate/centre handles. The quad corners
     /// come from `TransformObject::canvas_corners`, so the gizmo rotates with
@@ -246,6 +297,20 @@ impl Default for CanvasView {
 ///
 /// Pure egui — the texture is referenced by [`egui::TextureId`] only; the App
 /// shell owns the actual `TextureHandle`.
+/// BB: a latched selection-button press awaiting a small dead-zone move.
+///
+/// Owned by the canvas widget (not the App) so the App field-ownership
+/// inventory stays unchanged. `screen` is the global press position (for the
+/// dead-zone comparison), `point` the press projected+clamped into canvas
+/// pixels (the gesture anchor), and `started` whether the gesture has been
+/// emitted yet (one-shot).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SelectionLatch {
+    pub(crate) screen: egui::Pos2,
+    pub(crate) point: (i32, i32),
+    pub(crate) started: bool,
+}
+
 pub struct CanvasWidget {
     overlay: CanvasOverlay,
     last_origin: egui::Pos2,
@@ -258,6 +323,42 @@ pub struct CanvasWidget {
     /// mapped to, replayed while the interact position is unavailable. Cleared
     /// when the drag stops.
     last_transform_drag_point: Option<(i32, i32)>,
+    /// BB: the latched primary-button selection press awaiting the dead-zone
+    /// move (`None` when no primary selection gesture is latched/active).
+    pub(crate) selection_primary_latch: Option<SelectionLatch>,
+    /// BB: the latched secondary-button selection press; the Rectangle/Lasso
+    /// Subtract path.
+    pub(crate) selection_secondary_latch: Option<SelectionLatch>,
+    /// BB: whether a secondary selection gesture is down (latched or started),
+    /// so its release emits `eyedropper_ended` exactly once.
+    pub(crate) selection_secondary_armed: bool,
+    /// D78/FF: modifiers latched on the primary-press frame, carried to the
+    /// click/double-click frames via [`CanvasInteractions::click_modifiers`].
+    /// `None` until the first primary press over the draw rect.
+    click_press_modifiers: Option<egui::Modifiers>,
+    /// HH: memoised mask-boundary polylines for the incoming overlay's boundary
+    /// segments. `paint_ants_mask` needs the chained polylines for the black
+    /// baseline *and* now for the white dashes
+    /// ([`mask_dash_segments_from_polylines`]), so it no longer re-chains the
+    /// boundary per frame. Keyed on the exact segment list, so it is recomputed
+    /// only when the selection boundary actually changes.
+    ants_polylines: Option<(Vec<BoundarySegment>, Vec<Vec<(f32, f32)>>)>,
+}
+
+/// GG: order-independent union of two [`egui::Modifiers`] snapshots.
+///
+/// The Wand's click decision must be the same whether Alt or Shift was pressed
+/// first. A single `Modifiers` is the full held set, but the press-time latch
+/// and the click-time held state can each be missing whichever modifier was
+/// reported later, so the click uses their union.
+fn union_modifiers(a: egui::Modifiers, b: egui::Modifiers) -> egui::Modifiers {
+    egui::Modifiers {
+        alt: a.alt || b.alt,
+        ctrl: a.ctrl || b.ctrl,
+        shift: a.shift || b.shift,
+        mac_cmd: a.mac_cmd || b.mac_cmd,
+        command: a.command || b.command,
+    }
 }
 
 impl CanvasWidget {
@@ -269,12 +370,41 @@ impl CanvasWidget {
             gizmo_hovered: GizmoHit::None,
             last_clamped_drag_point: None,
             last_transform_drag_point: None,
+            selection_primary_latch: None,
+            selection_secondary_latch: None,
+            selection_secondary_armed: false,
+            click_press_modifiers: None,
+            ants_polylines: None,
         }
     }
 
     /// Overlay to paint on top of the canvas (set by the App shell each frame).
     pub fn set_overlay(&mut self, overlay: CanvasOverlay) {
+        // HH: chain the mask boundary's polylines ONCE here (per selection
+        // revision) instead of inside `paint_ants_mask` every frame. The
+        // per-frame cost of `mask_polylines`/`chain_component_loops` grows with
+        // the boundary, so re-running it each frame was the camera "crunch".
+        // Task II: the baseline and the dashes now both read these cached
+        // polylines, so nothing re-chains per frame.
+        if let Some(segments) = overlay_mask_segments(&overlay) {
+            let stale = self
+                .ants_polylines
+                .as_ref()
+                .is_none_or(|(key, _)| key.as_slice() != segments);
+            if stale {
+                let polylines = mask_polylines(segments);
+                self.ants_polylines = Some((segments.to_vec(), polylines));
+            }
+        }
         self.overlay = overlay;
+    }
+
+    /// HH: the memoised polylines for the overlay's boundary, when it has one.
+    /// `set_overlay` guarantees they match the currently assigned overlay.
+    fn cached_ants_polylines(&self) -> &[Vec<(f32, f32)>] {
+        self.ants_polylines
+            .as_ref()
+            .map_or(&[], |(_, polylines)| polylines.as_slice())
     }
 
     /// The currently assigned canvas overlay.
@@ -384,6 +514,32 @@ impl CanvasWidget {
 
         let mut interactions = CanvasInteractions::default();
 
+        // PANEL MASK: the App resolved the topmost surface under the pointer
+        // once this frame (`InputCapture::set_target`, from the dock's own
+        // `surface_at`) and routed wheel/middle-pan with it. Every canvas path
+        // that reads the GLOBAL pointer instead of this widget's own response
+        // must honour the same mask, or a press over panel chrome leaks to the
+        // canvas underneath: the RAW press signal below, and the hover-driven
+        // brush cursor / tile-placer preview painted further down.
+        let pointer_over_panel = capture.pointer_over_panel();
+
+        // RAW primary-press signal (see the field doc): a press over the canvas
+        // draw rect reported straight from the egui pointer state, so the tile
+        // placer stamps even when a DRAG-ONLY widget (a dock header band drawn
+        // over the canvas) claims the press and swallows `clicked`/stroke.
+        // egui 0.36 exposes `PointerState::press_origin()` for the press
+        // position; fall back to the latest position for synthetic frames.
+        // A press whose topmost surface is a PANEL never stamps: the panel
+        // fully masks the canvas.
+        let raw_primary_pressed = ui.input(|i| i.pointer.primary_pressed()) && !pointer_over_panel;
+        if raw_primary_pressed {
+            let press_pos = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+            interactions.raw_pressed_over_canvas =
+                press_pos.and_then(|p| screen_to_canvas_pt(p, origin, scale, pan, canvas_size));
+        }
+
         // Paint the texture and a subtle border, clipped to the widget.
         let painter = painter.with_clip_rect(response.rect);
         painter.image(
@@ -462,7 +618,14 @@ impl CanvasWidget {
         if let CanvasOverlay::RegionCells { cells, base } = &self.overlay {
             if !base.is_empty() {
                 let time_ms = (ui.input(|i| i.time) * 1000.0) as u64;
-                paint_ants_mask(&painter, self.last_origin, scale, pan, base, time_ms);
+                paint_ants_mask(
+                    &painter,
+                    self.last_origin,
+                    scale,
+                    pan,
+                    self.cached_ants_polylines(),
+                    time_ms,
+                );
             }
             let outline = live_outline_color(theme);
             for &cell in cells {
@@ -570,10 +733,21 @@ impl CanvasWidget {
         // Mask-shaped marching ants: the boundary unit segments of a
         // non-rectangular selection, dashed by the same slow, low-contrast
         // phase.
-        if let CanvasOverlay::AntsMask(segments) = &self.overlay {
+        if let CanvasOverlay::AntsMask(_) = &self.overlay {
             let time_ms = (ui.input(|i| i.time) * 1000.0) as u64;
-            paint_ants_mask(&painter, self.last_origin, scale, pan, segments, time_ms);
+            paint_ants_mask(
+                &painter,
+                self.last_origin,
+                scale,
+                pan,
+                self.cached_ants_polylines(),
+                time_ms,
+            );
         }
+
+        // NB: the Tile-placer preview is NOT painted here. It runs in a
+        // dedicated FINAL pass at the end of `ui` so it always lands on top of
+        // the baked tile content (see `paint_tile_placer_overlay`).
 
         // Transform gizmo overlay (R4, D57): floating lifted pixels (D32) as a
         // textured quad over the object bounds, then the (rotated) quad outline,
@@ -745,25 +919,82 @@ impl CanvasWidget {
             self.last_transform_drag_point = None;
         }
 
+        // D78/FF: latch the modifiers at the PRIMARY-press frame so a
+        // click-driven tool (the Wand) sees Alt/Shift as they were when the
+        // button went down — even when winit batches the modifier key-up into
+        // the same redraw as the mouse-up. Prefer the held state but OR in the
+        // press event's own modifiers, mirroring `alt_pressed`/`shift_pressed`.
+        let primary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        if primary_pressed && primary_response.hovered() {
+            self.click_press_modifiers = Some(ui.input(|i| {
+                let mut mods = i.modifiers;
+                if let Some(event_mods) = i.events.iter().rev().find_map(|event| match event {
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some(*modifiers),
+                    _ => None,
+                }) {
+                    mods.alt |= event_mods.alt;
+                    mods.shift |= event_mods.shift;
+                    mods.ctrl |= event_mods.ctrl;
+                    mods.command |= event_mods.command;
+                }
+                mods
+            }));
+        }
+
         // Primary click without drag → single-pixel interaction (e.g. fill,
         // select, or a one-shot pencil tap). `clicked()` is true only on the
         // release frame of a press-and-release within the click threshold, so
         // it never overlaps the drag-based stroke reporting above.
-        if primary_response.clicked() {
+        let primary_clicked = primary_response.clicked();
+        let primary_double_clicked = primary_response.double_clicked();
+        if primary_clicked || primary_double_clicked {
+            // GG: the Wand's click decision must not depend on the ORDER in
+            // which Alt/Shift were pressed. The primary-press latch captures
+            // the modifier set at the mouse-down, but a modifier reported
+            // AFTER the press (winit batching, or holding the button while
+            // adding the second modifier) would be missing there; likewise a
+            // modifier released before the click is missing from the held
+            // state. UNION the press-time latch with the click-time held state
+            // (and the release event's own modifiers) so both modifiers apply
+            // regardless of press order.
+            let released_mods = ui.input(|i| {
+                i.events.iter().rev().find_map(|event| match event {
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers,
+                        ..
+                    } => Some(*modifiers),
+                    _ => None,
+                })
+            });
+            let held_now = ui.input(|i| i.modifiers);
+            let mut click_mods = held_now;
+            if let Some(latched) = self.click_press_modifiers {
+                click_mods = union_modifiers(click_mods, latched);
+            }
+            if let Some(released) = released_mods {
+                click_mods = union_modifiers(click_mods, released);
+            }
             if let Some(pos) = primary_response.interact_pointer_pos() {
                 if let Some(pt) = screen_to_canvas_pt(pos, origin, scale, pan, canvas_size) {
-                    interactions.clicked = Some(pt);
+                    if primary_clicked {
+                        interactions.clicked = Some(pt);
+                    }
+                    if primary_double_clicked {
+                        interactions.double_clicked = Some(pt);
+                    }
+                    interactions.click_modifiers = Some(click_mods);
                 }
             }
-        }
-
-        // Primary double-click without drag → the dynamic-line commit gesture.
-        if primary_response.double_clicked() {
-            if let Some(pos) = primary_response.interact_pointer_pos() {
-                if let Some(pt) = screen_to_canvas_pt(pos, origin, scale, pan, canvas_size) {
-                    interactions.double_clicked = Some(pt);
-                }
-            }
+            // The latch has served its click/double-click; drop it so a later
+            // synthetic click cannot reuse a stale snapshot.
+            self.click_press_modifiers = None;
         }
 
         // Secondary button (right) → temporary eyedropper: press/drag/release.
@@ -907,8 +1138,15 @@ impl CanvasWidget {
         // A curve transform session is the only producer of the `Curve`
         // overlay, and while it is active its preview owns the canvas: neither
         // the brush cursor nor the line preview may paint over its gizmos.
+        //
+        // The cursor is HOVER-driven (it follows the pointer without any button
+        // held), so it is masked the same way a press is: a palette / toolbox /
+        // timeline panel covers the pointer and must not show a canvas cursor
+        // underneath it. Only the pure-hover case is gated — an in-flight line
+        // preview below still tracks its gesture across a panel so the pending
+        // stroke stays readable.
         let transform_phase = matches!(self.overlay, CanvasOverlay::Curve { .. });
-        if let Some(brush) = brush.filter(|_| !transform_phase) {
+        if let Some(brush) = brush.filter(|_| !transform_phase && !pointer_over_panel) {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 if let Some((cx, cy)) =
                     canvas_footprint_anchor(pos, origin, scale, pan, canvas_size, brush.size)
@@ -960,9 +1198,96 @@ impl CanvasWidget {
             );
         }
 
+        // Tile-placer preview — the LAST thing this frame paints (item 1/2/4/6).
+        // A dedicated final pass is what GUARANTEES the preview reads on top of
+        // the tile's baked pixels: the overlay used to be painted mid-pass,
+        // where anything drawn afterwards (footprints, line/gizmo chrome) could
+        // bury it under the tile content it is meant to describe.
+        self.paint_tile_placer_overlay(&painter, theme, camera, tile_size, scale);
+
         interactions.primary_down_on_canvas = primary_response.is_pointer_button_down_on();
         interactions.updated_camera = camera;
         interactions
+    }
+
+    /// Paints the Tile-placer cursor preview (UX items 1/2/4/6): the green
+    /// outlines of every previewed grid cell, the REAL flip+rotated tile pixels
+    /// over each of them, and the green tile_id labels of every assigned cell.
+    ///
+    /// Called as the FINAL pass of [`Self::ui`] so the preview always sits above
+    /// the canvas texture and every other decoration — the tile placer must be
+    /// readable whatever is already baked under the pointer.
+    ///
+    /// Item 2: the outline/pixels cover the hovered cell AND every cell of the
+    /// in-flight gesture, so a drag previews the tile at each cell it paints
+    /// rather than only under the pointer.
+    fn paint_tile_placer_overlay(
+        &self,
+        painter: &egui::Painter,
+        theme: &ThemeColors,
+        camera: Camera,
+        tile_size: u32,
+        scale: f32,
+    ) {
+        let CanvasOverlay::TilePlacer {
+            hover_cell,
+            gesture_cells,
+            preview_pixels,
+            indices,
+        } = &self.overlay
+        else {
+            return;
+        };
+        // The tile-placer green: the theme's green token. `onion_next_tint` is
+        // the green accent of the default dark theme (no hard-coded chrome
+        // color — everything routes through ThemeColors).
+        let green = theme.onion_next_tint32();
+        let cell_rect = |cx: u32, cy: u32| {
+            Rect2i::new(
+                (cx * tile_size) as i32,
+                (cy * tile_size) as i32,
+                tile_size as i32,
+                tile_size as i32,
+            )
+        };
+        // Item 2: every gesture cell gets its own outline, so the whole painted
+        // trail of the drag is marked — not just the pointer's cell. Deduped
+        // against the hover cell, which is drawn right after.
+        let mut outlined: Vec<(u32, u32)> = gesture_cells.clone();
+        if let Some(cell) = hover_cell {
+            if !outlined.contains(cell) {
+                outlined.push(*cell);
+            }
+        }
+        // Item 1: each cell's boundary, as a plain solid outline (no fill, no
+        // dashes), like the live-gesture boxes.
+        for &(cx, cy) in &outlined {
+            let screen = self.canvas_rect_to_screen(camera, cell_rect(cx, cy));
+            paint_live_outline(painter, screen, green);
+        }
+        // Item 4: the REAL tile content over each previewed cell — every
+        // oriented OPAQUE pixel is a filled quad in its own colour, so the
+        // preview shows exactly what the stamp writes (transparency preserved:
+        // transparent pixels are simply not painted). Same convention as the
+        // Pen brush footprint preview.
+        for &(cx, cy, color) in preview_pixels {
+            let min = self.canvas_point_to_screen(camera, (cx, cy));
+            // At least 1 pt per pixel, like the brush preview cells.
+            let rect = egui::Rect::from_min_max(
+                min,
+                min + egui::vec2(scale, scale).max(egui::vec2(1.0, 1.0)),
+            );
+            let color32 = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
+            painter.rect_filled(rect, 0.0, color32);
+        }
+        // Item 6: the green tile_id label at each assigned cell's top-left.
+        for ((cx, cy), id) in indices {
+            let cell = cell_rect(*cx, *cy);
+            let top_left = self.canvas_point_to_screen(camera, (cell.x, cell.y));
+            let text = format!("{id}");
+            let galley = painter.layout_no_wrap(text, egui::FontId::monospace(10.0), green);
+            painter.galley(top_left + egui::vec2(1.0, 0.0), galley, green);
+        }
     }
 
     /// The canvas pixel the primary drag reports this frame.
@@ -1456,24 +1781,37 @@ fn paint_ants_rect(
     }
 }
 
+/// The mask-boundary segments an overlay paints marching ants over, if any.
+///
+/// Shared by [`CanvasWidget::set_overlay`] (to memoise the chained polylines)
+/// and the paint path, so the key and the painted boundary can never disagree.
+fn overlay_mask_segments(overlay: &CanvasOverlay) -> Option<&[BoundarySegment]> {
+    match overlay {
+        CanvasOverlay::AntsMask(segments) => Some(segments.as_slice()),
+        CanvasOverlay::RegionCells { base, .. } if !base.is_empty() => Some(base.as_slice()),
+        _ => None,
+    }
+}
+
 /// Paint a mask boundary as committed marching ants: one continuous fixed
 /// black line along the whole ordered boundary path, then white dashes that
 /// follow that path clockwise (D76). Shared by the `AntsMask` overlay and the
 /// live region-cells overlay's base selection.
 ///
-/// The boundary [`BoundarySegment`]s arrive in no particular walking order;
-/// [`mask_polyline`] chains them into a single clockwise polygon, the black
-/// baseline is laid along that whole path, and [`mask_dash_segments`] walks
-/// the same path with the mask dash period so the white dashes follow it
-/// around corners and rotate clockwise around the closed loop. The colors are
-/// fixed black + white by design — no theme token, no canvas sampling — so the
-/// border always reads on any artwork.
+/// `polylines` is the memoised [`mask_polylines`] chain (see
+/// [`CanvasWidget::set_overlay`]): one clockwise polygon per connected
+/// component. The black baseline is laid along every component's path, and
+/// [`mask_dash_segments_from_polylines`] dashes those *same* cached polylines
+/// with the mask dash period so the white dashes follow the boundary around
+/// corners and rotate clockwise around the closed loops — with no per-frame
+/// re-chaining. The colors are fixed black + white by design — no theme token,
+/// no canvas sampling — so the border always reads on any artwork.
 fn paint_ants_mask(
     painter: &egui::Painter,
     origin: egui::Pos2,
     scale: f32,
     pan: (i32, i32),
-    segments: &[BoundarySegment],
+    polylines: &[Vec<(f32, f32)>],
     time_ms: u64,
 ) {
     let to_screen = |x: f32, y: f32| {
@@ -1482,20 +1820,23 @@ fn paint_ants_mask(
             origin.y + pan.1 as f32 + y * scale,
         )
     };
-    // Fixed black baseline along the whole ordered clockwise path.
-    let polyline = mask_polyline(segments);
-    let n = polyline.len();
-    for i in 0..n {
-        let (x0, y0) = polyline[i];
-        let (x1, y1) = polyline[(i + 1) % n];
-        painter.line_segment(
-            [to_screen(x0, y0), to_screen(x1, y1)],
-            // Mandated pure black baseline for the mask border (not chrome).
-            egui::Stroke::new(1.0, egui::Color32::BLACK), // NB: fixed mask border
-        );
+    // Fixed black baseline along EACH connected component's ordered clockwise
+    // path: a multi-component mask has several loops and every one gets its own
+    // black line (the white dashes already cover all components).
+    for polyline in polylines {
+        let n = polyline.len();
+        for i in 0..n {
+            let (x0, y0) = polyline[i];
+            let (x1, y1) = polyline[(i + 1) % n];
+            painter.line_segment(
+                [to_screen(x0, y0), to_screen(x1, y1)],
+                // Mandated pure black baseline for the mask border (not chrome).
+                egui::Stroke::new(1.0, egui::Color32::BLACK), // NB: fixed mask border
+            );
+        }
     }
-    // White dashes marching clockwise along the same path.
-    for ((x0, y0), (x1, y1)) in mask_dash_segments(segments, time_ms) {
+    // White dashes marching clockwise along the same cached path.
+    for ((x0, y0), (x1, y1)) in mask_dash_segments_from_polylines(polylines, time_ms) {
         painter.line_segment(
             [to_screen(x0, y0), to_screen(x1, y1)],
             // Mandated pure white dashes for the mask border (not chrome).
@@ -1673,6 +2014,29 @@ mod tests {
         camera: &mut Camera,
         preview: Option<(crate::core::brush::BrushSpec, DrawMode, Color)>,
     ) -> (CanvasInteractions, Vec<egui::Shape>) {
+        run_frame_targeting_surface(
+            ctx,
+            events,
+            widget,
+            canvas_size,
+            camera,
+            preview,
+            SurfaceId::Canvas,
+        )
+    }
+
+    /// Like [`run_frame_with_shapes_state_with_brush`] but records `target` as
+    /// the frame's topmost surface in the shared [`InputCapture`], so a test can
+    /// stand in "the pointer is over a docked / floating panel".
+    fn run_frame_targeting_surface(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        widget: &mut CanvasWidget,
+        canvas_size: (u32, u32),
+        camera: &mut Camera,
+        preview: Option<(crate::core::brush::BrushSpec, DrawMode, Color)>,
+        target: SurfaceId,
+    ) -> (CanvasInteractions, Vec<egui::Shape>) {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -1693,7 +2057,7 @@ mod tests {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     TEST_CAPTURE.with(|capture| {
-                        capture.set_target(Some(SurfaceId::Canvas));
+                        capture.set_target(Some(target));
                         result = widget.ui(
                             ui,
                             &theme,
@@ -1878,6 +2242,222 @@ mod tests {
             phase: egui::TouchPhase::Move,
             modifiers,
         }
+    }
+
+    fn press(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A docked panel surface, for the "pointer sits over panel chrome" tests.
+    fn panel_surface() -> SurfaceId {
+        SurfaceId::Panel(crate::ui::panel_dock::PanelId::new(1))
+    }
+
+    /// PANEL MASK — RAW press: the press point is INSIDE the canvas draw rect,
+    /// but the frame's topmost surface is a panel, so the RAW press signal must
+    /// stay `None`. This is the path a DRAG-ONLY panel widget (a dock header
+    /// band, a resize handle) would otherwise leak through, because it bypasses
+    /// egui's widget attribution entirely.
+    #[test]
+    fn raw_press_over_a_panel_surface_is_not_reported() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let mut camera = Camera::new();
+        let (over_panel, _) = run_frame_targeting_surface(
+            &ctx,
+            vec![press(egui::pos2(50.0, 50.0))],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            None,
+            panel_surface(),
+        );
+        assert_eq!(
+            over_panel.raw_pressed_over_canvas, None,
+            "a press whose topmost surface is a panel must not reach the canvas"
+        );
+
+        // Same press, same point, canvas is the topmost surface: the raw signal
+        // carries the pressed cell as before.
+        let (over_canvas, _) = run_frame_targeting_surface(
+            &ctx,
+            vec![press(egui::pos2(50.0, 50.0))],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            None,
+            SurfaceId::Canvas,
+        );
+        assert_eq!(
+            over_canvas.raw_pressed_over_canvas,
+            Some((50, 50)),
+            "a press over the canvas itself must still report the raw press point"
+        );
+    }
+
+    /// PANEL MASK — wheel: no camera change, no zoom, no brush/shape/scatter
+    /// scroll when the pointer is over a panel, for every wheel flavour.
+    #[test]
+    fn wheel_over_a_panel_surface_never_touches_the_canvas() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let mut camera = Camera::new();
+        // Point the pointer inside the canvas draw rect first.
+        run_frame_targeting_surface(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(50.0, 50.0))],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            None,
+            SurfaceId::Canvas,
+        );
+
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::Modifiers {
+                ctrl: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+        ] {
+            let zoom_before = camera.zoom_percent();
+            let pan_before = camera.pan();
+            let (scrolled, _) = run_frame_targeting_surface(
+                &ctx,
+                vec![wheel(1.0, modifiers)],
+                &mut widget,
+                (64, 64),
+                &mut camera,
+                Some((
+                    BrushSpec::new(3, crate::core::brush::BrushShape::Square),
+                    DrawMode::Pen,
+                    Color::BLACK,
+                )),
+                panel_surface(),
+            );
+            assert_eq!(scrolled.zoom, None, "no zoom over a panel ({modifiers:?})");
+            assert_eq!(
+                scrolled.pan_by,
+                (0, 0),
+                "no pan over a panel ({modifiers:?})"
+            );
+            assert_eq!(
+                scrolled.brush_scroll, 0.0,
+                "no brush resize over a panel ({modifiers:?})"
+            );
+            assert_eq!(
+                scrolled.shape_cycle, 0,
+                "no brush-shape cycle over a panel ({modifiers:?})"
+            );
+            assert_eq!(
+                scrolled.scatter_scroll, 0.0,
+                "no scatter scroll over a panel ({modifiers:?})"
+            );
+            assert_eq!(camera.zoom_percent(), zoom_before, "camera unchanged");
+            assert_eq!(camera.pan(), pan_before, "camera unchanged");
+        }
+    }
+
+    /// PANEL MASK — middle-drag pan: a middle press over a panel never claims
+    /// the canvas pan gesture.
+    #[test]
+    fn middle_drag_over_a_panel_surface_never_pans_the_canvas() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let mut camera = Camera::new();
+        let middle = |pressed: bool, pos: egui::Pos2| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let pan_before = camera.pan();
+        let (scrolled, _) = run_frame_targeting_surface(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(50.0, 50.0)),
+                middle(true, egui::pos2(50.0, 50.0)),
+            ],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            None,
+            panel_surface(),
+        );
+        let (dragged, _) = run_frame_targeting_surface(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(70.0, 60.0))],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            None,
+            panel_surface(),
+        );
+        assert_eq!(
+            (scrolled.pan_by, dragged.pan_by),
+            ((0, 0), (0, 0)),
+            "a middle drag that starts over a panel must not pan the canvas"
+        );
+        assert_eq!(camera.pan(), pan_before, "camera unchanged");
+    }
+
+    /// PANEL MASK — hover preview: the brush cursor follows the pointer with no
+    /// button held, so it must disappear over a panel (a palette covers the
+    /// cursor and masks the canvas) while staying on the canvas otherwise.
+    #[test]
+    fn brush_cursor_is_not_painted_over_a_panel_surface() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let mut camera = Camera::new();
+        let preview = Some((
+            BrushSpec::new(3, crate::core::brush::BrushShape::Square),
+            DrawMode::Pen,
+            Color::rgb(255, 0, 0),
+        ));
+        let count_footprints = |shapes: &[egui::Shape]| {
+            shapes
+                .iter()
+                .filter(|shape| matches!(shape, egui::Shape::Rect(_)))
+                .count()
+        };
+
+        let (_, over_canvas) = run_frame_targeting_surface(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(50.0, 50.0))],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            preview,
+            SurfaceId::Canvas,
+        );
+        let (_, over_panel) = run_frame_targeting_surface(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(50.0, 50.0))],
+            &mut widget,
+            (64, 64),
+            &mut camera,
+            preview,
+            panel_surface(),
+        );
+        assert!(
+            count_footprints(&over_canvas) > count_footprints(&over_panel),
+            "the brush cursor must paint over the canvas ({}) but not over a panel ({} rect shapes)",
+            count_footprints(&over_canvas),
+            count_footprints(&over_panel),
+        );
     }
 
     #[test]
@@ -3070,9 +3650,9 @@ mod tests {
 
         // Without a transform the eraser's hollow footprint preview is painted
         // around its anchor: canvas (3,3) → silhouette edges at screen y 8..16.
-        let (_, shapes) = run_frame_with_shapes_state_with_brush(
+let (_, shapes) = run_frame_with_shapes_state_with_brush(
             &ctx,
-            pointer.clone(),
+            vec![egui::Event::PointerMoved(egui::pos2(10.0, 10.0))],
             &mut widget,
             (32, 32),
             &mut camera,
@@ -3157,6 +3737,297 @@ mod tests {
             painted.len(),
             samples.len()
         );
+    }
+
+    /// UX item 1/4/6: the Tile-placer overlay paints the hovered cell's green
+    /// outline, the REAL tile content (opaque pixels in their own colours)
+    /// and the green tile_id labels.
+    #[test]
+    fn tile_placer_overlay_paints_hover_outline_real_pixels_and_index_labels() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let theme = Theme::default_dark().colors;
+        let green = theme.onion_next_tint32();
+        // 32x32 canvas at 100%, tile_size 16: hover cell (1,0) spans canvas
+        // (16,0)-(32,16). A 2x2 tile preview with two distinct opaque colours
+        // occupies (16,0)-(18,2), and two assigned cells carry ids 5 and 7.
+        let red = Color::rgb(255, 0, 0);
+        let blue = Color::rgb(0, 0, 255);
+        widget.set_overlay(CanvasOverlay::TilePlacer {
+            hover_cell: Some((1, 0)),
+            gesture_cells: vec![],
+            preview_pixels: vec![(16, 0, red), (17, 0, blue), (16, 1, red), (17, 1, blue)],
+            indices: vec![((0, 0), 5), ((1, 0), 7)],
+        });
+        let (_, shapes) = run_frame_with_shapes(&ctx, Vec::new(), &mut widget, (32, 32));
+
+        // Item 1: the hover outline is a green-stroked rect over the cell.
+        let hover_outline = shapes.iter().any(|shape| match shape {
+            egui::Shape::Rect(rect) => {
+                rect.stroke.color == green
+                    && rect.rect
+                        == egui::Rect::from_min_max(egui::pos2(16.0, 0.0), egui::pos2(32.0, 16.0))
+            }
+            _ => false,
+        });
+        assert!(
+            hover_outline,
+            "the hovered cell must be outlined in the theme green at its bounds"
+        );
+
+        // Item 4: the REAL tile content — filled quads in the tile's own
+        // colours (red + blue), NOT a green hollow silhouette.
+        let red32 = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255);
+        let blue32 = egui::Color32::from_rgba_unmultiplied(0, 0, 255, 255);
+        let red_quads = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(rect) if rect.fill == red32 => Some(rect.rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let blue_quads = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(rect) if rect.fill == blue32 => Some(rect.rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            red_quads.len(),
+            2,
+            "the two red opaque pixels must be painted in their own colour"
+        );
+        assert_eq!(
+            blue_quads.len(),
+            2,
+            "the two blue opaque pixels must be painted in their own colour"
+        );
+        let green_fills = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(rect) if rect.fill == green => Some(rect.rect),
+                _ => None,
+            })
+            .count();
+        assert_eq!(
+            green_fills, 0,
+            "the preview must paint the tile's real pixels, not a green silhouette"
+        );
+
+        // Item 6: the green tile_id labels at each assigned cell's top-left.
+        let labels: Vec<String> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text)
+                    if text.galley.text() == "5" || text.galley.text() == "7" =>
+                {
+                    Some(text.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.contains(&"5".to_string()) && labels.contains(&"7".to_string()),
+            "assigned cells must carry their tile_id labels: {labels:?}"
+        );
+    }
+
+    /// UX item 1 + Fix 1: a Tile-placer overlay with no hovered cell paints NO
+    /// hover outline, and a TRANSPARENT tile pixel is not painted at all
+    /// (the preview preserves transparency).
+    #[test]
+    fn tile_placer_overlay_without_hover_paints_no_outline_and_skips_transparent() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let theme = Theme::default_dark().colors;
+        let green = theme.onion_next_tint32();
+        let red = Color::rgb(255, 0, 0);
+        // Pixel (17,0) carries alpha 0 — it must NOT be painted.
+        widget.set_overlay(CanvasOverlay::TilePlacer {
+            hover_cell: None,
+            gesture_cells: vec![],
+            preview_pixels: vec![(16, 0, red), (17, 0, Color::rgba(255, 0, 0, 0))],
+            indices: vec![((0, 0), 5)],
+        });
+        let (_, shapes) = run_frame_with_shapes(&ctx, Vec::new(), &mut widget, (32, 32));
+        let green_stroked: Vec<&egui::Shape> = shapes
+            .iter()
+            .filter(|shape| matches!(shape, egui::Shape::Rect(rect) if rect.stroke.color == green))
+            .collect();
+        assert!(
+            green_stroked.is_empty(),
+            "no hovered cell means no green outline stroke"
+        );
+        // The opaque pixel paints red; the fully-transparent pixel (alpha 0)
+        // must not appear as a red quad at (17,0).
+        let red32 = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255);
+        let red_quads: Vec<egui::Rect> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(rect) if rect.fill == red32 => Some(rect.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            red_quads.len(),
+            1,
+            "only the opaque pixel is painted: {red_quads:?}"
+        );
+        assert!(
+            red_quads.iter().all(|rect| rect.min.x < 17.0),
+            "no quad may appear at the transparent pixel (17,0): {red_quads:?}"
+        );
+        assert!(
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::Shape::Text(text) if text.galley.text() == "5"
+            )),
+            "index labels still paint without a hovered cell"
+        );
+    }
+
+    /// Item 2: the Tile-placer preview covers EVERY cell of the in-flight
+    /// gesture, not only the pointer's cell — each gesture cell gets a green
+    /// outline AND its own real-pixel preview quad in place.
+    #[test]
+    fn tile_placer_overlay_previews_every_gesture_cell() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let theme = Theme::default_dark().colors;
+        let green = theme.onion_next_tint32();
+        let red = Color::rgb(255, 0, 0);
+        let blue = Color::rgb(0, 0, 255);
+        // Gesture stamped cells (0,0) and (1,0) -> cell rects (0,0)-(16,16) and
+        // (16,0)-(32,16); the pointer hovers (2,0) -> (32,0)-(48,16). Each cell
+        // carries ONE preview pixel at its origin, in its own colour.
+        widget.set_overlay(CanvasOverlay::TilePlacer {
+            hover_cell: Some((2, 0)),
+            gesture_cells: vec![(0, 0), (1, 0)],
+            preview_pixels: vec![(0, 0, red), (16, 0, blue), (32, 0, red)],
+            indices: vec![],
+        });
+        let (_, shapes) = run_frame_with_shapes(&ctx, Vec::new(), &mut widget, (48, 16));
+
+        let outlines: Vec<egui::Rect> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(rect) if rect.stroke.color == green => Some(rect.rect),
+                _ => None,
+            })
+            .collect();
+        for cell_x in 0..3u32 {
+            let expected = egui::Rect::from_min_max(
+                egui::pos2((cell_x * 16) as f32, 0.0),
+                egui::pos2((cell_x * 16 + 16) as f32, 16.0),
+            );
+            assert!(
+                outlines.contains(&expected),
+                "cell ({cell_x},0) must be outlined in the theme green: {outlines:?}"
+            );
+        }
+        let red32 = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255);
+        let blue32 = egui::Color32::from_rgba_unmultiplied(0, 0, 255, 255);
+        let fills: Vec<(egui::Color32, egui::Rect)> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                    Some((rect.fill, rect.rect))
+                }
+                _ => None,
+            })
+            .filter(|(fill, _)| *fill == red32 || *fill == blue32)
+            .collect();
+        assert!(
+            fills.contains(&(red32, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))))
+                && fills.contains(&(blue32, egui::Rect::from_min_max(egui::pos2(16.0, 0.0), egui::pos2(17.0, 1.0))))
+                && fills.contains(&(red32, egui::Rect::from_min_max(egui::pos2(32.0, 0.0), egui::pos2(33.0, 1.0)))),
+            "each previewed cell must paint its own tile pixel in place: {fills:?}"
+        );
+    }
+
+    /// Z-order: the Tile-placer preview must be the LAST thing the canvas paints,
+    /// so it always reads ON TOP of the tile's baked content — nothing drawn
+    /// afterwards (brush footprint, line preview) may bury it.
+    #[test]
+    fn tile_placer_overlay_paints_after_every_other_decoration() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let theme = Theme::default_dark().colors;
+        let green = theme.onion_next_tint32();
+        let red = Color::rgb(255, 0, 0);
+        widget.set_overlay(CanvasOverlay::TilePlacer {
+            hover_cell: Some((1, 0)),
+            gesture_cells: vec![],
+            preview_pixels: vec![(16, 0, red)],
+            indices: vec![],
+        });
+        // A brush cursor is active too, so its footprint quads compete with the
+        // tile preview for the same z-range.
+        let (_, shapes) = run_frame_with_shapes_state_with_brush(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(10.0, 10.0))],
+            &mut widget,
+            (32, 32),
+            &mut Camera::new(),
+            Some((
+                crate::core::brush::BrushSpec::sanitize(4, crate::core::brush::BrushShape::Square),
+                DrawMode::Pen,
+                Color::rgb(0, 255, 0),
+            )),
+        );
+        // The brush cursor paints green FILLED footprint quads; the tile-placer
+        // preview is a green STROKE (outline) + the red tile pixel. The whole
+        // preview pass must come after EVERY brush footprint quad.
+        let brush_green = egui::Color32::from_rgba_unmultiplied(0, 255, 0, 255);
+        let brush_fills: Vec<usize> = shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, shape)| match shape {
+                egui::Shape::Rect(rect) if rect.fill == brush_green => Some(i),
+                _ => None,
+            })
+            .collect();
+        let green_stroke = shapes
+            .iter()
+            .position(|shape| matches!(shape, egui::Shape::Rect(rect) if rect.stroke.color == green));
+        let red_fill = shapes.iter().position(
+            |shape| matches!(shape, egui::Shape::Rect(rect) if rect.fill == egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255)),
+        );
+        let colors: Vec<egui::Color32> = shapes
+            .iter()
+            .filter_map(|s| {
+                if let egui::Shape::Rect(r) = s {
+                    Some(r.fill)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !brush_fills.is_empty(),
+            "the brush cursor must paint its footprint (shapes: {colors:?})"
+        );
+        assert!(
+            green_stroke.is_some() && red_fill.is_some(),
+            "both tile-placer shapes must paint"
+        );
+        let last_brush = *brush_fills.last().unwrap();
+        assert!(
+            red_fill.unwrap() > last_brush && green_stroke.unwrap() > last_brush,
+            "the tile-placer preview must come after the brush footprint, got last brush fill at {last_brush}, outline at {green_stroke:?} and preview at {red_fill:?}"
+        );
+        // And nothing is painted after the tile-id labels either.
+        let label = shapes.iter().position(|shape| {
+            matches!(shape, egui::Shape::Text(text) if text.galley.text() == "1")
+        });
+        if let Some(label) = label {
+            assert_eq!(
+                label,
+                shapes.len() - 1,
+                "the index labels are the last shapes the canvas emits"
+            );
+        }
     }
 
     /// L1-A: the floating-pixels preview quad is painted through a clip to the
@@ -4753,6 +5624,131 @@ mod tests {
         assert_eq!(
             clear.stroke_point, None,
             "a footprint clear of the canvas must still report nothing"
+        );
+    }
+
+    /// Görev HH perf probe: measures the mask marching-ants helpers vs
+    /// boundary perimeter length. Not run by default (it is a timing bench);
+    /// run with `cargo test --release --lib profile_mask_hotspot -- --ignored
+    /// --nocapture`.
+    ///
+    /// BEFORE (Task II, the old `paint_ants_mask`): `mask_polylines` for the
+    /// baseline plus `mask_dash_segments`, which chained the same boundary
+    /// internally *and* re-scanned every edge from zero per dash (O(n²/period)).
+    /// AFTER (Task II): the cached polylines feed the black baseline and the
+    /// single-cursor O(n) dash walk, so there is zero per-frame chaining.
+    #[test]
+    #[ignore = "timing micro-bench, run manually with --ignored --nocapture"]
+    fn profile_mask_hotspot() {
+        fn square_boundary(side: i32) -> Vec<((i32, i32), (i32, i32))> {
+            let mut v = Vec::new();
+            for x in 0..side {
+                v.push(((x, 0), (x + 1, 0)));
+                v.push(((x, side), (x + 1, side)));
+            }
+            for y in 0..side {
+                v.push(((0, y), (0, y + 1)));
+                v.push(((side, y), (side, y + 1)));
+            }
+            v
+        }
+        fn time<F: FnMut()>(iters: u32, mut f: F) -> f64 {
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            t.elapsed().as_secs_f64() * 1.0e6 / f64::from(iters)
+        }
+        for side in [64_i32, 128, 256, 512, 1024] {
+            let segs = square_boundary(side);
+            let n = segs.len();
+            // The cached baseline (computed once per selection, not per frame).
+            let cached = mask_polylines(&segs);
+            let pl = time(20, || {
+                std::hint::black_box(mask_polylines(std::hint::black_box(&segs)));
+            });
+            let new_walk = time(20, || {
+                std::hint::black_box(mask_dash_segments_from_polylines(
+                    std::hint::black_box(&cached),
+                    1234,
+                ));
+            });
+            // BEFORE: baseline `mask_polylines` + `mask_dash_segments` (which
+            // recomputed the polylines internally and ran the legacy quadratic
+            // walk) = 2 chainings + O(n²/period) per frame.
+            let before = time(20, || {
+                std::hint::black_box(mask_polylines(std::hint::black_box(&segs)));
+                let pl = mask_polylines(std::hint::black_box(&segs));
+                std::hint::black_box(
+                    crate::render::overlay::legacy_mask_dash_segments_from_polylines(
+                        std::hint::black_box(&pl),
+                        1234,
+                    ),
+                );
+            });
+            // AFTER: zero per-frame chaining; the cached polylines feed both the
+            // baseline and the O(n) dash walk.
+            let after = new_walk;
+            println!(
+                "side={side:5} perimeter={n:6}  mask_polylines={pl:10.2}us  BEFORE={before:10.2}us  AFTER(cached+O(n))={after:9.2}us  speedup={:6.1}x",
+                before / after.max(1e-9)
+            );
+        }
+    }
+
+    /// HH: `set_overlay` memoises the chained mask polylines and only
+    /// recomputes them when the boundary actually changes.
+    #[test]
+    fn set_overlay_memoises_ants_polylines_per_boundary() {
+        let mut widget = CanvasWidget::new();
+        let a = vec![
+            ((2, 2), (6, 2)),
+            ((6, 2), (6, 4)),
+            ((6, 4), (2, 4)),
+            ((2, 4), (2, 2)),
+        ];
+        widget.set_overlay(CanvasOverlay::AntsMask(a.clone()));
+        assert_eq!(
+            widget.cached_ants_polylines(),
+            mask_polylines(&a).as_slice()
+        );
+
+        // Same boundary again: the cache still matches the painted boundary.
+        widget.set_overlay(CanvasOverlay::AntsMask(a.clone()));
+        assert_eq!(
+            widget.cached_ants_polylines(),
+            mask_polylines(&a).as_slice()
+        );
+
+        // A different boundary must recompute.
+        let b = vec![
+            ((0, 0), (3, 0)),
+            ((3, 0), (3, 3)),
+            ((3, 3), (0, 3)),
+            ((0, 3), (0, 0)),
+        ];
+        widget.set_overlay(CanvasOverlay::AntsMask(b.clone()));
+        assert_eq!(
+            widget.cached_ants_polylines(),
+            mask_polylines(&b).as_slice()
+        );
+
+        // A region-cell gesture with a base selection uses the same cache.
+        let mut widget = CanvasWidget::new();
+        widget.set_overlay(CanvasOverlay::RegionCells {
+            cells: vec![Rect2i::new(0, 0, 1, 1)],
+            base: a.clone(),
+        });
+        assert_eq!(
+            widget.cached_ants_polylines(),
+            mask_polylines(&a).as_slice()
+        );
+
+        // An overlay without a mask boundary leaves the cache untouched.
+        widget.set_overlay(CanvasOverlay::None);
+        assert_eq!(
+            widget.cached_ants_polylines(),
+            mask_polylines(&a).as_slice()
         );
     }
 }

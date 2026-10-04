@@ -22,6 +22,7 @@ use std::any::Any;
 
 use crate::core::math::Rect2i;
 use crate::core::model::{BlendMode, Layer, LayerId, LayerStack};
+use crate::core::tilemap::TilePalette;
 use crate::core::transform::LayerCommit;
 use crate::core::undo::{
     Command, CommandContext, CompositeCommand, DeltaRecorder, ReverseDeltaCommand, UndoStack,
@@ -519,15 +520,23 @@ impl<'a> LayerStackController<'a> {
         true
     }
 
-    /// Undo the top command on the shared stack.
+    /// Undo the top command on the shared stack. Test-support helper; the
+    /// context carries a throwaway palette (no tile edit commands flow through
+    /// structural layer gestures).
     pub fn undo(&mut self, layers: &mut LayerStack) -> bool {
-        let mut context = CommandContext { layers };
+        let mut context = CommandContext {
+            layers,
+            palette: &mut TilePalette::new(),
+        };
         self.stack.undo(&mut context)
     }
 
-    /// Redo the top command on the shared stack.
+    /// Redo the top command on the shared stack. Test-support helper.
     pub fn redo(&mut self, layers: &mut LayerStack) -> bool {
-        let mut context = CommandContext { layers };
+        let mut context = CommandContext {
+            layers,
+            palette: &mut TilePalette::new(),
+        };
         self.stack.redo(&mut context)
     }
 
@@ -714,9 +723,14 @@ pub fn apply_layer_commits_with(
         };
         // A masked lift pastes only the selected cells too: the lifted
         // buffer's zeros outside the mask must never reach the destination.
+        // The paste composites source-over (EE): a transformed texture must
+        // blend onto what is already on the target layer, and alpha-0 pixels
+        // must leave the canvas untouched instead of erasing it.
         let pasted = match &source.mask {
-            Some(mask) => layer.buffer.blit_region_masked(rect, &bytes, Some(mask)),
-            None => layer.buffer.blit_region(rect, &bytes),
+            Some(mask) => layer
+                .buffer
+                .blit_region_masked_over(rect, &bytes, Some(mask)),
+            None => layer.buffer.blit_region_over(rect, &bytes),
         };
         if pasted && !recorder.is_empty_delta(&layer.buffer) {
             composite.push(Box::new(recorder.finish(&layer.buffer)));
@@ -1075,7 +1089,8 @@ mod tests {
         // Undo moves the plain set to the redo stack; the coalesced command
         // (before = pre-drag 1.0, after = 0.4) is now on top of the undo stack.
         assert!(stack.undo(&mut CommandContext {
-            layers: &mut layers
+            layers: &mut layers,
+            palette: &mut TilePalette::new(),
         }));
         let top = stack.peek_top().unwrap();
         let cmd = top.as_any().downcast_ref::<LayerPropertyCommand>().unwrap();
@@ -1088,6 +1103,7 @@ mod tests {
             LayerPropertyCommand::new(id, LayerProperty::Opacity(1.0), LayerProperty::Opacity(0.5));
         let mut context = CommandContext {
             layers: &mut layers,
+            palette: &mut TilePalette::new(),
         };
         assert!(direct.undo(&mut context));
         assert!(direct.is_undone());
@@ -1140,7 +1156,8 @@ mod tests {
 
         // Undoing it returns to the original opacity.
         assert!(stack.undo(&mut CommandContext {
-            layers: &mut layers
+            layers: &mut layers,
+            palette: &mut TilePalette::new(),
         }));
         assert_eq!(layers.layer(id).unwrap().opacity, 1.0);
     }
@@ -1188,7 +1205,8 @@ mod tests {
         assert_eq!(cmd.after(), LayerProperty::Opacity(0.7));
 
         assert!(stack.undo(&mut CommandContext {
-            layers: &mut layers
+            layers: &mut layers,
+            palette: &mut TilePalette::new(),
         }));
         let top = stack.peek_top().unwrap();
         let cmd = top.as_any().downcast_ref::<LayerPropertyCommand>().unwrap();
@@ -1198,8 +1216,19 @@ mod tests {
 
     // --- transform commit (D32/D35/D36) ---
 
-    fn ctx(layers: &mut LayerStack) -> CommandContext<'_> {
-        CommandContext { layers }
+    /// Test helper: build a `CommandContext` borrowing `layers` and an owned
+    /// palette. The palette must outlive the returned context, so callers pass
+    /// a `&mut TilePalette`:
+    /// `let mut palette = TilePalette::new(); ctx(&mut layers, &mut palette)`.
+    fn ctx<'a>(layers: &'a mut LayerStack) -> CommandContext<'a> {
+        // Test-only: the palette is leaked so the returned context outlives the
+        // `&mut ctx(...)` temporary. Only the tile edit commands read it, and
+        // no structural-layer test pushes one.
+        let palette = Box::leak(Box::new(TilePalette::new()));
+        CommandContext {
+            layers,
+            palette: &mut *palette,
+        }
     }
 
     /// Deterministic per-pixel pattern fill (same formula as select.rs).
@@ -1552,6 +1581,175 @@ mod tests {
             Some(Color::TRANSPARENT)
         );
         assert_eq!(layers.active_layer().buffer.get_pixel(2, 1), kept_21);
+    }
+
+    #[test]
+    fn paste_composites_source_over() {
+        // Destination layer already carries an opaque drawing; the transformed
+        // commit lands on top of it and must COMPOSITE, not replace.
+        let mut layers = LayerStack::new(4, 4);
+        let src = layers.active_layer_id();
+        let dst = layers.add_layer("Target");
+        pattern_fill(&mut layers.layer_mut(src).unwrap().buffer);
+        assert!(layers
+            .layer_mut(dst)
+            .unwrap()
+            .buffer
+            .set_pixel(1, 1, Color::rgba(0, 0, 255, 255)));
+        assert!(layers
+            .layer_mut(dst)
+            .unwrap()
+            .buffer
+            .set_pixel(2, 1, Color::rgba(0, 255, 0, 255)));
+        assert!(layers.layer_mut(dst).unwrap().buffer.set_pixel(
+            3,
+            1,
+            Color::rgba(255, 255, 255, 255)
+        ));
+        let dst_before = layers.layer(dst).unwrap().buffer.as_bytes().to_vec();
+
+        let rect = Rect2i::new(1, 1, 3, 1);
+        let snapshot = layers
+            .layer(src)
+            .unwrap()
+            .buffer
+            .export_region(rect, None)
+            .unwrap();
+        let source = TransformSource {
+            layer_id: src,
+            rect,
+            snapshot,
+            mask: None,
+        };
+        // Pixel 0: half red (sa=128) blends over opaque blue.
+        // Pixel 1: fully transparent (sa=0) leaves the green untouched.
+        // Pixel 2: opaque red replaces the white.
+        let commit = LayerCommit {
+            layer_id: 0,
+            dst: (1.0, 1.0),
+            w: 3,
+            h: 1,
+            buf: vec![
+                255, 0, 0, 128, // semi-transparent source
+                255, 255, 255, 0, // fully transparent source
+                255, 0, 0, 255, // opaque source
+            ],
+        };
+
+        let mut cmd = apply_layer_commits(&source, &[commit], dst, &mut layers).unwrap();
+
+        let target = &layers.layer(dst).unwrap().buffer;
+        // Exact source-over result for sa=128 over (0,0,255,255).
+        assert_eq!(target.get_pixel(1, 1), Some(Color::rgba(128, 0, 127, 255)));
+        // alpha == 0 never changes the destination.
+        assert_eq!(target.get_pixel(2, 1), Some(Color::rgba(0, 255, 0, 255)));
+        // alpha == 255 replaces.
+        assert_eq!(target.get_pixel(3, 1), Some(Color::rgba(255, 0, 0, 255)));
+        // The source layer was still cut.
+        assert_eq!(
+            layers.layer(src).unwrap().buffer.get_pixel(1, 1),
+            Some(Color::TRANSPARENT)
+        );
+
+        // Undo restores both layers exactly.
+        assert!(cmd.undo(&mut ctx(&mut layers)));
+        assert_eq!(
+            layers.layer(dst).unwrap().buffer.as_bytes(),
+            &dst_before[..]
+        );
+        assert_eq!(
+            layers.layer(src).unwrap().buffer.get_pixel(1, 1),
+            Some(Color::rgba(48, 36, 48, 255))
+        );
+        assert!(cmd.redo(&mut ctx(&mut layers)));
+        assert_eq!(
+            layers.layer(dst).unwrap().buffer.get_pixel(1, 1),
+            Some(Color::rgba(128, 0, 127, 255))
+        );
+    }
+
+    #[test]
+    fn paste_alpha_zero_does_not_erase() {
+        let mut layers = LayerStack::new(4, 4);
+        let lid = layers.active_layer_id();
+        // Existing opaque drawing across the paste rect.
+        assert!(layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(1, 1, Color::rgba(0, 0, 255, 255)));
+        assert!(layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(2, 1, Color::rgba(0, 255, 0, 255)));
+        let before = layers.active_layer().buffer.as_bytes().to_vec();
+
+        let rect = Rect2i::new(1, 1, 2, 1);
+        let source = TransformSource {
+            layer_id: lid,
+            rect,
+            snapshot: vec![0u8; rect.area() as usize * 4],
+            mask: None,
+        };
+        // A transformed region that is entirely alpha == 0 (copy transform, so
+        // the source is not cut).
+        let commit = LayerCommit {
+            layer_id: 0,
+            dst: (1.0, 1.0),
+            w: 2,
+            h: 1,
+            buf: vec![
+                123, 45, 67, 0, 200, 100, 50, 0, // all fully transparent
+            ],
+        };
+
+        let result = apply_layer_commits_with(&source, &[commit], lid, &mut layers, false);
+        // No visible change → no undo entry (identity guard).
+        assert!(result.is_none());
+        assert_eq!(layers.active_layer().buffer.as_bytes(), &before[..]);
+    }
+
+    #[test]
+    fn cut_still_erases_selected_pixels() {
+        let mut layers = LayerStack::new(4, 4);
+        let lid = layers.active_layer_id();
+        pattern_fill(&mut layers.active_layer_mut().buffer);
+        let original = layers.active_layer().buffer.as_bytes().to_vec();
+
+        let rect = Rect2i::new(1, 1, 2, 2);
+        let snapshot = layers
+            .active_layer()
+            .buffer
+            .export_region(rect, None)
+            .unwrap();
+        let source = TransformSource {
+            layer_id: lid,
+            rect,
+            snapshot: snapshot.clone(),
+            mask: None,
+        };
+        // Commit lands fully off-canvas: only the cut runs.
+        let commit = LayerCommit {
+            layer_id: 0,
+            dst: (10.0, 10.0),
+            w: 2,
+            h: 2,
+            buf: snapshot,
+        };
+        let mut cmd = apply_layer_commits(&source, &[commit], lid, &mut layers).unwrap();
+
+        // The CUT stays an opaque replace: selected source pixels are cleared.
+        assert_eq!(
+            layers.active_layer().buffer.get_pixel(1, 1),
+            Some(Color::TRANSPARENT)
+        );
+        assert_eq!(
+            layers.active_layer().buffer.get_pixel(2, 2),
+            Some(Color::TRANSPARENT)
+        );
+        assert_ne!(layers.active_layer().buffer.as_bytes(), &original[..]);
+
+        assert!(cmd.undo(&mut ctx(&mut layers)));
+        assert_eq!(layers.active_layer().buffer.as_bytes(), &original[..]);
     }
 
     #[test]

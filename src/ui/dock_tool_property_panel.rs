@@ -3,6 +3,7 @@
 //!
 //! The Draw tools (Pencil and Eraser) share the brush-size, brush-shape and
 //! brush-scatter properties; the Fieldier shows its child picker plus the wand's
+//! tolerance / contiguity / restrict-to-region; the Fill tool shows its own
 //! tolerance / contiguity / restrict-to-region. Every other tool keeps the
 //! placeholder area.
 
@@ -33,6 +34,12 @@ const TOOL_PROPERTY_PLACEHOLDER: &str = "No editable properties for this tool ye
 /// slider row; it emits the parameter's reset value.
 const RESET_LABEL: &str = "Reset";
 
+/// Bounds of the Tile tool's rotation input. The stored value is always a
+/// normalized 90 multiple, but the box accepts up to three full turns each way
+/// so scrolling (or typing) can pass through a full turn before normalizing.
+const ROTATION_INPUT_MIN: i32 = -1080;
+const ROTATION_INPUT_MAX: i32 = 1080;
+
 /// The tool name (top-left) followed by the per-tool property area.
 struct ToolPropertyComponent {
     host: ToolboxHost,
@@ -58,7 +65,13 @@ impl Component for ToolPropertyComponent {
             Tool::Fieldier => {
                 self.fieldier_properties(ui, &view, chrome);
             }
-            Tool::Fill | Tool::Eyedropper | Tool::Draw => {
+            Tool::Fill => {
+                self.fill_properties(ui, &view, chrome);
+            }
+            Tool::Tile => {
+                self.tile_properties(ui, &view);
+            }
+            Tool::Eyedropper | Tool::Draw => {
                 ui.weak(TOOL_PROPERTY_PLACEHOLDER);
             }
         }
@@ -244,6 +257,89 @@ impl ToolPropertyComponent {
         }
     }
 
+    /// The Fill (bucket) tool's properties: the per-channel tolerance
+    /// (`[numeric input][slider][Reset]`), the contiguous checkbox and the
+    /// restrict-to-region checkbox. All three write the Fill tool's own stored
+    /// [`FillSettings`](crate::input::FillSettings).
+    fn fill_properties(&self, ui: &mut egui::Ui, view: &ToolboxView, chrome: &PanelChrome) {
+        let events = &self.host.events;
+        property_row(ui, "Tolerance", |ui| {
+            let mut tolerance = view.fill.tolerance;
+            let input = ui.add(egui::DragValue::new(&mut tolerance).range(0..=u8::MAX));
+            let slider = ui.add(egui::Slider::new(&mut tolerance, 0..=u8::MAX).show_value(false));
+            let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+            if (input.changed() || slider.changed()) && tolerance != view.fill.tolerance {
+                events
+                    .borrow_mut()
+                    .push(ToolbarEvent::FillToleranceChanged(tolerance));
+            }
+            if reset.clicked() {
+                events
+                    .borrow_mut()
+                    .push(ToolbarEvent::FillToleranceChanged(0));
+            }
+        });
+        let mut contiguous = view.fill.contiguous;
+        if ui.checkbox(&mut contiguous, "Contiguous").changed() {
+            events
+                .borrow_mut()
+                .push(ToolbarEvent::FillContiguousChanged(contiguous));
+        }
+        let mut restrict = view.fill.restrict_to_region;
+        if ui.checkbox(&mut restrict, "Restrict to region").changed() {
+            events
+                .borrow_mut()
+                .push(ToolbarEvent::FillRestrictToRegionChanged(restrict));
+        }
+    }
+
+    /// The Tile (placer) tool's properties: the placement transform that BOTH the
+    /// Q/R/X/Z shortcuts and these controls drive.
+    ///
+    /// The widgets are a pure VIEW over [`ToolboxView::tile_placer`], which the
+    /// App mirrors from the single `tile_placer_transform` — so there is one
+    /// source of truth and a key press is immediately visible here (and a panel
+    /// edit immediately changes what the next stamp writes).
+    ///
+    /// Rotation is a plain numeric input in DEGREES, but the value is snapped to
+    /// the quarter-turn grid (see [`snap_rotation_degrees`]) before it is emitted,
+    /// so the box only ever displays 0 / 90 / 180 / 270 no matter what is typed.
+    /// The two flip checkboxes are stacked vertically, horizontal above vertical.
+    fn tile_properties(&self, ui: &mut egui::Ui, view: &ToolboxView) {
+        let events = &self.host.events;
+        property_row(ui, "Rotation", |ui| {
+            let mut degrees = view.tile_placer.rotation;
+            let input = ui.add(
+                egui::DragValue::new(&mut degrees)
+                    .range(ROTATION_INPUT_MIN..=ROTATION_INPUT_MAX)
+                    .speed(1.0),
+            );
+            if input.changed() {
+                // Snap BEFORE emitting: the event carries an already-normalized
+                // 90 multiple, so the App never has to re-derive it and the
+                // typed value can never escape the quarter-turn grid.
+                let snapped = snap_rotation_degrees(degrees);
+                if snapped != view.tile_placer.rotation {
+                    events
+                        .borrow_mut()
+                        .push(ToolbarEvent::TileRotationChanged(snapped));
+                }
+            }
+        });
+        let mut flip_x = view.tile_placer.flip_x;
+        if ui.checkbox(&mut flip_x, "horizontal flip").changed() {
+            events
+                .borrow_mut()
+                .push(ToolbarEvent::TileFlipXChanged(flip_x));
+        }
+        let mut flip_y = view.tile_placer.flip_y;
+        if ui.checkbox(&mut flip_y, "vertical flip").changed() {
+            events
+                .borrow_mut()
+                .push(ToolbarEvent::TileFlipYChanged(flip_y));
+        }
+    }
+
     /// The live transform's properties: the free-angle rotation algorithm
     /// selector, mirroring the Fieldier "Child" row. Only meaningful while
     /// `view.transform_active` (the caller branches on it).
@@ -271,6 +367,18 @@ impl ToolPropertyComponent {
             }
         });
     }
+}
+
+/// Snap an arbitrary typed rotation to the Tile tool's quarter-turn grid and
+/// normalize it into `0..360`, so the input can only ever hold 0 / 90 / 180 /
+/// 270.
+///
+/// Rounding is to the NEAREST multiple of 90 (halfway values round away from
+/// zero), and the result wraps: `45 → 90`, `100 → 90`, `91 → 90`, `135 → 180`,
+/// `360 → 0`, `-45 → 270`, `-450 → 270`.
+fn snap_rotation_degrees(degrees: i32) -> i32 {
+    let quarters = (f64::from(degrees) / 90.0).round() as i64;
+    ((quarters.rem_euclid(4)) * 90) as i32
 }
 
 /// The tail value a slider position `t ∈ [-1, 1]` drives: `0` at the exact
@@ -337,6 +445,41 @@ pub fn tool_property_panel_spec(host: &ToolboxHost, placement: PanelPlacement) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_snaps_to_the_nearest_quarter_turn() {
+        assert_eq!(snap_rotation_degrees(0), 0);
+        assert_eq!(snap_rotation_degrees(90), 90);
+        assert_eq!(snap_rotation_degrees(180), 180);
+        assert_eq!(snap_rotation_degrees(270), 270);
+        assert_eq!(snap_rotation_degrees(45), 90, "halfway rounds away from zero");
+        assert_eq!(snap_rotation_degrees(135), 180);
+        assert_eq!(snap_rotation_degrees(100), 90, "nearest, not rounded up");
+        assert_eq!(snap_rotation_degrees(91), 90);
+        assert_eq!(snap_rotation_degrees(179), 180);
+        assert_eq!(snap_rotation_degrees(181), 180);
+        assert_eq!(snap_rotation_degrees(226), 270);
+        assert_eq!(snap_rotation_degrees(1), 0);
+        assert_eq!(snap_rotation_degrees(359), 0);
+    }
+
+    #[test]
+    fn rotation_normalizes_into_zero_to_three_hundred_sixty() {
+        assert_eq!(snap_rotation_degrees(360), 0, "a full turn is no rotation");
+        assert_eq!(snap_rotation_degrees(450), 90);
+        assert_eq!(snap_rotation_degrees(-90), 270);
+        assert_eq!(snap_rotation_degrees(-45), 270);
+        assert_eq!(snap_rotation_degrees(-100), 270);
+        assert_eq!(snap_rotation_degrees(-180), 180);
+        assert_eq!(snap_rotation_degrees(-450), 270);
+        for degrees in ROTATION_INPUT_MIN..=ROTATION_INPUT_MAX {
+            let snapped = snap_rotation_degrees(degrees);
+            assert!(
+                (0..360).contains(&snapped) && snapped % 90 == 0,
+                "{degrees} snapped to {snapped}, which is not a 90 multiple in 0..360"
+            );
+        }
+    }
 
     #[test]
     fn tail_slider_maps_extremes_to_one_and_centre_to_one_hundred() {

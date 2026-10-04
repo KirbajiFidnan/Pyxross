@@ -20,9 +20,9 @@
 //!    rotation, `sx`/`sy` are true LOCAL dimension factors: the scaled rect's
 //!    own width/height, never a canvas-axis stretch.
 //! 3. **Rotate around the pivot** — [`super::rotate_with`] rotates the scaled
-//!    buffer about its own centre (it dispatches exact multiples of 90° to
-//!    the pixel-exact paths, so 90°/180°/270° are bit-identical to U16's
-//!    exact functions); the result is then translated so the canvas-space
+//!    buffer about its own visual area centre (it dispatches exact multiples
+//!    of 90° to the pixel-exact paths, so 90°/180°/270° are bit-identical to
+//!    U16's exact functions); the result is then translated so the canvas-space
 //!    [`TransformObject::pivot`] stays fixed. Angle convention matches
 //!    [`super::rotate_with`]: positive = clockwise (screen coords, y-down). For
 //!    exact 90° multiples the placement uses integer coefficient tables
@@ -108,7 +108,8 @@ pub struct LayerBuffer {
 ///
 /// `pos` is the canvas position of the source buffer's top-left corner
 /// (the identity placement). `pivot` is the canvas-space point that
-/// rotation and scaling are anchored to (default: the source centre).
+/// rotation and scaling are anchored to (default: the source's visual AREA
+/// centre, `pos + w/2`).
 pub struct TransformObject {
     /// Mini-stack: one buffer per lifted source layer (D32).
     layers: Vec<LayerBuffer>,
@@ -143,13 +144,12 @@ pub struct TransformObject {
 
 impl TransformObject {
     /// Lifts a single layer into a new transform object (single-layer MVP,
-    /// D36). The pivot defaults to the centre of `src` in canvas space
-    /// (`pos + ((w-1)/2, (h-1)/2)`), scale is 1.0, angle is 0, no flips.
+    /// D36). The pivot defaults to the **visual AREA centre** of `src` in
+    /// canvas space (`pos + (w/2, h/2)`; the area is `[pos, pos + w]`, e.g.
+    /// 16×16 → `pos + (8, 8)`, 15×15 → `pos + (7.5, 7.5)`), scale is 1.0,
+    /// angle is 0, no flips.
     pub fn lift(src: LayerBuffer, pos: (f32, f32)) -> Self {
-        let pivot = (
-            pos.0 + (src.w as f32 - 1.0) / 2.0,
-            pos.1 + (src.h as f32 - 1.0) / 2.0,
-        );
+        let pivot = (pos.0 + src.w as f32 / 2.0, pos.1 + src.h as f32 / 2.0);
         TransformObject {
             layers: vec![src],
             pos,
@@ -167,15 +167,13 @@ impl TransformObject {
     }
 
     /// Lifts multiple layers (multi-layer readiness, D32). The pivot
-    /// defaults to the centre of the first layer; every layer shares the
-    /// same `pos`. Test-only: the single-layer MVP is the shipped path.
+    /// defaults to the **visual AREA centre** of the first layer
+    /// (`pos + (w/2, h/2)`); every layer shares the same `pos`. Test-only:
+    /// the single-layer MVP is the shipped path.
     #[cfg(test)]
     pub fn from_layers(layers: Vec<LayerBuffer>, pos: (f32, f32)) -> Self {
         let pivot = match layers.first() {
-            Some(l) => (
-                pos.0 + (l.w as f32 - 1.0) / 2.0,
-                pos.1 + (l.h as f32 - 1.0) / 2.0,
-            ),
+            Some(l) => (pos.0 + l.w as f32 / 2.0, pos.1 + l.h as f32 / 2.0),
             None => pos,
         };
         TransformObject {
@@ -759,8 +757,11 @@ fn rotate_inverse(v: (f32, f32), angle_deg: f32) -> (f32, f32) {
 /// integer pixel grid) and the f64 trig path for all other angles.
 ///
 /// SCALE-THEN-ROTATE: the flipped source is scaled to `ceil(w·sx) ×
-/// ceil(h·sy)`, then rotated about the scaled buffer's centre; `dst` places
-/// the rotated buffer so the pivot stays fixed.
+/// ceil(h·sy)`, then rotated about the scaled buffer's visual AREA centre
+/// (`sw/2`, `sh/2`); `dst` places the rotated buffer so the pivot stays fixed.
+/// The default pivot (`lift`) is the source's area centre, so a pure rotation
+/// (`sx == sy == 1`) keeps the pivot on the output's area centre and each
+/// pixel area maps symmetrically about it.
 fn placement_math(
     w: usize,
     h: usize,
@@ -781,10 +782,13 @@ fn placement_math(
     }
     let (rw, rh) = rotated_bounds(sw, sh, angle_deg);
     // Pivot in scaled-local coords (the scaled buffer sits at `pos`, scaled
-    // about its origin), relative to the scaled buffer centre.
+    // about its origin), relative to the scaled buffer's AREA centre. The
+    // visual area is `[pos, pos + sw]`, so its centre is `sw / 2` (NOT the
+    // pixel-coordinate centre `(sw-1)/2`). Using the area centre keeps the
+    // pivot on the visual centre: 16×16 → 8, 15×15 → 7.5.
     let pf = (pivot.0 - pos.0, pivot.1 - pos.1);
-    let cf = ((sw as f32 - 1.0) / 2.0, (sh as f32 - 1.0) / 2.0);
-    let cr = ((rw as f32 - 1.0) / 2.0, (rh as f32 - 1.0) / 2.0);
+    let cf = (sw as f32 / 2.0, sh as f32 / 2.0);
+    let cr = (rw as f32 / 2.0, rh as f32 / 2.0);
     let rel = (pf.0 * sx - cf.0, pf.1 * sy - cf.1);
     let r = rotate_vector(rel, angle_deg);
     let pr = (cr.0 + r.0, cr.1 + r.1);
@@ -1257,11 +1261,92 @@ mod tests {
         let (buf, w, h) = fixture_3x3();
         let obj = TransformObject::lift(layer(buf, w, h, 0), (10.0, 20.0));
         assert_eq!(obj.pos, (10.0, 20.0));
-        assert_eq!(obj.pivot, (11.0, 21.0)); // centre of 3×3 at (10,20)
+        assert_eq!(obj.pivot, (11.5, 21.5)); // AREA centre of 3×3 at (10,20): 10+1.5
         assert_eq!(obj.angle_deg, 0.0);
         assert_eq!(obj.scale, 1.0);
         assert!(!obj.flip_h);
         assert!(!obj.flip_v);
+    }
+
+    /// The default pivot is the visual AREA centre `pos + w/2`, NOT the
+    /// pixel-coordinate centre `pos + (w-1)/2`: 16×16 → 8, 15×15 → 7.5.
+    #[test]
+    fn lift_pivot_is_the_visual_area_centre() {
+        let obj = TransformObject::lift(layer(vec![0u8; 16 * 16 * 4], 16, 16, 0), (0.0, 0.0));
+        assert_eq!(obj.pivot(), (8.0, 8.0), "16×16 area centre is (8,8)");
+        let obj = TransformObject::lift(layer(vec![0u8; 15 * 15 * 4], 15, 15, 0), (0.0, 0.0));
+        assert_eq!(
+            obj.pivot(),
+            (7.5, 7.5),
+            "15×15 area centre is (7.5,7.5), not (w-1)/2 = 7"
+        );
+        // The pivot tracks a non-zero origin and a non-square area.
+        let (buf, w, h) = fixture_4x2();
+        let obj = TransformObject::lift(layer(buf, w, h, 0), (10.0, 20.0));
+        assert_eq!(obj.pivot(), (12.0, 21.0));
+    }
+
+    /// The stored pivot is exactly the AREA centre `min + size/2` of
+    /// [`TransformObject::canvas_bbox`] (the visual gizmo centre) at identity
+    /// and for every exact quarter turn, for even and odd dims alike.
+    #[test]
+    fn pivot_is_the_rendered_bbox_area_centre() {
+        for (w, h) in [(16usize, 16usize), (15, 15), (4, 2), (3, 3), (5, 4)] {
+            for angle in [0.0f32, 90.0, 180.0, 270.0] {
+                let mut obj =
+                    TransformObject::lift(layer(vec![0u8; w * h * 4], w, h, 0), (1.0, 2.0));
+                obj.set_angle(angle);
+                let (x0, y0, x1, y1) = obj.canvas_bbox();
+                assert_close(obj.pivot().0, (x0 + x1) * 0.5);
+                assert_close(obj.pivot().1, (y0 + y1) * 0.5);
+            }
+        }
+    }
+
+    /// 180° maps each pixel's AREA `[pos+i, pos+i+1]` onto the mirrored pixel
+    /// area `w-1-i` about the area centre, so the whole source area
+    /// `[pos, pos+w]` maps onto itself.
+    #[test]
+    fn rotate_180_maps_pixel_areas_symmetrically_about_the_area_centre() {
+        let (w, h) = (5usize, 3usize);
+        let mut obj = TransformObject::lift(layer(vec![0u8; w * h * 4], w, h, 0), (2.0, 7.0));
+        obj.set_angle(180.0);
+        assert_eq!(obj.pivot(), (4.5, 8.5));
+        // The output occupies exactly the source area again (180° is an
+        // involution of the area about its centre).
+        let (x0, y0, x1, y1) = obj.canvas_bbox();
+        assert_close(x0, 2.0);
+        assert_close(x1, 2.0 + w as f32);
+        assert_close(y0, 7.0);
+        assert_close(y1, 7.0 + h as f32);
+        // Pixel i's area maps onto pixel (w-1-i)'s area.
+        for i in 0..w {
+            let lead = canvas_point(&obj, (i as f32, 0.0));
+            let trail = canvas_point(&obj, (i as f32 + 1.0, 0.0));
+            let mirrored = (w - 1 - i) as f32;
+            let lo = trail.0.min(lead.0);
+            let hi = trail.0.max(lead.0);
+            assert_close(lo, 2.0 + mirrored);
+            assert_close(hi, 2.0 + mirrored + 1.0);
+        }
+    }
+
+    /// Resize sizing about the top-left AREA corner keeps that anchor fixed and
+    /// the exact local target under the area-centre convention.
+    #[test]
+    fn resize_anchor_is_fixed_under_the_area_centre_convention() {
+        let (w, h) = (6usize, 4usize);
+        let mut obj = TransformObject::lift(layer(vec![0u8; w * h * 4], w, h, 0), (1.0, 2.0));
+        assert_eq!(obj.pivot(), (4.0, 4.0));
+        let anchor = (1.0f32, 2.0f32);
+        obj.resize_to_pixels(12, 8, anchor);
+        assert_eq!(obj.local_scaled_dims(), (12, 8));
+        // The source top-left area corner (u = 0,0) still maps to the anchor.
+        let p = canvas_point(&obj, (0.0, 0.0));
+        assert!(
+            (p.0 - anchor.0).abs() < 1e-3 && (p.1 - anchor.1).abs() < 1e-3,
+            "area corner anchor drifted: {p:?}"
+        );
     }
 
     #[test]
@@ -1349,7 +1434,7 @@ mod tests {
         let (buf, w, h) = fixture_3x3();
         let mut obj = TransformObject::lift(layer(buf, w, h, 0), (0.0, 0.0));
         obj.set_angle(90.0);
-        // 3×3 rotated 90° about its centre (1,1): dst = (0,0), dims 3×3.
+        // 3×3 rotated 90° about its area centre (1.5,1.5): dst = (0,0), dims 3×3.
         assert_eq!(obj.canvas_bbox(), (0.0, 0.0, 3.0, 3.0));
     }
 
@@ -1359,11 +1444,12 @@ mod tests {
         let mut obj = TransformObject::lift(layer(buf, w, h, 0), (0.0, 0.0));
         obj.set_pivot((0.0, 0.0));
         obj.set_angle(90.0);
-        // Pivot at the top-left corner: rotated 3×3 is placed at (-2, 0).
+        // Pivot at the top-left CORNER of the area: the area centre pivots a
+        // 3×3 to (-3,0)..(0,3).
         let (min_x, min_y, max_x, max_y) = obj.canvas_bbox();
-        assert_close(min_x, -2.0);
+        assert_close(min_x, -3.0);
         assert_close(min_y, 0.0);
-        assert_close(max_x, 1.0);
+        assert_close(max_x, 0.0);
         assert_close(max_y, 3.0);
     }
 
@@ -1385,11 +1471,12 @@ mod tests {
         let (buf, w, h) = fixture_4x2();
         let mut obj = TransformObject::lift(layer(buf, w, h, 0), (10.0, 20.0));
         obj.set_angle(90.0);
-        // 4×2 at (10,20), pivot (11.5, 20.5): the quarter turn swaps the
-        // extents to [10,12]×[19,23] with no trig epsilon.
+        // 4×2 at (10,20), AREA centre pivot (12,21): the quarter turn swaps the
+        // extents to [11,13]×[19,23] with no trig epsilon (odd/even areas are
+        // symmetric about the area centre).
         assert_eq!(
             obj.canvas_corners(),
-            [(12.0, 19.0), (12.0, 23.0), (10.0, 23.0), (10.0, 19.0)]
+            [(13.0, 19.0), (13.0, 23.0), (11.0, 23.0), (11.0, 19.0)]
         );
         // The quad is axis-aligned: each corner is a corner of its own AABB.
         let corners = obj.canvas_corners();
@@ -1828,9 +1915,9 @@ mod tests {
         assert_eq!((commits[0].w, commits[0].h), (ew, eh));
         assert_eq!(commits[0].buf, expected);
         // Integer snap: the exact-90° placement is bit-exact, no trig
-        // epsilon — 3×3 rotated CW about the top-left pivot lands at
-        // (-2, 0) EXACTLY.
-        assert_eq!(commits[0].dst, (-2.0, 0.0));
+        // epsilon — 3×3 rotated CW about the top-left AREA-corner pivot lands
+        // at (-3, 0) EXACTLY.
+        assert_eq!(commits[0].dst, (-3.0, 0.0));
     }
 
     #[test]
@@ -1843,9 +1930,9 @@ mod tests {
         let (expected, ew, eh) = rotate_180(&buf, w, h);
         assert_eq!((commits[0].w, commits[0].h), (ew, eh));
         assert_eq!(commits[0].buf, expected);
-        // Pivot stays fixed: 3×3 rotated 180° about the top-left pivot
-        // lands at (-2, -2) exactly (integer snap).
-        assert_eq!(commits[0].dst, (-2.0, -2.0));
+        // Pivot stays fixed: 3×3 rotated 180° about the top-left AREA corner
+        // lands at (-3, -3) exactly (integer snap).
+        assert_eq!(commits[0].dst, (-3.0, -3.0));
     }
 
     #[test]
@@ -2345,7 +2432,7 @@ mod tests {
 
     #[test]
     fn resize_to_pixels_keeps_anchor_fixed() {
-        // Angle 0: 4×4 at (0,0), pivot centre (1.5,1.5), anchor (0,0).
+        // Angle 0: 4×4 at (0,0), AREA centre pivot (2,2), anchor (0,0).
         let (buf, w, h) = fixture_4x4();
         let mut obj = TransformObject::lift(layer(buf, w, h, 0), (0.0, 0.0));
         let anchor = (0.0f32, 0.0f32);

@@ -23,6 +23,8 @@ pub mod projection;
 pub mod select;
 pub mod selection_ops;
 pub mod stroke_command;
+pub mod tile_edit;
+pub mod tilemap;
 pub mod transform;
 pub mod undo;
 

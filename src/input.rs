@@ -21,6 +21,12 @@ pub enum Action {
     SelectPen,
     SelectEraser,
     ToggleColorPicker,
+    /// Swap primary/secondary colors (default key: `x`).
+    ///
+    /// **Conflict resolution (UX item 2):** `x` is also the Tile-placer's
+    /// horizontal-flip placement modifier. The App resolves the clash by tool
+    /// context: while the Tile tool is active the placer reads X directly and
+    /// this shortcut is suppressed; outside the Tile tool X still swaps colors.
     SwapColors,
     SelectDelete,
     InvertSelection,
@@ -30,10 +36,12 @@ pub enum Action {
     SelectRectangle,
     SelectWand,
     SelectLasso,
+    SelectFill,
+    SelectTileTool,
 }
 
 impl Action {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 27] = [
         Self::Undo,
         Self::Redo,
         Self::Copy,
@@ -59,6 +67,8 @@ impl Action {
         Self::SelectRectangle,
         Self::SelectWand,
         Self::SelectLasso,
+        Self::SelectFill,
+        Self::SelectTileTool,
     ];
 }
 
@@ -85,6 +95,7 @@ pub enum LogicalKey {
     S,
     W,
     L,
+    B,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
@@ -216,6 +227,7 @@ impl Keymap {
             LogicalKey::S => egui::Key::S,
             LogicalKey::W => egui::Key::W,
             LogicalKey::L => egui::Key::L,
+            LogicalKey::B => egui::Key::B,
         };
         hit(key)
     }
@@ -425,6 +437,14 @@ pub enum Tool {
     /// Marquee selection: drag a rectangle, then move / copy / cut / paste /
     /// delete / flip it.
     Fieldier,
+    /// Tile placer: stamp the selected tile-palette entry onto the active layer,
+    /// snapping the click to the tile grid. Plain click records a shared
+    /// reference to the source tile; Shift+click bakes an independent copy.
+    /// Placement-time **X**/**Z** add a horizontal / vertical flip and **R**/**Q**
+    /// rotate 90° CW / CCW on top of the tile's stored orientation (UX item 2).
+    /// While this tool is active, X is a placement modifier and the Swap-Colors
+    /// shortcut is suppressed (X still swaps colors outside the Tile tool).
+    Tile,
     /// Hidden draw-tool mode (the Pen's [`DrawMode`](crate::core::brush::DrawMode)).
     /// Present in the code but never listed in the toolbox `TOOLS` and never
     /// selectable from the UI; treated as the Pen's mode wherever a match needs
@@ -465,6 +485,31 @@ impl Default for WandSettings {
     }
 }
 
+/// The Fill (bucket) tool's flood-fill parameters.
+///
+/// Mirrors [`WandSettings`]: contiguity, per-channel RGBA tolerance and whether
+/// the flood stays inside the current region/tile cell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FillSettings {
+    /// Maximum per-channel colour distance still treated as a match.
+    pub tolerance: u8,
+    /// Whether the flood spreads only to touching pixels (`true`) or to every
+    /// matching pixel on the layer (`false`).
+    pub contiguous: bool,
+    /// Whether the flood stays inside the current region (tile cell).
+    pub restrict_to_region: bool,
+}
+
+impl Default for FillSettings {
+    fn default() -> Self {
+        Self {
+            tolerance: 0,
+            contiguous: true,
+            restrict_to_region: false,
+        }
+    }
+}
+
 /// Current tool plus the tool to restore after a temporary eyedropper session.
 ///
 /// `previous` is `Some` only while the temporary eyedropper is active; a
@@ -475,6 +520,7 @@ pub struct ToolState {
     previous: Option<Tool>,
     child: FieldierChild,
     wand: WandSettings,
+    fill: FillSettings,
 }
 
 impl ToolState {
@@ -485,6 +531,7 @@ impl ToolState {
             previous: None,
             child: FieldierChild::default(),
             wand: WandSettings::default(),
+            fill: FillSettings::default(),
         }
     }
 
@@ -520,6 +567,16 @@ impl ToolState {
     /// Mutable access to the Fieldier wand settings.
     pub fn wand_mut(&mut self) -> &mut WandSettings {
         &mut self.wand
+    }
+
+    /// The Fill (bucket) tool's settings.
+    pub fn fill(&self) -> FillSettings {
+        self.fill
+    }
+
+    /// Mutable access to the Fill (bucket) tool's settings.
+    pub fn fill_mut(&mut self) -> &mut FillSettings {
+        &mut self.fill
     }
 
     /// Enter the temporary eyedropper: remember the current tool as `previous`
@@ -656,5 +713,25 @@ mod tests {
         assert_eq!(state.wand(), settings);
         state.wand_mut().tolerance = 7;
         assert_eq!(state.wand().tolerance, 7);
+    }
+
+    #[test]
+    fn fill_settings_defaults_and_accessors() {
+        let settings = FillSettings::default();
+        assert_eq!(settings.tolerance, 0, "tolerance defaults to zero");
+        assert!(settings.contiguous, "contiguous defaults on");
+        assert!(
+            !settings.restrict_to_region,
+            "restrict-to-region defaults off"
+        );
+
+        let mut state = ToolState::new();
+        assert_eq!(state.fill(), settings);
+        state.fill_mut().tolerance = 9;
+        state.fill_mut().contiguous = false;
+        state.fill_mut().restrict_to_region = true;
+        assert_eq!(state.fill().tolerance, 9);
+        assert!(!state.fill().contiguous);
+        assert!(state.fill().restrict_to_region);
     }
 }

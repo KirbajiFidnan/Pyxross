@@ -25,6 +25,7 @@ use crate::core::model::sequence::AnimationSequence;
 use crate::core::model::{Layer, LayerId, LayerStack};
 use crate::core::palette::Palette;
 use crate::core::select::{SelectMode, Selection};
+use crate::core::tilemap::TilePalette;
 use crate::core::transform::{CurveTransform, TransformAlgorithm, TransformObject};
 use crate::core::undo::UndoStack;
 use crate::input::{Tool, ToolState};
@@ -95,7 +96,7 @@ impl Ownership {
         Self { category: "active layer/frame", owner: OwnerClass::ProjectLocal, fields: "layers, animation", close_policy: "discard with session" },
         Self { category: "camera", owner: OwnerClass::ProjectLocal, fields: "camera", close_policy: "discard with session" },
         Self { category: "animation/playback", owner: OwnerClass::ProjectLocal, fields: "sequence, animation", close_policy: "discard with session" },
-        Self { category: "palette/colors", owner: OwnerClass::ProjectLocal, fields: "palettes, active_palette, color, secondary_color", close_policy: "discard with session" },
+        Self { category: "palette/colors", owner: OwnerClass::ProjectLocal, fields: "palettes, active_palette, color, secondary_color, tile_palette", close_policy: "discard with session" },
         Self { category: "tool/brush/grid", owner: OwnerClass::ProjectLocal, fields: "tool_state, pen_draw_settings, eraser_draw_settings, grid_visible", close_policy: "discard with session" },
         Self { category: "canvas texture", owner: OwnerClass::ProjectLocal, fields: "canvas_generation", close_policy: "discard with session" },
         Self { category: "dialogs", owner: OwnerClass::ProjectLocal, fields: "tile_size, new_draft_w, new_draft_h, dialog_open, pending_action, last_error", close_policy: "discard with session" },
@@ -154,6 +155,9 @@ pub struct ProjectSession {
     pub active_palette: usize,
     pub color: Color,
     pub secondary_color: Color,
+    /// Tile palette: the project's tile pixel data plus selection. A concept
+    /// separate from animation frames; persisted via `Document.tile_palette`.
+    pub tile_palette: TilePalette,
     pub tool_state: ToolState,
     pub pen_draw_settings: DrawSettings,
     pub eraser_draw_settings: DrawSettings,
@@ -516,6 +520,8 @@ impl ProjectSession {
                 blend: layer.blend,
                 parent: layer.parent.map(LayerId::as_u64),
                 is_group: layer.is_group,
+                tilemap: layer.tilemap.clone(),
+                locked: layer.locked,
                 pixels: if layer.is_group {
                     Vec::new()
                 } else {
@@ -565,6 +571,7 @@ impl ProjectSession {
                 .palettes
                 .get(self.active_palette)
                 .map_or_else(Vec::new, |palette| palette.colors.clone()),
+            tile_palette: self.tile_palette.clone(),
             editor: crate::core::document::EditorSettings::default(),
         }
     }
@@ -589,6 +596,9 @@ impl ProjectSession {
                 buffer,
                 parent: None,
                 is_group: layer_doc.is_group,
+                tilemap: layer_doc.tilemap.clone(),
+                locked: layer_doc.locked,
+                tilemap_cache: std::cell::RefCell::new(None),
             };
             if layer_doc.id == default_id.as_u64() {
                 if let Some(default_layer) = layers.layer_mut(default_id) {
@@ -677,6 +687,12 @@ impl ProjectSession {
                 self.color = color;
             }
         }
+        self.tile_palette = doc.tile_palette.clone();
+        // Integrated tile model: the buffer is the edit surface, so every
+        // tiled cell must be BAKED into its footprint on load (old documents
+        // stored only the tilemap; the buffer may be stale). The root palette
+        // is the single source of truth.
+        crate::core::tile_edit::bake_all_tiles(&mut self.layers, &self.tile_palette);
         self.canvas_generation = self.canvas_generation.wrapping_add(1);
     }
 
@@ -710,6 +726,7 @@ impl ProjectSession {
             active_palette: 0,
             color: Color::BLACK,
             secondary_color: Color::WHITE,
+            tile_palette: TilePalette::new(),
             tool_state: ToolState::new(),
             pen_draw_settings: DrawSettings::default(),
             eraser_draw_settings: DrawSettings::default(),
@@ -750,9 +767,12 @@ impl ProjectSession {
     pub fn draw_settings(&self, tool: Tool) -> &DrawSettings {
         match tool {
             Tool::Eraser => &self.eraser_draw_settings,
-            Tool::Pencil | Tool::Draw | Tool::Fill | Tool::Eyedropper | Tool::Fieldier => {
-                &self.pen_draw_settings
-            }
+            Tool::Pencil
+            | Tool::Draw
+            | Tool::Fill
+            | Tool::Eyedropper
+            | Tool::Fieldier
+            | Tool::Tile => &self.pen_draw_settings,
         }
     }
 
@@ -760,9 +780,12 @@ impl ProjectSession {
     pub fn draw_settings_mut(&mut self, tool: Tool) -> &mut DrawSettings {
         match tool {
             Tool::Eraser => &mut self.eraser_draw_settings,
-            Tool::Pencil | Tool::Draw | Tool::Fill | Tool::Eyedropper | Tool::Fieldier => {
-                &mut self.pen_draw_settings
-            }
+            Tool::Pencil
+            | Tool::Draw
+            | Tool::Fill
+            | Tool::Eyedropper
+            | Tool::Fieldier
+            | Tool::Tile => &mut self.pen_draw_settings,
         }
     }
 }

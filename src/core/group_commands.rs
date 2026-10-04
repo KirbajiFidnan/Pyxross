@@ -361,7 +361,10 @@ mod tests {
         let _b = layers.add_layer("B");
         let c = layers.add_layer("C");
         let before = layers.structure();
-        let before_bytes = layers.composite_layers().as_bytes().to_vec();
+        let before_bytes = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
@@ -370,7 +373,12 @@ mod tests {
 
         assert!(ctl.undo(&mut layers));
         assert_eq!(layers.structure(), before);
-        assert_eq!(layers.composite_layers().as_bytes(), before_bytes);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            before_bytes
+        );
         assert_eq!(layers.layer(g), None);
         assert_eq!(layers.parent_of(a), None);
         assert_eq!(layers.parent_of(c), None);
@@ -384,7 +392,10 @@ mod tests {
         let b = layers.add_layer("B");
         let g = layers.create_group_around(&[a, b], "G").unwrap();
         let before = layers.structure();
-        let before_bytes = layers.composite_layers().as_bytes().to_vec();
+        let before_bytes = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
@@ -393,7 +404,12 @@ mod tests {
 
         assert!(ctl.undo(&mut layers));
         assert_eq!(layers.structure(), before);
-        assert_eq!(layers.composite_layers().as_bytes(), before_bytes);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            before_bytes
+        );
         assert!(layers.is_group(g));
         assert_eq!(layers.parent_of(a), Some(g));
         assert_eq!(layers.parent_of(b), Some(g));
@@ -407,7 +423,10 @@ mod tests {
         let b = layers.add_layer("B");
         let g = layers.create_group_around(&[a], "G").unwrap();
         let original = layers.structure();
-        let original_bytes = layers.composite_layers().as_bytes().to_vec();
+        let original_bytes = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
@@ -422,7 +441,12 @@ mod tests {
         assert_eq!(layers.parent_of(b), Some(g));
         assert!(ctl.undo(&mut layers));
         assert_eq!(layers.structure(), original);
-        assert_eq!(layers.composite_layers().as_bytes(), original_bytes);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            original_bytes
+        );
     }
 
     #[test]
@@ -451,7 +475,10 @@ mod tests {
         let b = layers.add_layer("B");
         let g = layers.create_group_around(&[a, b], "G").unwrap();
         let before = layers.structure();
-        let before_bytes = layers.composite_layers().as_bytes().to_vec();
+        let before_bytes = layers
+            .composite_layers(&crate::core::tilemap::TilePalette::new())
+            .as_bytes()
+            .to_vec();
 
         let mut stack = UndoStack::new();
         let mut ctl = LayerStackController::new(&mut stack);
@@ -462,7 +489,12 @@ mod tests {
 
         assert!(ctl.undo(&mut layers));
         assert_eq!(layers.structure(), before);
-        assert_eq!(layers.composite_layers().as_bytes(), before_bytes);
+        assert_eq!(
+            layers
+                .composite_layers(&crate::core::tilemap::TilePalette::new())
+                .as_bytes(),
+            before_bytes
+        );
         assert!(layers.is_group(g));
         assert_eq!(layers.parent_of(a), Some(g));
         assert_eq!(layers.parent_of(b), Some(g));

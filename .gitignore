@@ -9,6 +9,9 @@
 /.tools
 .codegraph
 
+# Assistant workflow notes (contains AI/assistant references)
+/CONTEXT.md
+
 # Local editor/OS noise
 *.swp
 .DS_Store

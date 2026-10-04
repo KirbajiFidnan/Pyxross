@@ -210,6 +210,31 @@ impl DockManager {
         .collect()
     }
 
+    /// The BODY rects of every docked panel for `viewport`: each panel's full
+    /// rect minus its top header band. Computed with the same geometry as
+    /// [`Self::panel_rects`]; empty when nothing is docked.
+    pub fn docked_panel_body_rects(&self, viewport: Rect) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for side in [DockSide::Left, DockSide::Right, DockSide::Bottom] {
+            let dock = self.dock_rect(side, viewport);
+            for (_id, panel_rect) in self.panel_rects(side, dock) {
+                // The header band is the top `HEADER_HEIGHT` strip; the body is
+                // everything below it (mirrors `panel_nest_body_rect`).
+                let body = Rect::from_min_max(
+                    pos2(
+                        panel_rect.left(),
+                        panel_rect.top() + super::view::HEADER_HEIGHT,
+                    ),
+                    panel_rect.max,
+                );
+                if body.width() > 0.0 && body.height() > 0.0 {
+                    rects.push(body);
+                }
+            }
+        }
+        rects
+    }
+
     fn resolved_panel_extents(&self, side: DockSide, available: f32) -> Vec<(PanelId, f32)> {
         let area = self.area(side);
         let desired: Vec<(PanelId, f32, f32)> = area
