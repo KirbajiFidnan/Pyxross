@@ -26,6 +26,6 @@
     "select_wand": {"key":"w"},
     "select_lasso": {"key":"l"},
     "select_fill": {"key":"f"},
-    "select_tile_tool": {"key":"b"}
+    "select_tile_tool": {"key":"t"}
   }
 }

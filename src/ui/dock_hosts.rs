@@ -55,6 +55,8 @@ pub struct TilePlacerView {
     pub flip_x: bool,
     /// Vertical flip.
     pub flip_y: bool,
+    /// Tile eraser: when true the stamped tile erases instead of placing.
+    pub tile_eraser: bool,
 }
 
 /// Snapshot of the toolbox state for one frame.

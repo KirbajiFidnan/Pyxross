@@ -96,6 +96,7 @@ pub enum LogicalKey {
     W,
     L,
     B,
+    T,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
@@ -228,6 +229,7 @@ impl Keymap {
             LogicalKey::W => egui::Key::W,
             LogicalKey::L => egui::Key::L,
             LogicalKey::B => egui::Key::B,
+            LogicalKey::T => egui::Key::T,
         };
         hit(key)
     }

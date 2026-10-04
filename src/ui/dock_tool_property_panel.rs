@@ -338,6 +338,12 @@ impl ToolPropertyComponent {
                 .borrow_mut()
                 .push(ToolbarEvent::TileFlipYChanged(flip_y));
         }
+        let mut tile_eraser = view.tile_placer.tile_eraser;
+        if ui.checkbox(&mut tile_eraser, "tile eraser").changed() {
+            events
+                .borrow_mut()
+                .push(ToolbarEvent::TileEraserChanged(tile_eraser));
+        }
     }
 
     /// The live transform's properties: the free-angle rotation algorithm

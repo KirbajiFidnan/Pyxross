@@ -145,7 +145,7 @@ fn binding_label(binding: Option<KeyBinding>) -> String {
     parts.join("+")
 }
 
-fn logical_keys() -> [crate::input::LogicalKey; 21] {
+fn logical_keys() -> [crate::input::LogicalKey; 22] {
     [
         crate::input::LogicalKey::Z,
         crate::input::LogicalKey::Y,
@@ -168,6 +168,7 @@ fn logical_keys() -> [crate::input::LogicalKey; 21] {
         crate::input::LogicalKey::W,
         crate::input::LogicalKey::L,
         crate::input::LogicalKey::B,
+        crate::input::LogicalKey::T,
     ]
 }
 
@@ -194,6 +195,7 @@ fn key_label(key: crate::input::LogicalKey) -> &'static str {
         crate::input::LogicalKey::W => "W",
         crate::input::LogicalKey::L => "L",
         crate::input::LogicalKey::B => "B",
+        crate::input::LogicalKey::T => "T",
     }
 }
 

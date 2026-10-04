@@ -286,6 +286,25 @@ struct App {
     /// canvas update path and emitted as [`CanvasOverlay::TilePlacer`] while
     /// the Tile tool is active.
     tile_placer_preview: TilePlacerPreview,
+    /// Previous frame's Alt state, for RISING-EDGE detection of the Tile
+    /// eraser toggle: Alt is not an egui key, so it must be sampled from
+    /// `modifiers.alt` and compared frame-to-frame. Holding Alt must not
+    /// retoggle.
+    prev_alt: bool,
+    /// GHOST tile captured by a right-click eyedropper on an EMPTY cell: the
+    /// composited footprint `(w, h, rgba8)` visibly on screen at that cell.
+    /// While `Some`, a placement blits these pixels into the active layer as an
+    /// undoable PIXEL edit and writes NO tilemap cell, and the hover preview
+    /// shows the ghost image. Cleared when a real palette tile is selected.
+    ghost_tile: Option<(u32, u32, Vec<u8>)>,
+    /// Shift+left-drag rectangle gesture: the latched press cell anchor and the
+    /// live current cell. While set, the primary gesture tracks a rectangle
+    /// instead of freehand-stamping; the rectangle is applied as ONE gesture on
+    /// release. `tile_rect_deleting` records whether the rectangle ERASES
+    /// (taken from the eraser at press time).
+    tile_rect_anchor: Option<(u32, u32)>,
+    tile_rect_current: Option<(u32, u32)>,
+    tile_rect_deleting: bool,
     /// Theme browser panel (F4): switch/refresh themes and preview colors.
     settings: SettingsPanel,
     keybindings: KeybindingsPanel,
@@ -439,6 +458,11 @@ impl Default for App {
             tile_placer: TilePlacerGesture::default(),
             tile_placer_transform: TilePlacerTransform::default(),
             tile_placer_preview: TilePlacerPreview::default(),
+            prev_alt: false,
+            ghost_tile: None,
+            tile_rect_anchor: None,
+            tile_rect_current: None,
+            tile_rect_deleting: false,
             settings: SettingsPanel::default(),
             keybindings: KeybindingsPanel::new(&keymap),
             panel_layout: PanelLayout::new(),
@@ -539,49 +563,116 @@ fn alt_pressed(ctx: &egui::Context) -> bool {
     })
 }
 
+/// Orient raw RGBA8 `w×h` pixels under the sticky placement transform:
+/// **flips first (horizontal then vertical mirror), then clockwise 90° steps** —
+/// the exact convention of the core `orient_tile_pixels` and of a stamped
+/// [`TileCell`].
+///
+/// Returns the ORIENTED dims and the FULL oriented pixel bytes (transparent
+/// pixels included), so it is the SINGLE orientation routine for both the
+/// preview (which drops `alpha == 0`) and the ghost blit (which overwrites the
+/// whole oriented footprint, transparency included). Dims swap on odd
+/// rotations.
+fn orient_pixels(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    flip_x: bool,
+    flip_y: bool,
+    rotation: u8,
+) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (w as usize, h as usize);
+    let mut current = vec![0u8; w * h * 4];
+    // Phase 1: flips. Build a `w×h` buffer where output (x, y) reads the flipped
+    // source, preserving dims.
+    for y in 0..h {
+        for x in 0..w {
+            let sx = if flip_x { w - 1 - x } else { x };
+            let sy = if flip_y { h - 1 - y } else { y };
+            let src = (sy * w + sx) * 4;
+            let dst = (y * w + x) * 4;
+            if src + 4 <= pixels.len() {
+                current[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+            }
+        }
+    }
+    // Phase 2: `rotation % 4` clockwise 90° steps.
+    let mut cur_w = w;
+    let mut cur_h = h;
+    for _ in 0..(rotation % 4) {
+        let new_w = cur_h;
+        let new_h = cur_w;
+        let mut next = vec![0u8; current.len()];
+        for y in 0..cur_h {
+            for x in 0..cur_w {
+                let src = (y * cur_w + x) * 4;
+                // 90° clockwise: (x, y) -> (new_w - 1 - y, x).
+                let nx = new_w - 1 - y;
+                let ny = x;
+                let dst = (ny * new_w + nx) * 4;
+                next[dst..dst + 4].copy_from_slice(&current[src..src + 4]);
+            }
+        }
+        current = next;
+        cur_w = new_w;
+        cur_h = new_h;
+    }
+    (cur_w as u32, cur_h as u32, current)
+}
+
 /// The oriented OPAQUE pixels of `tile` under the placement transform (Fix 1):
 /// `(offset_x, offset_y, colour)` relative to the cell origin, with the tile's
 /// ACTUAL straight-alpha RGBA colour per pixel.
 ///
-/// Mirrors the core `orient_tile_pixels` order EXACTLY: flips first (horizontal
-/// then vertical mirror), then `rotation` 90° CLOCKWISE steps. The preview must
-/// match what a stamp bakes, so the two stay in lockstep by construction.
-/// Fully-transparent pixels are omitted (the preview preserves transparency).
+/// Delegates to [`orient_pixels`] so the preview and the ghost blit can never
+/// disagree with the core `orient_tile_pixels` convention (flips first, then
+/// clockwise rotation). Fully-transparent pixels are omitted (the preview
+/// preserves transparency).
 fn oriented_preview_pixels(
     tile: &crate::core::tilemap::Tile,
     flip_x: bool,
     flip_y: bool,
     rotation: u8,
 ) -> Vec<(i32, i32, Color)> {
-    let w = tile.w as usize;
-    let h = tile.h as usize;
+    let (ow, _oh, bytes) = orient_pixels(&tile.pixels, u32::from(tile.w), u32::from(tile.h), flip_x, flip_y, rotation);
+    let ow = ow as usize;
     let mut out = Vec::new();
-    for ry in 0..h {
-        for rx in 0..w {
-            let i = (ry * w + rx) * 4;
-            let alpha = tile.pixels[i + 3];
-            if alpha == 0 {
-                continue;
-            }
-            let color = Color::rgba(
-                tile.pixels[i],
-                tile.pixels[i + 1],
-                tile.pixels[i + 2],
-                alpha,
-            );
-            // Phase 1 (flips): root (rx, ry) -> flipped (fx, fy).
-            let fx = if flip_x { w - 1 - rx } else { rx };
-            let fy = if flip_y { h - 1 - ry } else { ry };
-            // Phase 2 (rotation): flipped (fx, fy) -> output, closed-form for
-            // each 90° CW step count (dims swap on odd rotations).
-            let (ox, oy) = match rotation % 4 {
-                0 => (fx as i32, fy as i32),
-                1 => (h as i32 - 1 - fy as i32, fx as i32),
-                2 => (w as i32 - 1 - fx as i32, h as i32 - 1 - fy as i32),
-                _ => (fy as i32, w as i32 - 1 - fx as i32),
-            };
-            out.push((ox, oy, color));
+    for (i, px) in bytes.chunks_exact(4).enumerate() {
+        let alpha = px[3];
+        if alpha == 0 {
+            continue;
         }
+        out.push((
+            (i % ow) as i32,
+            (i / ow) as i32,
+            Color::rgba(px[0], px[1], px[2], alpha),
+        ));
+    }
+    out
+}
+
+/// The oriented OPAQUE ghost pixels under the sticky transform, in `(offset_x,
+/// offset_y, colour)` form relative to the cell origin — the ghost counterpart
+/// of [`oriented_preview_pixels`]. Uses the SAME [`orient_pixels`] routine.
+fn oriented_ghost_pixels(
+    ghost: &(u32, u32, Vec<u8>),
+    flip_x: bool,
+    flip_y: bool,
+    rotation: u8,
+) -> Vec<(i32, i32, Color)> {
+    let (ow, _oh, bytes) = orient_pixels(&ghost.2, ghost.0, ghost.1, flip_x, flip_y, rotation);
+    let ow = ow as usize;
+    let mut out = Vec::new();
+    for (i, px) in bytes.chunks_exact(4).enumerate() {
+        let alpha = px[3];
+        if alpha == 0 {
+            continue;
+        }
+        out.push((
+            (i % ow) as i32,
+            (i / ow) as i32,
+            Color::rgba(px[0], px[1], px[2], alpha),
+        ));
     }
     out
 }
@@ -594,12 +685,40 @@ fn oriented_preview_pixels(
 /// same cell only updates its `after`.
 #[derive(Default)]
 struct TilePlacerGesture {
-    /// `cell -> (before, after)` in the active layer's tilemap.
+    /// `cell -> (before, after)` in the active layer's tilemap. A cell is
+    /// recorded ONCE: the FIRST touch keeps the true original `before`, and
+    /// every later touch only updates `after`.
     diffs: BTreeMap<(u32, u32), (Option<TileCell>, Option<TileCell>)>,
     /// Per-stamped-cell buffer footprint `(rect, before)` — the buffer bytes
-    /// BEFORE the cell was baked. Clear (un-tile) records nothing: the last
-    /// baked content becomes ordinary visible pixels.
+    /// BEFORE the cell was baked. Pushed ONCE per touched cell (deduped by
+    /// [`Self::touched`]); a ghost placement pushes one even though it records
+    /// no cell diff.
     buffer_deltas: Vec<(Rect2i, Vec<u8>)>,
+    /// Cells already touched by this gesture (stamp, delete OR ghost blit), so
+    /// a repeated touch — the held-button frames re-emit `stroke_point` on the
+    /// SAME cell — neither overwrites the recorded `before` nor appends a
+    /// duplicate buffer footprint.
+    touched: BTreeSet<(u32, u32)>,
+}
+
+impl TilePlacerGesture {
+    /// Whether the gesture has recorded ANY effect (a cell write or a pixel
+    /// blit). Used to tell an in-flight gesture from an idle one: a ghost
+    /// placement has no cell diffs but is still a live gesture.
+    fn is_active(&self) -> bool {
+        !self.diffs.is_empty() || !self.buffer_deltas.is_empty()
+    }
+}
+
+/// What a single placer action does to a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TileEffect {
+    /// Bake the selected palette tile into the cell + buffer.
+    Stamp,
+    /// Clear the cell and wipe its baked pixels (the Tile eraser).
+    Delete,
+    /// Write the captured GHOST pixels as a pure pixel edit (no cell).
+    GhostBlit,
 }
 
 /// Sticky Tile-placer transform (ui-only state): the CURRENT rotation/flip
@@ -628,6 +747,12 @@ struct TilePlacerTransform {
     /// transform since the last reset. While false, stamped cells keep their own
     /// existing transform.
     active: bool,
+    /// Tile eraser: when true a placement action DELETES the cell (and its
+    /// baked pixels) instead of stamping. This is the SINGLE source of truth —
+    /// the Alt toggle, the Tool-Property checkbox and the eraser behavior all
+    /// read/write THIS field, and the panel reads it through the
+    /// [`TilePlacerView`] snapshot.
+    eraser: bool,
 }
 
 impl TilePlacerTransform {
@@ -663,6 +788,14 @@ impl TilePlacerTransform {
     fn set_flip_y(&mut self, flip: bool) {
         self.flip_y = flip;
         self.active = true;
+    }
+
+    /// Set the Tile eraser from the Tool Property panel's checkbox (or the Alt
+    /// toggle). The eraser is the SINGLE source of truth: this does NOT touch
+    /// the transform's `active` flag, so toggling the eraser never changes which
+    /// orientation the next stamp applies.
+    fn set_eraser(&mut self, eraser: bool) {
+        self.eraser = eraser;
     }
 }
 
@@ -1246,6 +1379,26 @@ impl App {
             for host in self.native_hosts.values() {
                 host.request_redraw();
             }
+            // SHOULD-FIX 5: a ghost captured in one project must never preview
+            // or place in another. Activation (new/open/close/switch) drops it.
+            self.ghost_tile = None;
+            self.tile_rect_anchor = None;
+            self.tile_rect_current = None;
+        }
+    }
+
+    /// Drop the ghost tile unless it still fits the current canvas (dimensions
+    /// within bounds). Called after a canvas resize so a stale ghost from a
+    /// larger canvas cannot preview or place.
+    fn clear_ghost_if_unfit(&mut self) {
+        if let Some((gw, gh, _)) = &self.ghost_tile {
+            let (cw, ch) = (
+                self.projects.current().layers.width() as u32,
+                self.projects.current().layers.height() as u32,
+            );
+            if *gw > cw || *gh > ch {
+                self.ghost_tile = None;
+            }
         }
     }
 
@@ -1821,6 +1974,12 @@ impl App {
                     // Tile tool stays active.
                     if tool != Tool::Tile {
                         self.tile_placer_transform = TilePlacerTransform::default();
+                        // Leaving the Tile tool also drops any in-flight Shift
+                        // rectangle latch and the ghost eyedropper, so a later
+                        // re-entry starts clean.
+                        self.tile_rect_anchor = None;
+                        self.tile_rect_current = None;
+                        self.ghost_tile = None;
                     }
                 }
                 ToolbarEvent::ColorChanged(color) => self.projects.current_mut().color = color,
@@ -1907,6 +2066,9 @@ impl App {
                 ToolbarEvent::TileFlipYChanged(flip) => {
                     self.tile_placer_transform.set_flip_y(flip);
                 }
+                ToolbarEvent::TileEraserChanged(eraser) => {
+                    self.tile_placer_transform.set_eraser(eraser);
+                }
                 ToolbarEvent::PaletteSelected(index) => {
                     if let Some(palette) = self.projects.current_mut().palettes.get(index) {
                         let next_color = palette.color(0);
@@ -1960,6 +2122,7 @@ impl App {
             rotation: self.tile_placer_transform.rotation_degrees(),
             flip_x: self.tile_placer_transform.flip_x,
             flip_y: self.tile_placer_transform.flip_y,
+            tile_eraser: self.tile_placer_transform.eraser,
         };
         *self.toolbox_host.view.borrow_mut() = ToolboxView {
             tool,
@@ -2193,6 +2356,9 @@ impl App {
                     let session = self.projects.current_mut();
                     if session.tile_palette.select(id) {
                         session.tool_state.select_tool(Tool::Tile);
+                        // Selecting a REAL palette tile drops the ghost tile:
+                        // a ghost is only ever placed while no tile is selected.
+                        self.ghost_tile = None;
                     }
                 }
                 TilePalettePanelEvent::AddEmpty => self.add_empty_tile(),
@@ -2222,6 +2388,7 @@ impl App {
             pixels,
         });
         session.tile_palette.select(id);
+        self.ghost_tile = None;
         self.mark_dirty();
     }
 
@@ -2655,47 +2822,20 @@ impl App {
         // Item 2 (multi-cell preview): the in-flight gesture's stamped cells.
         // Clone the cell list first — `session` borrows `self` immutably and the
         // gesture state is read alongside it.
-        let gesture_cells: Vec<(u32, u32)> = self.tile_placer.diffs.keys().copied().collect();
+        let gesture_cells: Vec<(u32, u32)> = self
+            .tile_placer
+            .diffs
+            .iter()
+            .filter_map(|(&cell, (_, after))| after.is_some().then_some(cell))
+            .collect();
         preview.gesture_cells = gesture_cells.clone();
-        // Items 1 + 4: only with a selected tile and the pointer over the
-        // canvas (in-bounds grid cell).
-        let Some(tile) = session.tile_palette.selected_tile() else {
-            return preview;
-        };
         let cols = session.layers.width() as u32;
         let rows = session.layers.height() as u32;
         let (max_cx, max_cy) = (cols.div_ceil(tile_size), rows.div_ceil(tile_size));
-        let push_preview = |preview: &mut TilePlacerPreview, cell: (u32, u32), placed: TileCell| {
-            let (cx, cy) = cell;
-            if cx >= max_cx || cy >= max_cy {
-                return;
-            }
-            let pixels = oriented_preview_pixels(tile, placed.flip_x, placed.flip_y, placed.rotation);
-            let (ox0, oy0) = ((cx * tile_size) as i32, (cy * tile_size) as i32);
-            preview.preview_pixels.extend(
-                pixels
-                    .into_iter()
-                    .map(|(dx, dy, color)| (ox0 + dx, oy0 + dy, color)),
-            );
-        };
-        // Every cell the gesture already stamped previews the tile AS WRITTEN —
-        // its own `after` cell carries the transform that was actually baked, so
-        // re-deriving it here can never disagree with the stamp. A cleared cell
-        // (`after == None`) previews nothing: there is no tile content to show.
-        for &(cx, cy) in &gesture_cells {
-            if let Some(placed) = self.tile_placer.diffs.get(&(cx, cy)).and_then(|(_, after)| *after)
-            {
-                push_preview(&mut preview, (cx, cy), placed);
-            }
-        }
-        // The hover cell is always previewed, even when the gesture has not
-        // reached it, and LAST so it takes precedence at a shared cell.
-        //
-        // The hover cell is the one PURE-HOVER part of the preview, so it obeys
-        // the panel mask: a palette / toolbox / timeline panel covers the
-        // pointer, and the placer must not highlight a cell underneath it. The
-        // in-flight gesture cells above are deliberately NOT masked — they
-        // preview what the running stamp already wrote.
+        // The hover cell obeys the panel mask: a palette / toolbox / timeline
+        // panel covers the pointer, and the placer must not highlight a cell
+        // underneath it. Computed before the early returns so a GHOST or a
+        // no-selection state still tracks the pointer for its own preview.
         let hover_cell = if self.pointer_over_panel() {
             None
         } else {
@@ -2707,20 +2847,196 @@ impl App {
                 .map(|(px, py)| TileMap::snap_cell((px, py), tile_size))
                 .filter(|&(cx, cy)| cx < max_cx && cy < max_cy)
         };
+        // Items 2+3: ONE decision point shared with the gesture. The effect
+        // precedence is: eraser -> Delete, else ghost -> GhostBlit, else Stamp.
+        // The preview must show exactly what the action will do:
+        //   - Delete      -> no tile/ghost image, only the cell outline;
+        //   - GhostBlit   -> the ghost image;
+        //   - Stamp       -> the selected tile image.
+        let effect = self.tile_effect();
+        // GHOST preview: while a ghost is active AND the action does not delete,
+        // the hover shows the ghost image (not a palette tile), clipped at the
+        // canvas edge. A Delete effect suppresses the image entirely.
+        let ghost_active = effect == TileEffect::GhostBlit;
+        let deleting = effect == TileEffect::Delete;
+        // Fix 1: the ghost image follows the SAME sticky transform as a tile.
+        // `push_ghost` draws the ORIENTED ghost pixels at a cell's origin (clipped
+        // to the canvas), so the hover, the shift-rect and the placement all agree.
+        let push_ghost = |preview: &mut TilePlacerPreview, cell: (u32, u32)| {
+            let Some((gw, gh, ghost)) = self.ghost_tile.as_ref() else {
+                return;
+            };
+            let t = &self.tile_placer_transform;
+            let pixels = oriented_ghost_pixels(&(*gw, *gh, ghost.clone()), t.flip_x, t.flip_y, t.rotation);
+            let (ox0, oy0) = ((cell.0 * tile_size) as i32, (cell.1 * tile_size) as i32);
+            for (dx, dy, color) in pixels {
+                let px = ox0 + dx;
+                let py = oy0 + dy;
+                if px < 0 || py < 0 || px >= cols as i32 || py >= rows as i32 {
+                    continue;
+                }
+                preview.preview_pixels.push((px, py, color));
+            }
+        };
+        // A selected tile is only needed for the Stamp image.
+        let selected = session.tile_palette.selected_tile();
+        if !deleting && !ghost_active && selected.is_none() {
+            // No tile and no ghost: nothing to preview (the outline of an
+            // in-flight gesture is still reported through `gesture_cells`).
+            preview.hover_cell = hover_cell;
+            return preview;
+        }
+        let push_preview = |preview: &mut TilePlacerPreview, cell: (u32, u32), placed: TileCell| {
+            let (cx, cy) = cell;
+            if cx >= max_cx || cy >= max_cy {
+                return;
+            }
+            let Some(tile) = selected else {
+                return;
+            };
+            let pixels = oriented_preview_pixels(tile, placed.flip_x, placed.flip_y, placed.rotation);
+            let (ox0, oy0) = ((cx * tile_size) as i32, (cy * tile_size) as i32);
+            preview.preview_pixels.extend(
+                pixels
+                    .into_iter()
+                    .map(|(dx, dy, color)| (ox0 + dx, oy0 + dy, color)),
+            );
+        };
+        // Shift rectangle latch: outline every cell of the live rect; when the
+        // effect is Delete show no image, otherwise preview the tile OR the
+        // (sticky-oriented) ghost image in each. Item 7: bound the PREVIEWED
+        // cells to the visible viewport so a full-canvas rect cannot allocate
+        // unboundedly each frame. The APPLIED rect is unaffected (it is built in
+        // `apply_tile_rect`).
+        if let (Some(anchor), Some(current)) = (self.tile_rect_anchor, self.tile_rect_current) {
+            preview.hover_cell = hover_cell;
+            let (min_cx, max_cx_r) = (anchor.0.min(current.0), anchor.0.max(current.0));
+            let (min_cy, max_cy_r) = (anchor.1.min(current.1), anchor.1.max(current.1));
+            for (cx, cy) in self.visible_cells_in_rect(
+                ctx,
+                min_cx,
+                max_cx_r,
+                min_cy,
+                max_cy_r,
+                camera,
+                canvas_size,
+            ) {
+                preview.gesture_cells.push((cx, cy));
+                if !deleting {
+                    if ghost_active {
+                        push_ghost(&mut preview, (cx, cy));
+                    } else {
+                        let placed = self.tile_placement_cell(None);
+                        push_preview(&mut preview, (cx, cy), placed);
+                    }
+                }
+            }
+            return preview;
+        }
+        // Every cell the gesture already stamped previews the tile AS WRITTEN —
+        // its own `after` cell carries the transform that was actually baked, so
+        // re-deriving it here can never disagree with the stamp. A cleared cell
+        // (`after == None`) previews nothing: there is no tile content to show.
+        // (A ghost writes no cell diffs, so this is a no-op for ghosts.)
+        for &(cx, cy) in &gesture_cells {
+            if let Some(placed) = self.tile_placer.diffs.get(&(cx, cy)).and_then(|(_, after)| *after)
+            {
+                push_preview(&mut preview, (cx, cy), placed);
+            }
+        }
+        // The hover cell is always previewed, even when the gesture has not
+        // reached it, and LAST so it takes precedence at a shared cell.
         if let Some(cell) = hover_cell {
             preview.hover_cell = Some(cell);
-            // The effective transform from the STICKY Q/R/X/Z state (no modifier
-            // pressed -> the cell's OWN current transform, a fresh cell has none),
-            // so the preview shows exactly what a stamp on this cell will write.
-            let existing = session
-                .layers
-                .layer(layer_id)
-                .and_then(|layer| layer.tilemap.as_ref())
-                .and_then(|tm| tm.cell(cell));
-            let placed = self.tile_placement_cell(existing);
-            push_preview(&mut preview, cell, placed);
+            if !deleting {
+                if ghost_active {
+                    push_ghost(&mut preview, cell);
+                } else {
+                    // The effective transform from the STICKY Q/R/X/Z state (no
+                    // modifier pressed -> the cell's OWN current transform, a
+                    // fresh cell has none), so the preview shows exactly what a
+                    // stamp on this cell will write.
+                    let existing = session
+                        .layers
+                        .layer(layer_id)
+                        .and_then(|layer| layer.tilemap.as_ref())
+                        .and_then(|tm| tm.cell(cell));
+                    let placed = self.tile_placement_cell(existing);
+                    push_preview(&mut preview, cell, placed);
+                }
+            }
         }
         preview
+    }
+
+    /// The grid cells of `[min_cx..=max_cx] × [min_cy..=max_cy]` that intersect
+    /// the VISIBLE canvas viewport, so a huge Shift rectangle cannot allocate an
+    /// unbounded preview every frame (item 7). The cells are coupled to the
+    /// canvas bounds as well as the viewport, and the anchor/current are already
+    /// clamped by the caller. A hard cell-count cap is applied as a final safety
+    /// net.
+    fn visible_cells_in_rect(
+        &self,
+        ctx: &egui::Context,
+        min_cx: u32,
+        max_cx: u32,
+        min_cy: u32,
+        max_cy: u32,
+        camera: crate::core::camera::Camera,
+        canvas_size: (u32, u32),
+    ) -> Vec<(u32, u32)> {
+        /// Hard upper bound so a pathological rect can never allocate without
+        /// limit even if the viewport mapping is unavailable.
+        const MAX_PREVIEW_CELLS: usize = 4096;
+        let tile_size = self.projects.current().tile_size.max(1) as u32;
+        let cols = canvas_size.0.div_ceil(tile_size);
+        let rows = canvas_size.1.div_ceil(tile_size);
+        // Resolve the visible canvas-pixel window by intersecting the canvas's
+        // on-screen rect with the current viewport and inverting the mapping.
+        let viewport = ctx.input(|i| i.viewport_rect());
+        let canvas_screen = self.canvas_widget.canvas_rect_to_screen(
+            camera,
+            Rect2i::new(0, 0, canvas_size.0 as i32, canvas_size.1 as i32),
+        );
+        let visible = match canvas_screen.intersect(viewport) {
+            r if r.width() > 0.0 && r.height() > 0.0 => r,
+            _ => canvas_screen,
+        };
+        let (vx0, vy0) = self
+            .canvas_widget
+            .screen_to_canvas(visible.min, camera, canvas_size)
+            .unwrap_or((0, 0));
+        let (vx1, vy1) = self
+            .canvas_widget
+            .screen_to_canvas(visible.max, camera, canvas_size)
+            .unwrap_or((canvas_size.0 as i32, canvas_size.1 as i32));
+        // Pad by one cell so a partially visible edge cell is still previewed.
+        let pad = tile_size as i32;
+        let (vx0, vy0, vx1, vy1) = (vx0 - pad, vy0 - pad, vx1 + pad, vy1 + pad);
+        let cl = |px: i32| i64::from(px).div_euclid(i64::from(tile_size));
+        let c_min_x = cl(vx0).max(0).max(i64::from(min_cx)) as u32;
+        let c_min_y = cl(vy0).max(0).max(i64::from(min_cy)) as u32;
+        let c_max_x = cl(vx1)
+            .min(i64::from(cols.saturating_sub(1)))
+            .min(i64::from(max_cx))
+            .max(0) as u32;
+        let c_max_y = cl(vy1)
+            .min(i64::from(rows.saturating_sub(1)))
+            .min(i64::from(max_cy))
+            .max(0) as u32;
+        let mut out = Vec::new();
+        if c_min_x > c_max_x || c_min_y > c_max_y {
+            return out;
+        }
+        for cy in c_min_y..=c_max_y {
+            for cx in c_min_x..=c_max_x {
+                out.push((cx, cy));
+                if out.len() >= MAX_PREVIEW_CELLS {
+                    return out;
+                }
+            }
+        }
+        out
     }
 
     /// True when the SCREEN point `p` lies over ANY panel surface that masks
@@ -4794,56 +5110,204 @@ impl App {
     // Tile placer (Tool::Tile)
     // -----------------------------------------------------------------------
 
-    /// Drives the Tile-tool gesture: primary stamps the selected palette tile
-    /// at snapped grid cells, secondary clears cells. One gesture (a plain
-    /// click or a full drag) commits exactly ONE [`TilemapEditCommand`].
+    /// Drives the Tile-tool gesture: primary stamps (or, with the eraser on,
+    /// deletes) the selected palette tile at snapped grid cells, Shift+primary
+    /// drags a rectangle of cells, secondary is the eyedropper. One gesture (a
+    /// plain click or a full drag) commits exactly ONE undo entry.
     ///
     /// The active layer gets a tilemap on first placement if it lacks one;
     /// a `locked` layer blocks ALL writes (the gesture is a no-op).
     fn handle_tile_placer_interactions(&mut self, interactions: CanvasInteractions) {
-        // Secondary (right) button: CLEAR cells.
+        // Secondary (right) button: TILE EYEDROPPER. A press samples the cell
+        // under the pointer: a tiled cell selects its tile + adopts its
+        // orientation; an empty cell captures a GHOST of the composited pixels.
+        // It no longer clears cells (the eraser + Shift-rect delete now).
         if interactions.eyedropper_started {
-            self.tile_placer = TilePlacerGesture::default();
-        }
-        if interactions.eyedropper_started || interactions.eyedropper_point.is_some() {
             if let Some(pt) = interactions.eyedropper_point {
-                self.tile_placer_cell(pt, true);
+                self.tile_placer_eyedrop(pt);
             }
         }
-        if interactions.eyedropper_ended {
-            self.tile_placer_commit();
+        // Primary (left) button: STAMP / DELETE / GHOST-BLIT, or a Shift-drag
+        // RECTANGLE latch. The `tile_rect_anchor` latch decides which mode the
+        // whole gesture is in.
+        if interactions.stroke_started {
+            // A fresh gesture: reset the recorder and (re)latch the Shift rect.
+            self.tile_placer = TilePlacerGesture::default();
+            // `shift_pressed` reads the live held modifiers (and a synthetic
+            // press's own modifier), matching the draw-tool line latch.
+            let shift = shift_pressed(&self.ctx);
+            if let Some(pt) = interactions.stroke_point.or(interactions.clicked) {
+                if shift {
+                    let project = self.projects.current();
+                    let tile_size = project.tile_size.max(1) as u32;
+                    let (cx, cy) = TileMap::snap_cell(pt, tile_size);
+                    self.tile_rect_anchor = Some((cx, cy));
+                    self.tile_rect_current = Some((cx, cy));
+                    self.tile_rect_deleting = self.tile_placer_transform.eraser;
+                } else {
+                    self.tile_rect_anchor = None;
+                    self.tile_rect_current = None;
+                }
+            }
         }
-        // Primary (left) button: STAMP cells.
         if let Some(pt) = interactions.clicked {
-            // A plain click (press+release within the click threshold). If a
-            // drag gesture already stamped cells (diffs non-empty), the stroke
-            // stream owns the gesture and its `stroke_ended` commits below.
-            if self.tile_placer.diffs.is_empty() {
-                self.tile_placer_cell(pt, false);
+            // A plain click (press+release within the click threshold). The
+            // stroke stream owns a real drag; only an isolated click is applied
+            // here so it is not double-stamped.
+            if !self.tile_placer.is_active() && self.tile_rect_anchor.is_none() {
+                let mode = self.tile_effect();
+                self.tile_placer_cell(pt, mode);
                 self.tile_placer_commit();
             }
         }
-        if interactions.stroke_started && self.tile_placer.diffs.is_empty() {
-            // A fresh drag gesture.
-            self.tile_placer = TilePlacerGesture::default();
-        }
         if let Some(pt) = interactions.stroke_point {
-            self.tile_placer_cell(pt, false);
+            if self.tile_rect_anchor.is_some() {
+                // Shift rectangle: only track the current cell; apply on release.
+                let project = self.projects.current();
+                let tile_size = project.tile_size.max(1) as u32;
+                self.tile_rect_current = Some(TileMap::snap_cell(pt, tile_size));
+            } else {
+                let mode = self.tile_effect();
+                self.tile_placer_cell(pt, mode);
+            }
         }
         if interactions.stroke_ended {
+            if let (Some(anchor), Some(current)) =
+                (self.tile_rect_anchor, self.tile_rect_current)
+            {
+                self.apply_tile_rect(anchor, current);
+            }
             self.tile_placer_commit();
+            self.tile_rect_anchor = None;
+            self.tile_rect_current = None;
         }
     }
 
-    /// Stamps (or clears) the grid cell under `pt` on the ACTIVE layer.
+    /// The effect a primary action should apply right now: the eraser deletes,
+    /// an active ghost is blitted, otherwise the selected palette tile stamps.
+    fn tile_effect(&self) -> TileEffect {
+        self.tile_effect_with_eraser(self.tile_placer_transform.eraser)
+    }
+
+    /// The SINGLE effect decision point, shared by the hover preview, the
+    /// Shift-rect preview, the rect application and the freehand commit path.
+    /// Precedence is DEFINED and total:
+    ///   1. `eraser`          -> [`TileEffect::Delete`] (wins over ghost/tile)
+    ///   2. `ghost_tile` set  -> [`TileEffect::GhostBlit`]
+    ///   3. otherwise         -> [`TileEffect::Stamp`]
+    fn tile_effect_with_eraser(&self, eraser: bool) -> TileEffect {
+        if eraser {
+            TileEffect::Delete
+        } else if self.ghost_tile.is_some() {
+            TileEffect::GhostBlit
+        } else {
+            TileEffect::Stamp
+        }
+    }
+
+    /// Applies a Shift rectangle `[min_cx..=max_cx] × [min_cy..=max_cy]` as ONE
+    /// gesture: every cell is stamped (eraser OFF) or deleted (eraser ON). The
+    /// anchors are clamped to the tilemap so an off-canvas drag stays robust;
+    /// an anchor equal to the current cell is still a one-cell rectangle.
+    fn apply_tile_rect(&mut self, anchor: (u32, u32), current: (u32, u32)) {
+        let project = self.projects.current();
+        let tile_size = project.tile_size.max(1) as u32;
+        let cols = (project.layers.width() as u32).div_ceil(tile_size);
+        let rows = (project.layers.height() as u32).div_ceil(tile_size);
+        let clamp = |c: (u32, u32)| (c.0.min(cols.saturating_sub(1)), c.1.min(rows.saturating_sub(1)));
+        let (ax, ay) = clamp(anchor);
+        let (bx, by) = clamp(current);
+        let (min_cx, max_cx) = (ax.min(bx), ax.max(bx));
+        let (min_cy, max_cy) = (ay.min(by), ay.max(by));
+        // The rect's effect is latched at press time (`tile_rect_deleting` mirrors
+        // the eraser then) and uses the SAME precedence helper as everywhere else.
+        let mode = self.tile_effect_with_eraser(self.tile_rect_deleting);
+        for cy in min_cy..=max_cy {
+            for cx in min_cx..=max_cx {
+                let origin_x = (cx as u64 * u64::from(tile_size)) as i32;
+                let origin_y = (cy as u64 * u64::from(tile_size)) as i32;
+                self.tile_placer_cell((origin_x, origin_y), mode);
+            }
+        }
+    }
+
+    /// Right-click eyedropper: over a TILED cell, select that tile and adopt its
+    /// orientation into the sticky transform; over an EMPTY cell, capture a GHOST
+    /// of the composited footprint and clear the tile selection. A press exactly
+    /// on a cell boundary snaps like every other placer action.
+    fn tile_placer_eyedrop(&mut self, pt: (i32, i32)) {
+        let project = self.projects.current();
+        let tile_size = project.tile_size.max(1) as u32;
+        let (cx, cy) = TileMap::snap_cell(pt, tile_size);
+        let layer_id = project.layers.active_layer_id();
+        let cell = project
+            .layers
+            .layer(layer_id)
+            .and_then(|layer| layer.tilemap.as_ref())
+            .and_then(|tm| tm.cell((cx, cy)));
+        if let Some(cell) = cell {
+            // A real tile: select it and adopt its orientation ABSOLUTELY.
+            if self.projects.current_mut().tile_palette.select(cell.tile_id) {
+                self.tile_placer_transform.rotation = cell.rotation % 4;
+                self.tile_placer_transform.flip_x = cell.flip_x;
+                self.tile_placer_transform.flip_y = cell.flip_y;
+                self.tile_placer_transform.active = true;
+                self.tile_placer_transform.eraser = false;
+                self.ghost_tile = None;
+            }
+            return;
+        }
+        // An empty cell: capture the COMPOSITED pixels at the cell footprint
+        // (clipped to the canvas) as a ghost and clear the real selection so no
+        // tile id is written.
+        let (canvas_w, canvas_h) = (
+            project.layers.width() as i32,
+            project.layers.height() as i32,
+        );
+        let rect = Rect2i::new(
+            (cx as u64 * u64::from(tile_size)) as i32,
+            (cy as u64 * u64::from(tile_size)) as i32,
+            tile_size as i32,
+            tile_size as i32,
+        )
+        .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
+        if rect.is_empty() {
+            return;
+        }
+        let composite = {
+            let session = self.projects.current();
+            session
+                .layers
+                .composite_layers_region(rect, &session.tile_palette)
+        };
+        if let Some(composite) = composite {
+            self.ghost_tile = Some((rect.w as u32, rect.h as u32, composite.as_bytes().to_vec()));
+            self.projects.current_mut().tile_palette.selected = None;
+        }
+    }
+
+    /// Stamps, deletes or ghost-blits the grid cell under `pt` on the ACTIVE
+    /// layer.
     ///
     /// The placement transform comes from the STICKY Q/R/X/Z state (toggled by
     /// key presses, see [`Self::tile_placement_cell`]): **X** flips horizontally, **Z** flips
     /// vertically, **R** rotates 90° CW, **Q** 90° CCW. The layer must be
     /// unlocked and the selected tile must exist (for stamping); otherwise this
     /// is a no-op.
-    fn tile_placer_cell(&mut self, pt: (i32, i32), clearing: bool) {
-        if !clearing
+    ///
+    /// `mode` selects the effect: [`TileEffect::Stamp`] bakes the selected
+    /// palette tile, [`TileEffect::Delete`] CLEARS the cell and its baked pixels
+    /// (the eraser), and [`TileEffect::GhostBlit`] writes the captured ghost
+    /// pixels as an undoable PIXEL edit with NO tilemap cell.
+    ///
+    /// Each cell is recorded ONCE per gesture: the first touch stores the true
+    /// original `before` and the pre-bake footprint bytes; a later touch of the
+    /// same cell only updates `after` (and re-bakes), so one held click/drag
+    /// still commits as exactly ONE undo entry that restores the original.
+    fn tile_placer_cell(&mut self, pt: (i32, i32), mode: TileEffect) {
+        // A stamp with NO selected tile is an honest no-op: surface a status
+        // message and do not even create the tilemap.
+        if matches!(mode, TileEffect::Stamp)
             && self
                 .projects
                 .current()
@@ -4851,8 +5315,6 @@ impl App {
                 .selected_tile()
                 .is_none()
         {
-            // Honest feedback: the palette is empty, so a stamp is impossible.
-            // The user must add a tile first (+ Empty).
             self.projects.current_mut().last_error =
                 Some("Tile palette is empty — add a tile first (+ Empty).".to_string());
             return;
@@ -4887,22 +5349,122 @@ impl App {
                 Some("Cannot place tiles on a group layer — select a regular layer.".to_string());
             return;
         }
-        // Ensure the active layer owns a tilemap sized to the CURRENT canvas
-        // cell count. If it already exists (created earlier at a different
-        // `tile_size`, or before a canvas resize), GROW/shrink it to match —
-        // otherwise `set_cell` would silently drop the stamp as out-of-bounds
-        // and the click would appear to do nothing.
-        {
-            let layers = &mut self.projects.current_mut().layers;
-            let layer = layers.layer_mut(layer_id).expect("active layer exists");
-            if layer.tilemap.is_none() {
-                layer.tilemap = Some(TileMap::new(tile_size, cols, rows));
-            } else {
-                let tm = layer.tilemap.as_mut().expect("tilemap was ensured");
-                tm.tile_size = tile_size;
-                tm.resize(cols, rows);
+        // ---- Ghost blit: a pure PIXEL edit, NO tilemap cell ----------------
+        // NIT 9: a ghost writes no cell, so it must NOT create/resize the
+        // tilemap — the ensure below runs only for Stamp/Delete.
+        if let TileEffect::GhostBlit = mode {
+            let Some((gw, gh, ghost)) = self.ghost_tile.clone() else {
+                return;
+            };
+            let (canvas_w, canvas_h) = {
+                let project = self.projects.current();
+                (
+                    project.layers.width() as i32,
+                    project.layers.height() as i32,
+                )
+            };
+            // Fix 1: the ghost follows the SAME sticky placement transform as a
+            // tile (R/X/Z + tool-property panel), applied with the shared
+            // `orient_pixels` routine (flips first, then clockwise rotation).
+            // Dims swap on odd rotations.
+            let t = &self.tile_placer_transform;
+            let (ow, oh, oriented) = orient_pixels(
+                &ghost,
+                gw,
+                gh,
+                t.flip_x,
+                t.flip_y,
+                t.rotation,
+            );
+            // The recorded footprint must cover ANY orientation this ghost can
+            // take DURING the gesture (rotate/flip mid-hold), so record a
+            // maximal square `m×m` from the ghost's largest dimension and the
+            // tile_size, exactly like the tile path's BLOCKER-1 fix.
+            let max_dim = (tile_size as i32).max(gw.max(gh) as i32);
+            let max_rect = Rect2i::new(
+                (cx as u64 * u64::from(tile_size)) as i32,
+                (cy as u64 * u64::from(tile_size)) as i32,
+                max_dim,
+                max_dim,
+            )
+            .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
+            // The actual blit footprint is the ORIENTED ghost dims at the cell
+            // origin, clipped to the canvas at the edge. NOTE: the blit
+            // overwrites the WHOLE destination footprint, including transparent
+            // pixels (the preview only draws the opaque ones).
+            let rect = Rect2i::new(
+                (cx as u64 * u64::from(tile_size)) as i32,
+                (cy as u64 * u64::from(tile_size)) as i32,
+                ow as i32,
+                oh as i32,
+            )
+            .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
+            if rect.is_empty() {
+                return;
             }
+            let layer = self
+                .projects
+                .current_mut()
+                .layers
+                .layer_mut(layer_id)
+                .expect("active layer exists");
+            let first = self.tile_placer.touched.insert((cx, cy));
+            // Capture the before-bytes ONCE per touched cell over the MAXIMAL
+            // rect (covers a later rotation/flip); if the recorder rejects the
+            // region (None), do NOT push an empty-before delta.
+            if first && !max_rect.is_empty() {
+                if let Some(rec) =
+                    DeltaRecorder::begin("Tile", layer_id, &layer.buffer, max_rect)
+                {
+                    self.tile_placer
+                        .buffer_deltas
+                        .push((max_rect, rec.before_bytes().to_vec()));
+                }
+            }
+            // Copy the oriented bytes into the clipped footprint (a partially
+            // off-canvas ghost is clipped, not wrapped).
+            let (ox0, oy0) = (rect.x, rect.y);
+            let origin_x = (cx as u64 * u64::from(tile_size)) as i32;
+            let origin_y = (cy as u64 * u64::from(tile_size)) as i32;
+            let mut bytes = vec![0u8; rect.area() as usize * 4];
+            for y in 0..rect.h {
+                for x in 0..rect.w {
+                    let sx = (ox0 - origin_x) + x;
+                    let sy = (oy0 - origin_y) + y;
+                    if sx < 0 || sy < 0 || sx as u32 >= ow || sy as u32 >= oh {
+                        continue;
+                    }
+                    let src = ((sy as u32 * ow + sx as u32) * 4) as usize;
+                    let dst = ((y * rect.w + x) * 4) as usize;
+                    if src + 4 <= oriented.len() {
+                        bytes[dst..dst + 4].copy_from_slice(&oriented[src..src + 4]);
+                    }
+                }
+            }
+            if !layer.buffer.blit_region(rect, &bytes) {
+                // Buffer rejected the region (cannot happen after the clip):
+                // do not leave a half-recorded touch behind.
+                self.tile_placer.touched.remove(&(cx, cy));
+                if let Some(pos) = self
+                    .tile_placer
+                    .buffer_deltas
+                    .iter()
+                    .position(|(r, _)| *r == max_rect)
+                {
+                    self.tile_placer.buffer_deltas.remove(pos);
+                }
+            }
+            return;
         }
+
+        // Ensure the active layer owns a tilemap sized to the CURRENT canvas
+        // cell count (Stamp/Delete only). If it already exists (created earlier
+        // at a different `tile_size`, or before a canvas resize), GROW/shrink it
+        // to match — otherwise `set_cell` would silently drop the stamp as
+        // out-of-bounds and the click would appear to do nothing.
+        self.ensure_tilemap(layer_id, tile_size, cols, rows);
+
+        let clearing = matches!(mode, TileEffect::Delete);
         let existing = {
             let project = self.projects.current();
             project
@@ -4911,11 +5473,32 @@ impl App {
                 .and_then(|layer| layer.tilemap.as_ref())
                 .and_then(|tm| tm.cell((cx, cy)))
         };
+        // The effective transform for this action: Delete clears the cell
+        // (`after == None`); Stamp bakes the selected palette tile.
         let after = if clearing {
             None
         } else {
+            // A stamp requires a selected tile.
+            if self
+                .projects
+                .current()
+                .tile_palette
+                .selected_tile()
+                .is_none()
+            {
+                // Honest feedback: the palette is empty, so a stamp is
+                // impossible. The user must add a tile first (+ Empty).
+                self.projects.current_mut().last_error =
+                    Some("Tile palette is empty — add a tile first (+ Empty).".to_string());
+                return;
+            }
             Some(self.tile_placement_cell(existing))
         };
+        // A true no-op (Stamp over a cell that already holds exactly this
+        // result) must not record an empty delta or a footprint.
+        if existing == after {
+            return;
+        }
         // Honest feedback: stamping a fully-transparent tile (the EMPTY tile
         // "+ Empty" creates) writes a cell that renders as nothing on the
         // canvas. The panel warns about it too; this covers the placer path.
@@ -4934,8 +5517,12 @@ impl App {
                 );
             }
         }
+        // The first-touch flag decides whether the ORIGINAL cell `before` and
+        // the pre-bake footprint bytes are recorded. Later touches only update
+        // `after` and re-bake.
+        let first = self.tile_placer.touched.insert((cx, cy));
         {
-            // Capture the canvas dims and the stamped tile's oriented footprint
+            // Capture the canvas dims and the stamped tile's MAXIMAL footprint
             // dims BEFORE the mutable layer borrow (disjoint borrow rules).
             let (canvas_w, canvas_h) = {
                 let project = self.projects.current();
@@ -4944,57 +5531,90 @@ impl App {
                     project.layers.height() as i32,
                 )
             };
-            let oriented_dims = after.map(|cell| {
+            // BLOCKER 1: the footprint recorded/cleared must cover EVERY
+            // orientation this cell can take DURING the gesture — a held cell
+            // may be rotated (R) or erased (Alt) mid-hold AFTER its first
+            // touch, widening the baked/cleared area. Record a single MAXIMAL
+            // square `m × m` (`m = max(tile_w, tile_h)` over the existing cell's
+            // tile, the resulting cell's tile, and the current tile_size) at the
+            // cell origin. Any rotation/flip of any involved tile fits inside,
+            // so undo AND redo are complete for the whole gesture. `tile_size`
+            // is a floor so a delete of a tile whose palette entry is gone (or a
+            // cell whose tile grew since) is still covered.
+            let tile_max = |project: &project::ProjectSession, cell: Option<TileCell>| -> i32 {
+                cell.and_then(|cell| project.tile_palette.get(cell.tile_id))
+                    .map(|tile| i32::from(tile.w.max(tile.h)))
+                    .unwrap_or(0)
+            };
+            let max_dim = {
                 let project = self.projects.current();
-                match project.tile_palette.get(cell.tile_id) {
-                    Some(tile) => {
-                        if cell.rotation % 2 == 1 {
-                            (u32::from(tile.h), u32::from(tile.w))
-                        } else {
-                            (u32::from(tile.w), u32::from(tile.h))
-                        }
-                    }
-                    None => (tile_size, tile_size),
-                }
-            });
+                let mut m = tile_size as i32;
+                m = m.max(tile_max(project, existing));
+                m = m.max(tile_max(project, after));
+                m
+            };
+            let max_rect = Rect2i::new(
+                (cx as u64 * u64::from(tile_size)) as i32,
+                (cy as u64 * u64::from(tile_size)) as i32,
+                max_dim,
+                max_dim,
+            )
+            .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
             let project = self.projects.current_mut();
             let layer = project
                 .layers
                 .layer_mut(layer_id)
                 .expect("active layer exists");
             let tm = layer.tilemap.as_mut().expect("tilemap was ensured");
-            // Record the pre-stamp buffer footprint bytes so a stamp gesture
-            // undoes its bake in one step. Clear (un-tile) records nothing.
-            if !clearing {
-                if let Some((ow, oh)) = oriented_dims {
-                    let rect = Rect2i::new(
-                        (cx as u64 * u64::from(tile_size)) as i32,
-                        (cy as u64 * u64::from(tile_size)) as i32,
-                        ow as i32,
-                        oh as i32,
-                    )
-                    .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
-                    if !rect.is_empty() {
-                        let before = crate::core::undo::DeltaRecorder::begin(
-                            "Tile",
-                            layer_id,
-                            &layer.buffer,
-                            rect,
-                        )
-                        .map(|r| r.before_bytes().to_vec())
-                        .unwrap_or_default();
-                        self.tile_placer.buffer_deltas.push((rect, before));
-                    }
+            // Record the pre-bake buffer footprint bytes ONCE per touched cell,
+            // over the MAXIMAL rect, so the whole gesture undoes its bake in one
+            // step (or its wipe, for the eraser). If the recorder rejects the
+            // region (None), do NOT push a delta with empty `before`.
+            if first && !max_rect.is_empty() {
+                if let Some(rec) = DeltaRecorder::begin("Tile", layer_id, &layer.buffer, max_rect) {
+                    self.tile_placer
+                        .buffer_deltas
+                        .push((max_rect, rec.before_bytes().to_vec()));
                 }
             }
             tm.set_cell((cx, cy), after);
-            // Bake the stamped cell into the buffer (the integrated model
-            // invariant: buffer footprint == oriented tile bytes).
-            if !clearing {
+            if clearing {
+                // CLEAN delete: wipe transparent pixels over the cell's MAXIMAL
+                // footprint so the erased tile leaves nothing baked, whatever
+                // orientation it had.
+                if !max_rect.is_empty() {
+                    let (bw, bh) = (max_rect.w as usize, max_rect.h as usize);
+                    let clear = vec![0u8; bw * bh * 4];
+                    let _ = layer.buffer.blit_region(max_rect, &clear);
+                }
+            } else {
+                // Bake the stamped cell into the buffer (the integrated model
+                // invariant: buffer footprint == oriented tile bytes).
                 let _ = tm.blit_cell(&project.tile_palette, &mut layer.buffer, cx, cy);
             }
         }
-        self.tile_placer.diffs.insert((cx, cy), (existing, after));
+        // Record ONCE: the first touch keeps the original `before`; later
+        // touches only refresh `after`.
+        self.tile_placer
+            .diffs
+            .entry((cx, cy))
+            .or_insert((existing, after))
+            .1 = after;
+    }
+
+    /// Ensure the active layer owns a tilemap sized to the CURRENT canvas cell
+    /// count, growing/shrinking an existing one. Used only by the Stamp/Delete
+    /// paths (a ghost writes no cell and must not create a tilemap).
+    fn ensure_tilemap(&mut self, layer_id: LayerId, tile_size: u32, cols: u32, rows: u32) {
+        let layers = &mut self.projects.current_mut().layers;
+        let layer = layers.layer_mut(layer_id).expect("active layer exists");
+        if layer.tilemap.is_none() {
+            layer.tilemap = Some(TileMap::new(tile_size, cols, rows));
+        } else {
+            let tm = layer.tilemap.as_mut().expect("tilemap was ensured");
+            tm.tile_size = tile_size;
+            tm.resize(cols, rows);
+        }
     }
 
     /// Edge-detect the Q/R/X/Z key PRESSES and fold them into the sticky
@@ -5007,6 +5627,15 @@ impl App {
     /// sticks until the Tile tool is deactivated. **R** rotates 90° CW, **Q**
     /// 90° CCW, **X** toggles `flip_x`, **Z** toggles `flip_y`.
     ///
+    /// **Alt** toggles the Tile ERASER on a RISING EDGE of `modifiers.alt`
+    /// (egui has no `Key::Alt`), so holding Alt does not retoggle. The toggle is
+    /// gated on the Tile tool exactly like the transform keys.
+    ///
+    /// **Modifier guard:** the Q/R/X/Z reads apply only when NO
+    /// command/ctrl/alt modifier is held, so `Ctrl+Z` / `Ctrl+Y` undo/redo
+    /// cleanly while the Tile tool is active instead of being hijacked by the
+    /// placer's flip/rotate keys.
+    ///
     /// Gated on the Tile tool so the modifiers only drive the placer while it
     /// is the active tool.
     ///
@@ -5018,16 +5647,43 @@ impl App {
     fn tick_tile_placer_transform(&mut self) {
         let is_tile = self.projects.current().tool_state.tool() == Tool::Tile;
         if !is_tile {
+            // Keep the Alt edge state coherent while the tool is inactive so a
+            // later activation does not see a stale rising edge.
+            self.prev_alt = self.ctx.input(|i| i.modifiers.alt);
             return;
         }
-        let (x, z, r, q) = self.ctx.input(|i| {
+        let (x, z, r, q, alt, guarded, scrolled) = self.ctx.input(|i| {
+            let scrolled = i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::MouseWheel { .. } | egui::Event::Zoom(_)
+                )
+            });
             (
                 i.key_pressed(egui::Key::X),
                 i.key_pressed(egui::Key::Z),
                 i.key_pressed(egui::Key::R),
                 i.key_pressed(egui::Key::Q),
+                i.modifiers.alt,
+                i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt,
+                scrolled,
             )
         });
+        // Alt rising edge -> toggle the SINGLE eraser state. The transform's
+        // `active` flag is deliberately untouched. SHOULD-FIX 6: a frame that
+        // carries a scroll/wheel event (Alt+scroll adjusts properties) must NOT
+        // toggle — only a bare Alt press does. Edge-only, so holding Alt across
+        // frames still toggles exactly once.
+        if alt && !self.prev_alt && !scrolled {
+            let erased = !self.tile_placer_transform.eraser;
+            self.tile_placer_transform.set_eraser(erased);
+        }
+        self.prev_alt = alt;
+        // The transform keys are suppressed while a command/ctrl/alt modifier
+        // is held so undo/redo shortcuts win.
+        if guarded {
+            return;
+        }
         let t = &mut self.tile_placer_transform;
         if r {
             t.rotation = (t.rotation + 1) % 4;
@@ -5083,11 +5739,62 @@ impl App {
         }
     }
 
-    /// Commits the in-flight placer gesture as ONE undoable
-    /// [`TilemapEditCommand`], or a no-op when nothing changed.
+    /// Commits the in-flight placer gesture as ONE undoable entry, or a no-op
+    /// when nothing changed.
+    ///
+    /// A gesture that wrote tilemap cells — including a CLEAN eraser delete,
+    /// which records both the cleared cell and the wiped buffer footprint —
+    /// commits as ONE composite: a [`TilemapEditCommand`] for the cell diffs
+    /// plus a [`ReverseDeltaCommand`] per footprint for the baked/wiped pixels.
+    /// The composite is pushed directly (NOT through `push_pixel_edit`) so the
+    /// pixel wipe never writes back to the ROOT tile data — deleting a placed
+    /// tile instance must not erase the palette tile's pixels.
+    ///
+    /// A GHOST-only gesture (no cells, just a pixel blit) commits as a pixel
+    /// edit through [`Self::push_pixel_edit`], so it is undoable and never
+    /// writes a cell.
     fn tile_placer_commit(&mut self) {
         let gesture = std::mem::take(&mut self.tile_placer);
+        if !gesture.is_active() {
+            return;
+        }
+        let layer_id = self.projects.current().layers.active_layer_id();
+        // Ghost-only gesture: build the pixel deltas from the recorded
+        // footprints and push them DIRECTLY (NOT through `push_pixel_edit`).
+        // SHOULD-FIX 4: the ghost contract is "texture only, no tile index", so
+        // it must NOT run `tile_edit::write_back_region` — a ghost placed onto a
+        // cell that already holds a tile would otherwise write those pixels into
+        // that tile's ROOT data and re-stamp every instance.
         if gesture.diffs.is_empty() {
+            let mut composite = CompositeCommand::new(TILE_EDIT_COMPOSITE_NAME);
+            let mut any = false;
+            for (rect, before) in &gesture.buffer_deltas {
+                let after = {
+                    let project = self.projects.current();
+                    let layer = project
+                        .layers
+                        .layer(layer_id)
+                        .expect("active layer exists");
+                    DeltaRecorder::begin("Tile", layer_id, &layer.buffer, *rect)
+                        .map(|r| r.before_bytes().to_vec())
+                        .unwrap_or_default()
+                };
+                if &after != before {
+                    composite.push(Box::new(ReverseDeltaCommand::new(
+                        "Tile",
+                        layer_id,
+                        *rect,
+                        before.clone(),
+                        after,
+                    )));
+                    any = true;
+                }
+            }
+            if any {
+                let project = self.projects.current_mut();
+                project.undo.push(Box::new(composite));
+                project.mark_dirty();
+            }
             return;
         }
         let diffs: Vec<((u32, u32), Option<TileCell>, Option<TileCell>)> = gesture
@@ -5095,34 +5802,36 @@ impl App {
             .into_iter()
             .map(|(cell, (before, after))| (cell, before, after))
             .collect();
-        let layer_id = self.projects.current().layers.active_layer_id();
-        let project = self.projects.current_mut();
-        let mut cmd = TilemapEditCommand::new(layer_id, diffs);
-        if !gesture.buffer_deltas.is_empty() {
-            let buffer_deltas: Vec<(Rect2i, Vec<u8>, Vec<u8>)> = gesture
+        // Capture the post-gesture buffer bytes for every recorded footprint and
+        // build the pixel deltas BEFORE the mutable push.
+        let pixel_deltas: Vec<(Rect2i, Vec<u8>, Vec<u8>)> = {
+            let project = self.projects.current();
+            let layer = project.layers.layer(layer_id).expect("active layer exists");
+            gesture
                 .buffer_deltas
-                .into_iter()
+                .iter()
                 .map(|(rect, before)| {
-                    // The after-state is the baked buffer at the footprint
-                    // (the cell was blitted after set_cell).
-                    let after = crate::core::undo::DeltaRecorder::begin(
-                        "Tile",
-                        layer_id,
-                        &project
-                            .layers
-                            .layer(layer_id)
-                            .expect("active layer exists")
-                            .buffer,
-                        rect,
-                    )
-                    .map(|r| r.before_bytes().to_vec())
-                    .unwrap_or_default();
-                    (rect, before, after)
+                    let after = DeltaRecorder::begin("Tile", layer_id, &layer.buffer, *rect)
+                        .map(|r| r.before_bytes().to_vec())
+                        .unwrap_or_default();
+                    (*rect, before.clone(), after)
                 })
-                .collect();
-            cmd = cmd.with_buffer_deltas(buffer_deltas);
+                .collect()
+        };
+        // A stamp-or-delete gesture: cells command FIRST, then the pixel deltas,
+        // so undo restores pixels then cells and redo clears/applies cells then
+        // pixels (forward order). No `push_pixel_edit` write-back.
+        let mut composite = CompositeCommand::new(TILE_EDIT_COMPOSITE_NAME);
+        composite.push(Box::new(TilemapEditCommand::new(layer_id, diffs)));
+        for (rect, before, after) in pixel_deltas {
+            if before != after {
+                composite.push(Box::new(ReverseDeltaCommand::new(
+                    "Tile", layer_id, rect, before, after,
+                )));
+            }
         }
-        project.undo.push(Box::new(cmd));
+        let project = self.projects.current_mut();
+        project.undo.push(Box::new(composite));
         project.mark_dirty();
     }
 
@@ -6054,6 +6763,9 @@ impl App {
     fn document_to_app(&mut self, doc: &Document) {
         self.projects.current_mut().load_document(doc);
         self.invalidate_host_project_cache();
+        // A loaded document defines a new canvas; any ghost from the previous
+        // document must not leak.
+        self.ghost_tile = None;
     }
 
     fn file_new(&mut self) {
@@ -6123,6 +6835,11 @@ impl App {
     }
 
     fn load_project(&mut self, path: PathBuf) {
+        // SHOULD-FIX 5: loading a project (fresh or already-open) drops any
+        // ghost captured elsewhere so it never previews/places across projects.
+        self.ghost_tile = None;
+        self.tile_rect_anchor = None;
+        self.tile_rect_current = None;
         if let Some(project) = self.projects.find_by_path(&path) {
             let _ = self.activate_project(project);
             self.update_title();
@@ -6190,6 +6907,8 @@ impl App {
         self.projects.current_mut().new_draft_w = width.max(1);
         self.projects.current_mut().new_draft_h = height.max(1);
         self.projects.current_mut().last_error = None;
+        // The canvas dimensions changed; drop a ghost that no longer fits.
+        self.clear_ghost_if_unfit();
         self.invalidate_host_project_cache();
         self.update_title();
         self.clear_active_recovery();
@@ -20896,18 +21615,18 @@ mod tests {
     }
 
     #[test]
-    /// Given the B default binding, when it is pressed, then the Tile tool is
+    /// Given the T default binding, when it is pressed, then the Tile tool is
     /// deliberately selected.
-    fn b_key_selects_the_tile_tool() {
+    fn t_key_selects_the_tile_tool() {
         let mut app = App::default();
         assert_ne!(app.projects.current().tool_state.tool(), Tool::Tile);
 
-        send_key(&mut app, egui::Key::B, egui::Modifiers::NONE);
+        send_key(&mut app, egui::Key::T, egui::Modifiers::NONE);
 
         assert_eq!(
             app.projects.current().tool_state.tool(),
             Tool::Tile,
-            "the B shortcut must select the Tile tool"
+            "the T shortcut must select the Tile tool"
         );
     }
 
@@ -21004,9 +21723,9 @@ mod tests {
     }
 
     #[test]
-    fn tile_tool_right_click_clears_cells() {
+    fn tile_tool_right_click_is_a_tile_eyedropper_not_a_clear() {
         let mut app = App::default();
-        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
         app.projects.current_mut().tile_size = 4;
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
@@ -21024,7 +21743,10 @@ mod tests {
             .cell((1, 0))
             .is_some());
 
-        // Right-drag clears the cell (no selection required).
+        // Clear the palette selection so the eyedropper has work to do.
+        app.projects.current_mut().tile_palette.selected = None;
+        // Right-click on the TILED cell selects that tile and adopts its
+        // orientation; it must NOT clear the cell.
         app.handle_interactions(CanvasInteractions {
             eyedropper_started: true,
             eyedropper_point: Some((5, 3)),
@@ -21042,8 +21764,20 @@ mod tests {
             .tilemap
             .as_ref()
             .unwrap();
-        assert_eq!(tm.cell((1, 0)), None);
-        assert_eq!(app.projects.current().undo.undo_len(), 2);
+        assert!(
+            tm.cell((1, 0)).is_some(),
+            "right-click no longer clears cells — the eraser + Shift-rect delete"
+        );
+        assert_eq!(
+            app.projects.current().tile_palette.selected,
+            Some(tile_id),
+            "the eyedropper selects the tile under the pointer"
+        );
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            1,
+            "the eyedropper writes no tilemap edit"
+        );
     }
 
     #[test]
@@ -21497,6 +22231,1327 @@ mod tests {
             "deactivating the Tile tool resets the sticky transform"
         );
     }
+
+    // -- Tile eraser, ghost eyedropper, shift-rect, undo regression ---------
+
+    /// REGRESSION (held same-cell placement): a held primary press whose
+    /// `stroke_point` re-emits the SAME cell across an intermediate frame must
+    /// record the TRUE original `before` ONCE, so a single undo restores the
+    /// original cell and pixels, and a redo re-applies.
+    #[test]
+    fn tile_held_same_cell_placement_undoes_and_redoes() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Press frame: stamp cell (1,0) at (5,3).
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        // Intermediate frame: the SAME cell is re-emitted while the button is
+        // still held (this is what update_tool_gesture does every frame).
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        // Release.
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+
+        // Exactly ONE undo entry for the whole held gesture.
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            1,
+            "a held same-cell gesture commits exactly one undo entry"
+        );
+        let cell = |app: &App| {
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap()
+                .cell((1, 0))
+        };
+        assert_eq!(cell(&app).map(|c| c.tile_id), Some(tile_id));
+        // The cell's footprint pixels are baked.
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED)
+        );
+
+        // ONE undo restores the original: no cell, no baked pixels.
+        app.undo_document();
+        assert_eq!(cell(&app), None, "undo restores the original empty cell");
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(Color::rgba(0, 0, 0, 0)),
+            "undo restores the original (transparent) pixels"
+        );
+
+        // Redo re-applies.
+        app.redo_document();
+        assert_eq!(cell(&app).map(|c| c.tile_id), Some(tile_id));
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED),
+            "redo re-applies the baked pixels"
+        );
+    }
+
+    /// The eraser (Alt / checkbox) DELETES a placed cell: one undo restores the
+    /// cell AND the pixels that were baked over the footprint.
+    #[test]
+    fn tile_eraser_delete_undoes_cell_and_pixels() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Place a tile at cell (1,0).
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert!(app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap()
+            .cell((1, 0))
+            .is_some());
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED)
+        );
+
+        // Turn the eraser ON via the panel event (single source of truth).
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(true)]);
+        assert!(app.tile_placer_transform.eraser);
+
+        // A primary action now deletes the cell and wipes its pixels.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)), None, "the eraser clears the cell");
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(Color::rgba(0, 0, 0, 0)),
+            "the eraser wipes the baked pixels (a CLEAN delete)"
+        );
+
+        // ONE undo restores BOTH the cell and the pixels.
+        app.undo_document();
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((1, 0)).map(|c| c.tile_id),
+            Some(tile_id),
+            "undo restores the erased cell"
+        );
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED),
+            "undo restores the erased pixels"
+        );
+
+        // Redo re-deletes cleanly.
+        app.redo_document();
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)), None);
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(Color::rgba(0, 0, 0, 0))
+        );
+    }
+
+    /// Alt toggles the eraser on a RISING EDGE only: holding it across several
+    /// frames toggles once, and the toggle is a no-op while the Tile tool is
+    /// inactive.
+    #[test]
+    fn tile_alt_toggles_eraser_once_per_press_and_only_when_active() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert!(!app.tile_placer_transform.eraser);
+
+        // While ANOTHER tool is active Alt must NOT toggle the eraser.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        alt_edge_frames(&mut app, true, 1);
+        assert!(
+            !app.tile_placer_transform.eraser,
+            "Alt must not toggle the eraser while the Tile tool is inactive"
+        );
+
+        // Back to Tile: a rising Alt edge toggles ON once.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        // The tool switch away reset the transform, so refresh the edge baseline.
+        alt_edge_frames(&mut app, false, 1);
+        alt_edge_frames(&mut app, true, 3); // held for three frames
+        assert!(
+            app.tile_placer_transform.eraser,
+            "one Alt press toggles the eraser ON"
+        );
+
+        // Holding Alt across more frames must NOT retoggle.
+        alt_edge_frames(&mut app, true, 4);
+        assert!(
+            app.tile_placer_transform.eraser,
+            "holding Alt must not retoggle the eraser"
+        );
+
+        // Release then a fresh press toggles OFF once.
+        alt_edge_frames(&mut app, false, 1);
+        alt_edge_frames(&mut app, true, 1);
+        assert!(
+            !app.tile_placer_transform.eraser,
+            "a second Alt press toggles the eraser back OFF"
+        );
+    }
+
+    /// Ctrl+Z/Y keep working while the Tile tool is active AND do NOT toggle
+    /// the placer's `flip_y` (the Z key would otherwise hijack the transform).
+    #[test]
+    fn ctrl_z_does_not_toggle_flip_y_while_tile_tool_active() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Place a tile so there is something to undo.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert_eq!(app.projects.current().undo.undo_len(), 1);
+
+        // Ctrl+Z: undo, and the Z key must NOT toggle flip_y.
+        ctrl_key_frame(&mut app, egui::Key::Z);
+        assert!(
+            !app.tile_placer_transform.flip_y,
+            "Ctrl+Z must not toggle the placer's flip_y"
+        );
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap()
+                .cell((1, 0))
+                .is_none(),
+            "Ctrl+Z must undo the tile placement"
+        );
+
+        // Ctrl+Y: redo.
+        ctrl_key_frame(&mut app, egui::Key::Y);
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap()
+                .cell((1, 0))
+                .is_some(),
+            "Ctrl+Y must redo the tile placement"
+        );
+        assert!(!app.tile_placer_transform.flip_y);
+    }
+
+    /// Shift+left-drag stamps the whole rectangle `[min..=max] × [min..=max]`
+    /// as exactly ONE undo entry; with the eraser on it deletes the rectangle.
+    #[test]
+    fn tile_shift_drag_rect_is_one_undo_and_deletes_when_erasing() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Shift label; anchor cell (1,0) -> current cell (2,1) covers a 2x2
+        // rectangle: (1,0),(2,0),(1,1),(2,1).
+        set_modifiers(&app, egui::Modifiers { shift: true, ..egui::Modifiers::NONE });
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        for cell in [(1, 0), (2, 0), (1, 1), (2, 1)] {
+            assert_eq!(tm.cell(cell).map(|c| c.tile_id), Some(tile_id), "{cell:?}");
+        }
+        assert_eq!(tm.cell((3, 0)), None, "outside the rectangle stays empty");
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            1,
+            "the whole rectangle commits as exactly one undo entry"
+        );
+
+        // Undo clears all four cells at once.
+        app.undo_document();
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        for cell in [(1, 0), (2, 0), (1, 1), (2, 1)] {
+            assert_eq!(tm.cell(cell), None, "{cell:?}");
+        }
+        app.redo_document();
+
+        // Now turn the eraser on and Shift-drag the same rectangle: delete.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(true)]);
+        set_modifiers(&app, egui::Modifiers { shift: true, ..egui::Modifiers::NONE });
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        for cell in [(1, 0), (2, 0), (1, 1), (2, 1)] {
+            assert_eq!(tm.cell(cell), None, "Shift+eraser deletes the rectangle");
+        }
+        assert_eq!(app.projects.current().undo.undo_len(), 2);
+    }
+
+    /// Right-click on a TILED cell selects that tile and adopts its orientation
+    /// into the sticky transform; right-click on an EMPTY cell captures a ghost
+    /// and clears the selection.
+    #[test]
+    fn tile_right_click_selects_or_ghosts_and_real_selection_clears_ghost() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Stamp a cell, then rotate the sticky transform and stamp a second cell
+        // so the two cells have distinguishable orientations.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((9, 3)),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap()
+                .cell((2, 0))
+                .unwrap()
+                .rotation,
+            1
+        );
+
+        // Clear the selection so the eyedropper has to set it.
+        app.projects.current_mut().tile_palette.selected = None;
+        app.tile_placer_transform = TilePlacerTransform::default();
+
+        // Right-click the ROTATED cell (2,0): selects the tile + adopts rot 1.
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((9, 3)),
+            ..Default::default()
+        });
+        assert_eq!(app.projects.current().tile_palette.selected, Some(tile_id));
+        assert_eq!(app.tile_placer_transform.rotation, 1);
+        assert!(app.tile_placer_transform.active);
+        assert!(app.ghost_tile.is_none(), "a tiled cell makes no ghost");
+
+        // Right-click an EMPTY cell (0,0) at canvas (1,1): captures a ghost +
+        // clears the real selection.
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((1, 1)),
+            ..Default::default()
+        });
+        assert!(
+            app.ghost_tile.is_some(),
+            "an empty cell captures a ghost tile"
+        );
+        assert_eq!(
+            app.projects.current().tile_palette.selected,
+            None,
+            "the ghost clears the real tile selection"
+        );
+
+        // Selecting a REAL palette tile clears the ghost.
+        let id2 = set_selected_tile(&mut app, 2, 2, [0, 0, 255, 255]);
+        app.apply_tile_palette_events(vec![TilePalettePanelEvent::Select(id2)]);
+        assert!(
+            app.ghost_tile.is_none(),
+            "selecting a real tile clears the ghost"
+        );
+    }
+
+    /// A GHOST placement writes only pixels (as an undoable pixel edit) and
+    /// writes NO tilemap cell.
+    #[test]
+    fn tile_ghost_placement_writes_pixels_no_cell_and_undoes() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Paint a green block into the layer buffer so the empty-cell composite
+        // has visible content to capture.
+        {
+            let layer = app.projects.current_mut().layers.active_layer_mut();
+            let region = Rect2i::new(4, 0, 4, 4);
+            let green = [0u8, 255, 0, 255].repeat(16);
+            layer.buffer.blit_region(region, &green);
+        }
+        app.projects.current_mut().tile_palette.selected = None;
+
+        // Right-click the empty cell (1,0) to capture the ghost.
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((5, 3)),
+            ..Default::default()
+        });
+        assert!(app.ghost_tile.is_some());
+
+        // Place the ghost at cell (4,0) (canvas (16,0)).
+        let undo_before = app.projects.current().undo.undo_len();
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((17, 3)),
+            ..Default::default()
+        });
+        // No tilemap cell was written anywhere.
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .map(|tm| tm.cells().iter().all(|c| c.is_none()))
+                .unwrap_or(true),
+            "a ghost placement writes no tilemap cell"
+        );
+        // The green pixels were blitted at the target footprint.
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(16, 0),
+            Some(Color::rgb(0, 255, 0)),
+            "the ghost pixels land at the target cell"
+        );
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            undo_before + 1,
+            "the ghost placement is exactly one undo entry"
+        );
+
+        // Undo removes the ghost pixels.
+        app.undo_document();
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(16, 0),
+            Some(Color::rgba(0, 0, 0, 0)),
+            "undo removes the ghost pixels"
+        );
+    }
+
+    /// BLOCKER 1 regression: hold the primary button on a cell with a NON-SQUARE
+    /// tile, press R mid-hold (the footprint widens from `2w×4h` to `4w×2h`),
+    /// release. ONE undo must restore ALL baked pixels to the original.
+    #[test]
+    fn tile_held_non_square_rotate_mid_hold_undo_restores_all_pixels() {
+        let mut app = App::default();
+        // A 2w x 4h solid-red tile: rotation 0 bakes 2x4, rotation 1 bakes 4x2.
+        let id = {
+            let session = app.projects.current_mut();
+            let id = session.tile_palette.add(Tile {
+                id: TileId(0),
+                w: 2,
+                h: 4,
+                pixels: [255u8, 0, 0, 255].repeat(2 * 4),
+            });
+            session.tile_palette.select(id);
+            id
+        };
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Press on cell (1,0) — canvas (4,0) spans tile_size 4; footprint 4x4
+        // at (4,0)..(7,3). The maximal footprint covers (4,0)..(7,3) fully.
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        // Rotate mid-hold: rotation 1 makes the tile bake 4x2.
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            1,
+            "the whole held gesture is ONE undo entry"
+        );
+        // The full 4x4 cell footprint was baked (rotation 1 = 4x2 at rows 0-1).
+        let buf = &app.projects.current().layers.active_layer().buffer;
+        assert_eq!(buf.get_pixel(4, 1), Some(RED), "rotated bake row 0");
+        // Now ONE undo restores EVERY pixel of the maximal footprint.
+        app.undo_document();
+        let buf = &app.projects.current().layers.active_layer().buffer;
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(
+                    buf.get_pixel(4 + x as usize, y as usize),
+                    Some(Color::rgba(0, 0, 0, 0)),
+                    "undo must restore footprint pixel ({x},{y})"
+                );
+            }
+        }
+        // Redo re-applies fully.
+        app.redo_document();
+        let buf = &app.projects.current().layers.active_layer().buffer;
+        assert_eq!(
+            buf.get_pixel(4, 0),
+            Some(RED),
+            "redo re-applies the baked (rotated) pixels"
+        );
+        // The cell's final transform is rotation 1.
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)).unwrap().rotation, 1);
+        assert_eq!(tm.cell((1, 0)).unwrap().tile_id, id);
+    }
+
+    /// BLOCKER 1 (Alt variant): toggle the eraser mid-hold on a held cell
+    /// (stamp first, then a later touch deletes). ONE undo must fully restore
+    /// cells + pixels.
+    #[test]
+    fn tile_eraser_toggled_mid_hold_undo_restores_cells_and_pixels() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 4, 4, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Pre-place the tile with a SEPARATE gesture so the held gesture starts
+        // from a tiled cell (its undo must restore that tile + pixels).
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert!(app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap()
+            .cell((1, 0))
+            .is_some());
+        let undo_after_placement = app.projects.current().undo.undo_len();
+
+        // A held gesture on the SAME cell: stamp (re-stamp, same transform) then
+        // toggle the eraser mid-hold, so a later touch deletes it.
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(true)]);
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+
+        // Net: the cell is deleted and its pixels wiped.
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(tm.cell((1, 0)), None, "the mid-hold toggle deletes");
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(Color::rgba(0, 0, 0, 0))
+        );
+        assert_eq!(
+            app.projects.current().undo.undo_len(),
+            undo_after_placement + 1,
+            "the held gesture is ONE undo entry"
+        );
+
+        // ONE undo restores the PRE-GESTURE tile + pixels (the placement).
+        app.undo_document();
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            tm.cell((1, 0)).map(|c| c.tile_id),
+            Some(tile_id),
+            "undo restores the original cell"
+        );
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED),
+            "undo restores the original baked pixels"
+        );
+    }
+
+    /// SHOULD-FIX 4 regression: a ghost placed onto a cell that ALREADY holds a
+    /// tile must not touch the tile's ROOT pixels or any instance, and must
+    /// write NO cell for the ghost; the pixels land in the active layer only.
+    #[test]
+    fn tile_ghost_over_tiled_cell_does_not_touch_root_or_instances() {
+        let mut app = App::default();
+        let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Two instances of the tile: cell (0,0) and cell (2,0).
+        for pt in [(1, 1), (9, 1)] {
+            app.handle_interactions(CanvasInteractions {
+                clicked: Some(pt),
+                ..Default::default()
+            });
+        }
+        let root_before = app
+            .projects
+            .current()
+            .tile_palette
+            .get(tile_id)
+            .unwrap()
+            .pixels
+            .clone();
+        let instance_b_before: Vec<Option<Color>> = (8..10)
+            .flat_map(|x| (0..2).map(move |y| (x, y)))
+            .map(|(x, y)| {
+                app.projects
+                    .current()
+                    .layers
+                    .active_layer()
+                    .buffer
+                    .get_pixel(x, y)
+            })
+            .collect();
+
+        // Paint a green pixel at an empty cell (1,1) then ghost-capture it.
+        {
+            let layer = app.projects.current_mut().layers.active_layer_mut();
+            layer.buffer.set_pixel(4, 4, Color::rgb(0, 255, 0));
+        }
+        app.projects.current_mut().tile_palette.selected = None;
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((4, 4)),
+            ..Default::default()
+        });
+        assert!(app.ghost_tile.is_some(), "the empty cell captures a ghost");
+        assert_eq!(
+            app.projects.current().tile_palette.selected,
+            None,
+            "the ghost clears the real selection"
+        );
+
+        // Place the ghost OVER the tiled cell (0,0) at canvas (0,0).
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((0, 0)),
+            ..Default::default()
+        });
+
+        // 1) Root tile pixels unchanged.
+        assert_eq!(
+            app.projects.current().tile_palette.get(tile_id).unwrap().pixels,
+            root_before,
+            "a ghost must not write the tile's ROOT data"
+        );
+        // 2) The OTHER instance's baked pixels are unchanged.
+        let instance_b_after: Vec<Option<Color>> = (8..10)
+            .flat_map(|x| (0..2).map(move |y| (x, y)))
+            .map(|(x, y)| {
+                app.projects
+                    .current()
+                    .layers
+                    .active_layer()
+                    .buffer
+                    .get_pixel(x, y)
+            })
+            .collect();
+        assert_eq!(
+            instance_b_after, instance_b_before,
+            "a ghost must not re-stamp every instance"
+        );
+        // 3) The tiled cell (0,0) still holds its tile (no cell written).
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .as_ref()
+                .unwrap()
+                .cell((0, 0))
+                .map(|c| c.tile_id),
+            Some(tile_id),
+            "the ghost writes no tilemap cell"
+        );
+        // 4) The ghost pixels landed in the active layer only.
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(0, 0),
+            Some(Color::rgb(0, 255, 0)),
+            "the ghost pixels overwrite the active-layer footprint"
+        );
+        // 5) Undo restores the active-layer pixels.
+        app.undo_document();
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(0, 0),
+            Some(RED),
+            "undo restores the pre-ghost active-layer pixels"
+        );
+    }
+
+    /// SHOULD-FIX 5: a ghost must not leak across projects — it is cleared on
+    /// `new_project` and on `load_project`.
+    #[test]
+    fn tile_ghost_cleared_on_new_and_load_project() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        // Capture a ghost from an empty cell.
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((1, 1)),
+            ..Default::default()
+        });
+        assert!(app.ghost_tile.is_some());
+
+        // new_project clears it.
+        app.new_project("second", 128, 128);
+        assert!(
+            app.ghost_tile.is_none(),
+            "a new project must clear the ghost"
+        );
+
+        // Re-capture, then load_project clears it.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((1, 1)),
+            ..Default::default()
+        });
+        assert!(app.ghost_tile.is_some());
+        // A saved project on disk to load.
+        let path = TempDir::new("ghost_lifecycle");
+        assert!(app.save_to(path.path().to_path_buf()));
+        // Re-capture AFTER save (save must not itself be the clear point).
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((1, 1)),
+            ..Default::default()
+        });
+        assert!(app.ghost_tile.is_some());
+        app.load_project(path.path().to_path_buf());
+        assert!(
+            app.ghost_tile.is_none(),
+            "loading a project must clear the ghost"
+        );
+    }
+
+    /// Test helper: a 2×2 ghost with four distinct opaque colours so an
+    /// orientation change is visible pixel-by-pixel.
+    /// (0,0)=blue, (1,0)=green, (0,1)=red, (1,1)=yellow.
+    fn four_color_ghost() -> (u32, u32, Vec<u8>) {
+        let mut pixels = vec![0u8; 2 * 2 * 4];
+        pixels[0..4].copy_from_slice(&[0, 0, 255, 255]); // (0,0) blue
+        pixels[4..8].copy_from_slice(&[0, 255, 0, 255]); // (1,0) green
+        pixels[8..12].copy_from_slice(&[255, 0, 0, 255]); // (0,1) red
+        pixels[12..16].copy_from_slice(&[255, 255, 0, 255]); // (1,1) yellow
+        (2, 2, pixels)
+    }
+
+    fn px(app: &App, x: usize, y: usize) -> Option<Color> {
+        app.projects
+            .current()
+            .layers
+            .active_layer()
+            .buffer
+            .get_pixel(x, y)
+    }
+
+    /// FIX 1: a ghost placement with sticky rotation=1 writes the ORIENTED ghost
+    /// pixels (90° CW) and no tilemap cell.
+    #[test]
+    fn tile_ghost_placement_applies_sticky_rotation() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.ghost_tile = Some(four_color_ghost());
+        app.projects.current_mut().tile_palette.selected = None;
+        // Sticky rotation 1 (90° CW).
+        app.tile_placer_transform.rotation = 1;
+        app.tile_placer_transform.active = true;
+
+        // Place at cell (1,0) -> origin (4,0).
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+
+        // 90° CW of the 2×2 ((x,y)->(1-y,x)): (0,1)red->(0,0),
+        // (0,0)blue->(1,0), (1,1)yellow->(0,1), (1,0)green->(1,1).
+        assert_eq!(px(&app, 4, 0), Some(Color::rgb(255, 0, 0)), "(0,0)=red");
+        assert_eq!(px(&app, 5, 0), Some(Color::rgb(0, 0, 255)), "(1,0)=blue");
+        assert_eq!(px(&app, 4, 1), Some(Color::rgb(255, 255, 0)), "(0,1)=yellow");
+        assert_eq!(px(&app, 5, 1), Some(Color::rgb(0, 255, 0)), "(1,1)=green");
+        // No tilemap cell.
+        assert!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .tilemap
+                .is_none(),
+            "a ghost placement writes no tilemap cell"
+        );
+    }
+
+    /// FIX 1: a ghost placement with sticky flip_x writes the FLIPPED ghost
+    /// pixels (mirror horizontally), and releasing the modifier keeps it sticky.
+    #[test]
+    fn tile_ghost_placement_applies_sticky_flip() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.ghost_tile = Some(four_color_ghost());
+        app.projects.current_mut().tile_palette.selected = None;
+        // Flip X via a real key press, then RELEASE it: the sticky transform
+        // must persist for the following placement.
+        press_key(&mut app, egui::Key::X);
+        release_key(&app, egui::Key::X);
+
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+
+        // flip_x swaps columns: (0,0) blue -> (1,0); (1,0) green -> (0,0).
+        assert_eq!(px(&app, 4, 0), Some(Color::rgb(0, 255, 0)), "(0,0)=green");
+        assert_eq!(px(&app, 5, 0), Some(Color::rgb(0, 0, 255)), "(1,0)=blue");
+        assert_eq!(px(&app, 4, 1), Some(Color::rgb(255, 255, 0)), "(0,1)=yellow");
+        assert_eq!(px(&app, 5, 1), Some(Color::rgb(255, 0, 0)), "(1,1)=red");
+    }
+
+    /// FIX 2: a ghost Shift+drag rectangle previews the per-cell (sticky-
+    /// oriented) ghost image AND outlines every cell of the rectangle.
+    #[test]
+    fn tile_ghost_shift_rect_previews_ghost_and_outlines() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.ghost_tile = Some(four_color_ghost());
+        app.projects.current_mut().tile_palette.selected = None;
+        // Latch a Shift rect over cells (0,0)..=(1,0), identically to the normal
+        // tile rect path.
+        app.tile_rect_anchor = Some((0, 0));
+        app.tile_rect_current = Some((1, 0));
+        app.tile_rect_deleting = false;
+        let camera = crate::core::camera::Camera::new();
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+
+        // Every cell of the rect is outlined (gesture_cells).
+        assert_eq!(preview.gesture_cells, vec![(0, 0), (1, 0)]);
+        // Each cell previews the 4-colour ghost at its origin.
+        for cx in 0..2u32 {
+            let ox = (cx * 4) as i32;
+            assert!(
+                preview.preview_pixels.contains(&(ox, 0, Color::rgb(0, 0, 255))),
+                "cell {cx} must preview the ghost image, got {:?}",
+                preview.preview_pixels
+            );
+        }
+        // Four ghost pixels per cell = 8 total.
+        assert_eq!(preview.preview_pixels.len(), 8);
+    }
+
+    /// FIX 1: a NON-SQUARE ghost rotated 90° uses SWAPPED dims (w×h -> h×w) for
+    /// the footprint, and ONE undo fully restores the whole footprint.
+    #[test]
+    fn tile_non_square_ghost_rotated_uses_swapped_dims_and_undoes() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        // A 2w × 4h ghost, solid blue.
+        let mut g = vec![0u8; 2 * 4 * 4];
+        for px in g.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0, 0, 255, 255]);
+        }
+        app.ghost_tile = Some((2, 4, g));
+        app.projects.current_mut().tile_palette.selected = None;
+        // Rotate 90° CW: the 2×4 becomes 4×2.
+        app.tile_placer_transform.rotation = 1;
+        app.tile_placer_transform.active = true;
+
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        // Oriented footprint 4×2 at origin (4,0): (4,0)..(7,1) all blue.
+        assert_eq!(px(&app, 4, 0), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(px(&app, 7, 1), Some(Color::rgb(0, 0, 255)), "swapped dims reach row 1 col 7");
+        // The original 2×4 would only reach col 5 / row 3; verify the footprint
+        // is the swapped 4-wide one at (6,0).
+        assert_eq!(px(&app, 6, 0), Some(Color::rgb(0, 0, 255)), "row 0 reaches col 6");
+
+        // ONE undo restores the whole (maximal) footprint.
+        app.undo_document();
+        for y in 0..4usize {
+            for x in 4..8usize {
+                assert_eq!(
+                    px(&app, x, y),
+                    Some(Color::rgba(0, 0, 0, 0)),
+                    "undo must restore footprint ({x},{y})"
+                );
+            }
+        }
+        // Redo re-applies the oriented ghost.
+        app.redo_document();
+        assert_eq!(px(&app, 7, 1), Some(Color::rgb(0, 0, 255)));
+    }
+
+    /// FIX 1 (sticky change): changing rotation changes what the NEXT ghost
+    /// placement writes.
+    #[test]
+    fn tile_ghost_placement_follows_later_rotation_change() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        app.ghost_tile = Some(four_color_ghost());
+        app.projects.current_mut().tile_palette.selected = None;
+
+        // No transform: ghost as-is -> (0,0)=blue.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((5, 3)),
+            ..Default::default()
+        });
+        assert_eq!(px(&app, 4, 0), Some(Color::rgb(0, 0, 255)));
+
+        // Rotate once; the NEXT placement is rotated (0,0)=red.
+        press_key(&mut app, egui::Key::R);
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((9, 3)),
+            ..Default::default()
+        });
+        assert_eq!(px(&app, 8, 0), Some(Color::rgb(255, 0, 0)), "(2,0) origin rotated");
+    }
+
+    /// SHIFT-RECT DELETE: undo restores the pixels and redo re-wipes them (the
+    /// earlier rect test only checked cells + undo count).
+    #[test]
+    fn tile_shift_rect_delete_undo_and_redo_restore_pixels() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 4, 4, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Stamp a 2x2 rect of cells (1,0)-(2,1) via a Shift drag.
+        set_modifiers(
+            &app,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+        // The cell (1,0) footprint pixel (4,0) is baked RED.
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED)
+        );
+
+        // Eraser ON, Shift-drag the same rect to DELETE it.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(true)]);
+        set_modifiers(
+            &app,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((5, 3)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            stroke_point: Some((9, 7)),
+            ..Default::default()
+        });
+        set_modifiers(&app, egui::Modifiers::NONE);
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(Color::rgba(0, 0, 0, 0)),
+            "the rect delete wipes the pixels"
+        );
+
+        // Undo restores the pixels.
+        app.undo_document();
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(RED),
+            "undo restores the rect-deleted pixels"
+        );
+        // Redo re-wipes them.
+        app.redo_document();
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(4, 0),
+            Some(Color::rgba(0, 0, 0, 0)),
+            "redo re-wipes the rect pixels"
+        );
+    }
+
+    /// BLOCKER 2+3: the hover preview must AGREE with the action. With the
+    /// eraser ON, no tile/ghost image is previewed (the action deletes); the
+    /// effect helper is the single precedence point.
+    #[test]
+    fn tile_preview_agrees_with_eraser_and_ghost() {
+        let mut app = App::default();
+        set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        let camera = crate::core::camera::Camera::new();
+        move_pointer(&app, egui::pos2(4.0, 0.0));
+
+        // Stamp mode: the hover previews the tile image (a solid 2x2 tile).
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.hover_cell, Some((1, 0)));
+        assert!(
+            preview.preview_pixels.contains(&(4, 0, RED)),
+            "stamp mode previews the tile image, got {:?}",
+            preview.preview_pixels
+        );
+        assert!(!preview.preview_pixels.is_empty());
+
+        // Eraser ON: the hover shows NO tile image (the action deletes).
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(true)]);
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert_eq!(preview.hover_cell, Some((1, 0)));
+        assert!(
+            preview.preview_pixels.is_empty(),
+            "with the eraser on the preview must not show the tile it will delete"
+        );
+
+        // Eraser OFF + ghost active: the hover shows the GHOST, not the tile.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(false)]);
+        app.ghost_tile = Some((4, 4, [0u8, 0, 255, 255].repeat(16)));
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert!(
+            preview
+                .preview_pixels
+                .contains(&(4, 0, Color::rgb(0, 0, 255))),
+            "an active ghost previews the ghost image, got {:?}",
+            preview.preview_pixels
+        );
+        assert!(
+            !preview
+                .preview_pixels
+                .iter()
+                .any(|(_, _, c)| *c == RED),
+            "the ghost preview must not show the selected tile"
+        );
+
+        // Eraser ON + ghost active: Delete wins over GhostBlit -> no image.
+        app.apply_toolbar_events(vec![ToolbarEvent::TileEraserChanged(true)]);
+        let preview = app.tile_placer_preview_at(&app.ctx, camera, (8, 8));
+        assert!(
+            preview.preview_pixels.is_empty(),
+            "Delete must win over GhostBlit: no ghost image while erasing"
+        );
+    }
+
+    /// SHOULD-FIX 6: Alt+scroll must NOT toggle the eraser; a bare Alt press
+    /// still does.
+    #[test]
+    fn tile_alt_scroll_does_not_toggle_eraser() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = 4;
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+        assert!(!app.tile_placer_transform.eraser);
+
+        // A frame that carries Alt AND a scroll event must not toggle.
+        alt_scroll_frame(&mut app, true);
+        assert!(
+            !app.tile_placer_transform.eraser,
+            "Alt+scroll must not toggle the eraser"
+        );
+
+        // A bare Alt rising edge still toggles.
+        alt_edge_frames(&mut app, false, 1);
+        alt_edge_frames(&mut app, true, 1);
+        assert!(
+            app.tile_placer_transform.eraser,
+            "a bare Alt press toggles the eraser"
+        );
+    }
+
+    /// One frame carrying Alt AND an Alt-scroll wheel event.
+    fn alt_scroll_frame(app: &mut App, alt: bool) {
+        let ctx = app.ctx.clone();
+        let modifiers = egui::Modifiers {
+            alt,
+            ..egui::Modifiers::NONE
+        };
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw_input, |_ui| {
+            app.tick_tile_placer_transform();
+        });
+        output.textures_delta.clear();
+    }
+
+    /// Run `frames` frames with `alt` held, folding the rising edge into the
+    /// sticky transform through the same tick `ui_frame` runs.
+    fn alt_edge_frames(app: &mut App, alt: bool, frames: usize) {
+        let ctx = app.ctx.clone();
+        for _ in 0..frames {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                events: vec![egui::Event::ModifiersChanged(egui::Modifiers {
+                    alt,
+                    ..egui::Modifiers::NONE
+                })],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |_ui| {
+                app.tick_tile_placer_transform();
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    /// Run one frame carrying a Ctrl-modified key PRESS so both the shortcut
+    /// dispatcher and `tick_tile_placer_transform` see it (the existing
+    /// [`ctrl_key_frame`] helper drives the real `ui_frame` path).
+    // (uses the module-level `ctrl_key_frame`)
 
     /// The Tool Property panel is a VIEW over the same transform the keys write:
     /// a rotation edit changes what the NEXT STAMP writes, not just the display.
@@ -22805,20 +24860,20 @@ mod tests {
 
     #[test]
     /// REGRESSION: the Tile tool must be selectable at runtime via the toolbar
-    /// AND the B hotkey (Action::SelectTileTool) — and selecting it routes
+    /// AND the T hotkey (Action::SelectTileTool) — and selecting it routes
     /// canvas clicks to the placer.
-    fn tile_tool_selectable_via_toolbar_and_b_hotkey() {
+    fn tile_tool_selectable_via_toolbar_and_t_hotkey() {
         let mut app = App::default();
         // Toolbar selection.
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         assert_eq!(app.projects.current().tool_state.tool(), Tool::Tile);
-        // B hotkey selects it too (real key-press events through handle_shortcuts).
+        // T hotkey selects it too (real key-press events through handle_shortcuts).
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
         assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
         run_shortcuts(
             &mut app,
             vec![egui::Event::Key {
-                key: egui::Key::B,
+                key: egui::Key::T,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
@@ -22828,7 +24883,7 @@ mod tests {
         assert_eq!(
             app.projects.current().tool_state.tool(),
             Tool::Tile,
-            "the B hotkey must select the Tile tool"
+            "the T hotkey must select the Tile tool"
         );
     }
 
@@ -22876,28 +24931,28 @@ mod tests {
 
     #[test]
     /// REGRESSION (REAL FRAME PATH, app's own context): the user's exact flow —
-    /// select a tile in the palette, press **B** (SelectTileTool), then click the
+    /// select a tile in the palette, press **T** (SelectTileTool), then click the
     /// canvas. The REAL app runs every frame on `self.ctx` (`redraw()` clones it
     /// and `run_ui`s on it), so `handle_shortcuts` — which reads `self.ctx` — sees
-    /// the B key event. The earlier real-frame tests injected events into a
+    /// the T key event. The earlier real-frame tests injected events into a
     /// SEPARATE context, where `handle_shortcuts` read an eventless `self.ctx`
-    /// and the B path was never exercised. This test drives BOTH the B key press
+    /// and the T path was never exercised. This test drives BOTH the T key press
     /// AND the canvas click through the app's own context, exactly like the real
     /// frame loop, and asserts the tile is placed.
-    fn tile_click_via_real_frame_with_b_hotkey_and_palette_selection() {
+    fn tile_click_via_real_frame_with_t_hotkey_and_palette_selection() {
         let mut app = app_with_own_canvas();
         // The user selects a tile in the palette panel (model selection set).
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
         app.projects.current_mut().tile_size = 4;
-        // Switch to Pencil first, then press B — exactly like the user flow.
+        // Switch to Pencil first, then press T — exactly like the user flow.
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
         assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
-        // B press+release through the app's own context (handle_shortcuts reads
+        // T press+release through the app's own context (handle_shortcuts reads
         // `self.ctx`, and `redraw` runs the frame on `self.ctx`).
         run_own_ctx_frame(
             &mut app,
             vec![egui::Event::Key {
-                key: egui::Key::B,
+                key: egui::Key::T,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
@@ -22907,7 +24962,7 @@ mod tests {
         assert_eq!(
             app.projects.current().tool_state.tool(),
             Tool::Tile,
-            "the B key must select the Tile tool through the real frame path"
+            "the T key must select the Tile tool through the real frame path"
         );
         // Click the canvas (through the same app context) at a point clear of
         // every dock panel — a press over ANY panel (body, header band,
@@ -22925,11 +24980,11 @@ mod tests {
             .active_layer()
             .tilemap
             .as_ref()
-            .expect("a real-frame B + click must create the active layer's tilemap");
+            .expect("a real-frame T + click must create the active layer's tilemap");
         assert_eq!(
             tm.cell((18, 18)).map(|c| c.tile_id),
             Some(tile_id),
-            "the real-frame B + click must place the tile at the clicked cell"
+            "the real-frame T + click must place the tile at the clicked cell"
         );
         let session = app.projects.current();
         let composite = session.layers.composite_layers(&session.tile_palette);

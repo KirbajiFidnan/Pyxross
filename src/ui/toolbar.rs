@@ -62,6 +62,8 @@ pub enum ToolbarEvent {
     /// The user toggled the Tile tool's vertical-flip checkbox. Activates
     /// the sticky transform.
     TileFlipYChanged(bool),
+    /// The user toggled the Tile tool's eraser parameter.
+    TileEraserChanged(bool),
     PaletteSelected(usize),
     /// The user swapped the primary and secondary colors (swap button / X key).
     SwapColors,
