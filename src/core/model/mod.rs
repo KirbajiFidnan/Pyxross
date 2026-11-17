@@ -73,12 +73,14 @@ use crate::core::tilemap::{TileMap, TilePalette, TilePixelOverrides};
 
 // R3 frame model: the canvas is the sprite sheet; frames are rect windows
 // into it — never pixel copies.
+pub mod animation_set;
 pub mod composite;
 pub mod frame;
 pub mod group;
 pub mod region;
 pub mod sequence;
 
+pub use animation_set::AnimationSet;
 pub use composite::composite_over;
 pub use frame::Frame;
 pub use region::Region;
@@ -477,6 +479,59 @@ impl LayerStack {
         (self.width, self.height)
     }
 
+    /// Resizes every layer buffer / the tilemap grid to `new_w × new_h`.
+    ///
+    /// Each non-group layer's buffer is rebuilt with
+    /// [`crate::core::canvas_resize::resize_pixels`]: `resample == false` places
+    /// the old pixels 1:1 at `pivot` (grow pads, shrink crops); `resample == true`
+    /// nearest-neighbour scales them. Group layers keep an EMPTY buffer (they
+    /// only composite their children). Each layer's tilemap is re-gridded to
+    /// `ceil(new_w / tile_size.w) × ceil(new_h / tile_size.h)`, preserving the
+    /// top-left cells. Render caches are dropped and the stack is marked changed.
+    pub fn resize_canvas(
+        &mut self,
+        new_w: usize,
+        new_h: usize,
+        pivot: crate::core::canvas_resize::Pivot,
+        resample: bool,
+    ) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        for layer in &mut self.layers {
+            if layer.is_group {
+                // Groups carry no pixels; keep their buffer empty.
+                continue;
+            }
+            let old_w = layer.buffer.width() as u32;
+            let old_h = layer.buffer.height() as u32;
+            let resized = crate::core::canvas_resize::resize_pixels(
+                layer.buffer.as_bytes(),
+                old_w,
+                old_h,
+                new_w as u32,
+                new_h as u32,
+                pivot,
+                resample,
+            );
+            let mut buffer = PixelBuffer::new(new_w, new_h);
+            if resized.len() == buffer.as_bytes().len() {
+                buffer.as_bytes_mut().copy_from_slice(&resized);
+            }
+            layer.buffer = buffer;
+            if let Some(tm) = layer.tilemap.as_mut() {
+                let tile_w = tm.tile_size.w.max(1);
+                let tile_h = tm.tile_size.h.max(1);
+                let cols = (new_w as u32).div_ceil(tile_w);
+                let rows = (new_h as u32).div_ceil(tile_h);
+                tm.resize(cols, rows);
+            }
+            layer.tilemap_cache = RefCell::new(None);
+        }
+        self.width = new_w;
+        self.height = new_h;
+        self.changed = true;
+    }
+
     /// Composites all visible layers (bottom-to-top) over the full canvas.
     ///
     /// `palette` supplies the tile pixels for any layer with a tilemap.
@@ -617,6 +672,7 @@ impl Compositing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tilemap::TileSize;
 
     fn solid(width: usize, height: usize, color: Color) -> PixelBuffer {
         let mut buffer = PixelBuffer::new(width, height);
@@ -1519,5 +1575,75 @@ mod tests {
         let out = stack.composite_layers(&crate::core::tilemap::TilePalette::new());
         assert_eq!(out.width(), 0);
         assert_eq!(out.height(), 0);
+    }
+
+    #[test]
+    fn resize_canvas_resizes_buffers_tilemaps_and_keeps_group_buffers_empty() {
+        use crate::core::canvas_resize::Pivot;
+        let mut stack = LayerStack::new(4, 4);
+        let bg = stack.active_layer_id();
+        stack
+            .active_layer_mut()
+            .buffer
+            .set_pixel(0, 0, Color::rgb(1, 2, 3));
+        stack.active_layer_mut().tilemap = Some(TileMap::new(TileSize::square(4), 1, 1));
+        // A group layer carries an EMPTY buffer and must stay that way.
+        let group = stack.add_layer("Group");
+        {
+            let layer = stack.layer_mut(group).unwrap();
+            layer.is_group = true;
+            layer.buffer = PixelBuffer::new(0, 0);
+        }
+
+        stack.resize_canvas(8, 8, Pivot::TopLeft, false);
+
+        assert_eq!(stack.canvas_size(), (8, 8));
+        let bg_layer = stack.layer(bg).unwrap();
+        assert_eq!(bg_layer.buffer.width(), 8);
+        assert_eq!(bg_layer.buffer.height(), 8);
+        assert_eq!(
+            bg_layer.buffer.get_pixel(0, 0),
+            Some(Color::rgb(1, 2, 3)),
+            "TopLeft pivot keeps the old pixel in place"
+        );
+        let tm = bg_layer.tilemap.as_ref().unwrap();
+        assert_eq!((tm.cols, tm.rows), (2, 2), "ceil(8/4) x ceil(8/4)");
+        assert!(
+            stack.layer(group).unwrap().buffer.is_empty(),
+            "a group layer's buffer stays empty through a resize"
+        );
+    }
+
+    #[test]
+    fn resize_canvas_resample_scales_pixels() {
+        use crate::core::canvas_resize::Pivot;
+        let mut stack = LayerStack::new(2, 2);
+        stack
+            .active_layer_mut()
+            .buffer
+            .set_pixel(0, 0, Color::rgb(9, 8, 7));
+        stack.resize_canvas(4, 4, Pivot::TopLeft, true);
+        let buf = &stack.active_layer().buffer;
+        // NN 2x: the single source pixel covers a 2x2 block.
+        assert_eq!(buf.get_pixel(0, 0), Some(Color::rgb(9, 8, 7)));
+        assert_eq!(buf.get_pixel(1, 1), Some(Color::rgb(9, 8, 7)));
+    }
+
+    #[test]
+    fn resize_canvas_regrids_tilemap_per_axis() {
+        use crate::core::canvas_resize::Pivot;
+        let mut stack = LayerStack::new(8, 16);
+        // 4×8 tiles: cell origins step by (4, 8), so the grid is cols=x/4,
+        // rows=y/8.
+        let tile = TileSize::new(4, 8);
+        stack.active_layer_mut().tilemap = Some(TileMap::new(tile, 2, 2));
+        stack.resize_canvas(16, 32, Pivot::TopLeft, false);
+        let tm = stack.active_layer().tilemap.as_ref().unwrap();
+        assert_eq!(
+            (tm.cols, tm.rows),
+            (4, 4),
+            "ceil(16/4) cols × ceil(32/8) rows"
+        );
+        assert_eq!(tm.tile_size, tile, "the per-axis tile size is preserved");
     }
 }

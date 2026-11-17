@@ -74,12 +74,18 @@ pub const ANT_DASH_PX: f32 = 3.0;
 pub const ANT_GAP_PX: f32 = 3.0;
 /// Marching-ants animation speed in canvas pixels per millisecond.
 ///
-/// Deliberately restrained (3 px/s): the 6 px dash+gap period takes **2 seconds**
-/// for one full rotation, so the dashes read as a gentle drift rather than a
-/// blink. Fast/high-contrast border animation is a photosensitivity hazard,
-/// so the speed and the border's alpha ([`ANT_STROKE_ALPHA`]) are both kept
-/// low; brightness never changes at all.
-pub const ANT_SPEED_PX_PER_MS: f32 = 0.003;
+/// Deliberately restrained (2 px/s — slowed from the former 3 px/s): the 6 px
+/// dash+gap period takes **3 seconds** for one full rotation, so the dashes read
+/// as a gentle drift rather than a blink. Fast/high-contrast border animation is
+/// a photosensitivity hazard, so the speed and the border's alpha
+/// ([`ANT_STROKE_ALPHA`]) are both kept low; brightness never changes at all.
+///
+/// This single constant drives BOTH the legacy rectangular/arc-length walks
+/// ([`ant_phase`], [`mask_dash_segments_from_polylines`]) and the pixel-perfect
+/// [`pixel_ant_edges_from_polylines`] path (which multiplies it by
+/// [`PIXEL_ANT_SUBDIV`]); slowing it here therefore slows every marching-ants
+/// path uniformly.
+pub const ANT_SPEED_PX_PER_MS: f32 = 0.002;
 
 /// Mask marching-ants dash length in canvas pixels.
 ///
@@ -500,6 +506,12 @@ fn cursor_point(
 /// polylines — the O(n) form of [`mask_dash_segments`], which avoids
 /// re-chaining the boundary.
 ///
+/// **LEGACY (superseded by [`pixel_ant_edges_from_polylines`]):** this walk
+/// places dash boundaries at fractional arc lengths, so its output is not
+/// snapped to the document pixel grid. It is no longer on the production paint
+/// path ([`crate::ui::canvas`] uses the pixel-edge generator instead) and is
+/// retained only for API/test compatibility.
+///
 /// `polylines` are the closed, clockwise polygons [`mask_polylines`] yields —
 /// one per connected component (separate blobs and a selection's hole each get
 /// their own loop). This walks **each** loop's edges once with a single forward
@@ -642,6 +654,108 @@ pub fn mask_dash_segments(
     time_ms: u64,
 ) -> Vec<((f32, f32), (f32, f32))> {
     mask_dash_segments_from_polylines(&mask_polylines(segments), time_ms)
+}
+
+/// Subdivision of every document-pixel boundary edge for the pixel-perfect mask
+/// marching ants. [`AntEdge`] coordinates are in SUB-UNITS
+/// (`document_px * PIXEL_ANT_SUBDIV`), so the pattern's smallest step is
+/// `1 / SUBDIV` of a document pixel — the on-screen ant segments are 4× smaller
+/// than one pixel while still landing on the sub-unit grid.
+pub const PIXEL_ANT_SUBDIV: i32 = 4;
+
+/// ON-run length, in SUB-UNITS, of the pixel-perfect mask marching ants.
+/// At [`PIXEL_ANT_SUBDIV`] = 4 this is 0.5 document pixels.
+pub const PIXEL_ANT_DASH_UNITS: i64 = 2;
+/// OFF-run length, in SUB-UNITS, of the pixel-perfect mask marching ants.
+/// At [`PIXEL_ANT_SUBDIV`] = 4 this is 0.5 document pixels (one pixel period).
+pub const PIXEL_ANT_GAP_UNITS: i64 = 2;
+
+/// One marching-ants sub-edge with its state.
+///
+/// `start`/`end` are integer SUB-UNIT coordinates (`document_px *
+/// PIXEL_ANT_SUBDIV`) one sub-unit apart, so each edge is `1 / SUBDIV` of a
+/// document pixel and always snapped to the sub-unit grid — never a subpixel or
+/// anti-aliased position. `on` marks a dash run (`true`) or a gap run (`false`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AntEdge {
+    pub start: (i32, i32),
+    pub end: (i32, i32),
+    pub on: bool,
+}
+
+/// Pixel-perfect marching-ants edges from READY mask polylines.
+///
+/// `polylines` are the closed polygons [`mask_polylines`] yields. Every
+/// document-pixel edge is subdivided into [`PIXEL_ANT_SUBDIV`] sub-edges and
+/// those sub-edges are counted in traversal order: sub-edge `k` is ON when
+/// `(k + phase_units) mod (dash + gap) < dash`. Both the dash and gap runs are
+/// in SUB-UNITS (`2/2` at `SUBDIV = 4` → 0.5 px on / 0.5 px off, a one
+/// document-pixel period), so the ants are **4× smaller** than the former
+/// per-pixel pattern.
+///
+/// The animation phase is scaled by [`PIXEL_ANT_SUBDIV`] so the visual march
+/// speed is unchanged: the pattern advances the same document distance per
+/// millisecond, just in finer sub-unit steps.
+///
+/// Document-pixel sync is now at 1/4-pixel granularity — a deliberate trade
+/// accepted for smaller segments — but positions are still integer SUB-UNIT
+/// values, so the geometry has no subpixel floats and no anti-aliasing. The
+/// counter restarts per loop so disjoint components (and a hole) march in step.
+/// Deterministic; empty input yields nothing.
+pub fn pixel_ant_edges_from_polylines(
+    polylines: &[Vec<(f32, f32)>],
+    time_ms: u64,
+) -> Vec<AntEdge> {
+    let period = PIXEL_ANT_DASH_UNITS + PIXEL_ANT_GAP_UNITS;
+    if period <= 0 || PIXEL_ANT_SUBDIV <= 0 {
+        return Vec::new();
+    }
+    // Continuous phase, quantised to whole SUB-UNITS: the ×SUBDIV keeps the
+    // document-space march speed identical while stepping 4× finer.
+    let phase = (time_ms as f64 * f64::from(ANT_SPEED_PX_PER_MS) * f64::from(PIXEL_ANT_SUBDIV))
+        .floor() as i64;
+    let subdiv = PIXEL_ANT_SUBDIV;
+    let mut edges = Vec::new();
+    for path in polylines {
+        let n = path.len();
+        if n < 2 {
+            continue;
+        }
+        let mut k: i64 = 0;
+        for i in 0..n {
+            // Work in SUB-UNITS so each emitted edge is exactly one sub-unit.
+            let a = (path[i].0 as i32 * subdiv, path[i].1 as i32 * subdiv);
+            let b = (
+                path[(i + 1) % n].0 as i32 * subdiv,
+                path[(i + 1) % n].1 as i32 * subdiv,
+            );
+            let dx = b.0 - a.0;
+            let dy = b.1 - a.1;
+            let steps = dx.abs().max(dy.abs());
+            if steps == 0 {
+                continue;
+            }
+            let sx = dx.signum();
+            let sy = dy.signum();
+            for s in 0..steps {
+                let start = (a.0 + sx * s, a.1 + sy * s);
+                let end = (a.0 + sx * (s + 1), a.1 + sy * (s + 1));
+                let on = (k + phase).rem_euclid(period) < PIXEL_ANT_DASH_UNITS;
+                edges.push(AntEdge { start, end, on });
+                k += 1;
+            }
+        }
+    }
+    edges
+}
+
+/// Pixel-perfect marching-ants edges from raw mask boundary unit segments.
+///
+/// Thin wrapper over [`mask_polylines`] + [`pixel_ant_edges_from_polylines`] for
+/// callers that hold the raw [`BoundarySegment`] list rather than the cached
+/// loops.
+pub fn pixel_ant_edges(segments: &[BoundarySegment], time_ms: u64) -> Vec<AntEdge> {
+    pixel_ant_edges_from_polylines(&mask_polylines(segments), time_ms)
 }
 
 /// Splits the dash spanning arc lengths `[start, end]` into one line piece per
@@ -872,16 +986,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ant_phase_advances_three_px_per_second() {
+    fn ant_phase_advances_two_px_per_second() {
         // Given: representative timestamps spanning more than one dash period.
         // When: the phase is sampled one second apart.
-        // Then: every phase advances by exactly three pixels modulo the period.
+        // Then: every phase advances by exactly two pixels modulo the period
+        // (the slowed 2 px/s speed).
         assert_eq!(ant_phase(0), 0.0);
-        assert!((ant_phase(1000) - 3.0).abs() < 1e-4);
+        assert!((ant_phase(1000) - 2.0).abs() < 1e-4);
         for t in [0u64, 37, 123, 500, 999, 1234] {
             let before = ant_phase(t);
             let after = ant_phase(t + 1000);
-            let expected = (before + 3.0) % 6.0;
+            let expected = (before + 2.0) % 6.0;
             assert!(
                 (after - expected).abs() < 1e-3,
                 "t={t}: {before} -> {after}, expected {expected}"
@@ -890,14 +1005,14 @@ mod tests {
     }
 
     #[test]
-    fn ant_phase_wraps_after_two_seconds() {
-        // Given: the six-pixel dash-plus-gap period at three pixels per second.
-        // When: the phase is sampled around the two-second wrap.
-        // Then: it returns to zero at 2000 ms and immediately advances again.
-        assert!((ant_phase(1999) - 5.997).abs() < 1e-3);
-        assert!((ant_phase(2000) - 0.0).abs() < 1e-3);
-        assert!((ant_phase(2001) - 0.003).abs() < 1e-4);
-        assert!((ant_phase(4000) - 0.0).abs() < 1e-3);
+    fn ant_phase_wraps_after_three_seconds() {
+        // Given: the six-pixel dash-plus-gap period at two pixels per second.
+        // When: the phase is sampled around the three-second wrap.
+        // Then: it returns to zero at 3000 ms and immediately advances again.
+        assert!((ant_phase(2999) - 5.998).abs() < 1e-3);
+        assert!((ant_phase(3000) - 0.0).abs() < 1e-3);
+        assert!((ant_phase(3001) - 0.002).abs() < 1e-4);
+        assert!((ant_phase(6000) - 0.0).abs() < 1e-3);
     }
 
     #[test]
@@ -979,13 +1094,21 @@ mod tests {
     #[test]
     fn ant_segments_phase_shifts_dashes() {
         // Given: a rectangular border whose perimeter spans several dash periods.
-        // When: segments are sampled one second apart at three pixels per second.
-        // Then: the dash geometry moves and begins three pixels along the top edge.
+        // When: segments are sampled one second apart at two pixels per second.
+        // Then: the dash geometry moves and begins two pixels along the top edge.
         let rect = Rect2i::new(0, 0, 12, 12);
         let at_zero = ant_segments(rect, 0);
         let after_one_second = ant_segments(rect, 1000);
         assert_ne!(at_zero, after_one_second);
-        assert_eq!(after_one_second[0], ((3.0, 0.0), (6.0, 0.0)));
+        // With the 2 px/s phase, t=1000 shifts the pattern by 2 px: the first
+        // full dash (0..3 at t=0) becomes a 1 px partial, and the next dash
+        // starts at x = 4.
+        assert_eq!(at_zero[0], ((0.0, 0.0), (3.0, 0.0)));
+        assert_eq!(after_one_second[0], ((0.0, 0.0), (1.0, 0.0)));
+        assert!(
+            after_one_second.iter().any(|&(a, _)| a == (4.0, 0.0)),
+            "the 2 px/s phase must advance the dash start to x = 4"
+        );
     }
 
     #[test]
@@ -1258,11 +1381,11 @@ mod tests {
         let after_one_second = mask_dash_segments(&scrambled, 1_000);
         assert_ne!(at_zero, after_one_second);
         // Mask period 4 (dash 2 + gap 2): at t=0 the first dash covers [0,2),
-        // so its first unit-edge piece is (0,0)→(1,0); at t=1000 the phase is
-        // 3, so the dash starts at arc length 1 and its first piece is
-        // (1,0)→(2,0).
+        // so its first unit-edge piece is (0,0)→(1,0); at t=1000 the slowed
+        // 2 px/s phase is 2, so the dash starts at arc length 2 and its first
+        // piece is (2,0)→(3,0).
         assert_eq!(at_zero[0], ((0.0, 0.0), (1.0, 0.0)));
-        assert_eq!(after_one_second[0], ((1.0, 0.0), (2.0, 0.0)));
+        assert_eq!(after_one_second[0], ((2.0, 0.0), (3.0, 0.0)));
     }
 
     #[test]
@@ -1699,5 +1822,139 @@ mod tests {
             elapsed < 10.0,
             "the O(n) walk must stay under a generous bound; took {elapsed}s"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pixel_ant_edges (pixel-perfect document-space marching ants)
+    // -----------------------------------------------------------------------
+
+    /// The document-space point of a SUB-UNIT coordinate.
+    fn sub_to_doc(p: (i32, i32)) -> (f32, f32) {
+        (
+            p.0 as f32 / PIXEL_ANT_SUBDIV as f32,
+            p.1 as f32 / PIXEL_ANT_SUBDIV as f32,
+        )
+    }
+
+    #[test]
+    fn pixel_ant_edges_cover_every_unit_edge_once() {
+        // Given: a 4×4 square mask boundary (16 document edges), scrambled.
+        // When: the pixel-ants edges are computed.
+        // Then: every document edge is split into SUBDIV sub-unit edges — each
+        // axis-aligned, one SUB-UNIT long, and lying on the mask boundary.
+        let scrambled = scramble_from(square_unit_segments(4), (0, 0));
+        let edges = pixel_ant_edges(&scrambled, 0);
+        let boundary = square_unit_segments(4);
+        assert_eq!(
+            edges.len(),
+            16 * PIXEL_ANT_SUBDIV as usize,
+            "each document edge becomes SUBDIV sub-edges"
+        );
+        for e in &edges {
+            let dx = e.end.0 - e.start.0;
+            let dy = e.end.1 - e.start.1;
+            assert!(
+                (dx == 0) ^ (dy == 0),
+                "edge {:?}→{:?} is not axis-aligned",
+                e.start,
+                e.end
+            );
+            assert_eq!(dx.abs() + dy.abs(), 1, "edge is not one SUB-UNIT long");
+            let (doc_a, doc_b) = (sub_to_doc(e.start), sub_to_doc(e.end));
+            assert!(
+                on_same_segment(&boundary, doc_a, doc_b),
+                "edge {:?}→{:?} is off one mask boundary edge",
+                e.start,
+                e.end
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_ant_edges_split_into_on_and_off_runs() {
+        // Given: the 4×4 square boundary at SUB-UNIT resolution and a 2-on /
+        // 2-off sub-unit pattern.
+        // When: the edges are computed at phase zero.
+        // Then: exactly half are ON dashes and half are OFF gaps.
+        let scrambled = scramble_from(square_unit_segments(4), (0, 0));
+        let edges = pixel_ant_edges(&scrambled, 0);
+        let on = edges.iter().filter(|e| e.on).count();
+        let expected = 16 * PIXEL_ANT_SUBDIV as usize / 2;
+        assert_eq!(on, expected, "a 2/2 sub-unit pattern is half ON");
+        assert_eq!(edges.len() - on, expected, "the rest are OFF gaps");
+    }
+
+    #[test]
+    fn pixel_ant_edges_subdivide_each_document_edge_and_shrink_the_dash() {
+        // Given: a single 1×1 pixel boundary (four 1-px document edges).
+        // When: the pixel-ants edges are computed.
+        // Then: each document edge becomes exactly PIXEL_ANT_SUBDIV sub-unit
+        // edges, and the dash run is 4× smaller than the former 2-px dash
+        // (0.5 document px), while the phase period stays one document pixel.
+        let segments = square_unit_segments(1);
+        let edges = pixel_ant_edges(&segments, 0);
+        assert_eq!(
+            edges.len(),
+            4 * PIXEL_ANT_SUBDIV as usize,
+            "each of the 4 document edges becomes SUBDIV sub-edges"
+        );
+        for e in &edges {
+            let dx = (e.end.0 - e.start.0).abs();
+            let dy = (e.end.1 - e.start.1).abs();
+            assert_eq!(dx + dy, 1, "each sub-edge is one sub-unit long");
+            assert!(dx == 0 || dy == 0, "sub-edge must be axis-aligned");
+        }
+        let on = edges.iter().filter(|e| e.on).count();
+        assert_eq!(
+            on,
+            2 * PIXEL_ANT_SUBDIV as usize,
+            "half the sub-edges are ON (2 on / 2 off per pixel)"
+        );
+        // Dash length in document pixels: 2 sub-units / SUBDIV = 0.5 px, a 4×
+        // reduction from the former per-pixel 2-px dash.
+        let dash_doc_px = PIXEL_ANT_DASH_UNITS as f32 / PIXEL_ANT_SUBDIV as f32;
+        assert_eq!(dash_doc_px, 0.5, "the dash is 4× smaller on screen");
+        let period_doc_px =
+            (PIXEL_ANT_DASH_UNITS + PIXEL_ANT_GAP_UNITS) as f32 / PIXEL_ANT_SUBDIV as f32;
+        assert_eq!(period_doc_px, 1.0, "the pattern period is one document pixel");
+    }
+
+    #[test]
+    fn pixel_ant_edges_phase_quantises_to_sub_units() {
+        // Given: the boundary and the slowed 2 px/s phase, scaled by SUBDIV.
+        // When: the edges are sampled within one SUB-UNIT vs. across the next
+        // sub-unit boundary.
+        // Then: sub-unit times are byte-identical (the pattern never
+        // half-steps) and crossing one sub-unit advances the pattern.
+        let scrambled = scramble_from(square_unit_segments(4), (0, 0));
+        assert_eq!(
+            pixel_ant_edges(&scrambled, 0),
+            pixel_ant_edges(&scrambled, 124),
+            "sub-sub-unit time must not move the pattern"
+        );
+        assert_ne!(
+            pixel_ant_edges(&scrambled, 0),
+            pixel_ant_edges(&scrambled, 125),
+            "crossing one sub-unit must advance the pattern"
+        );
+    }
+
+    #[test]
+    fn pixel_ant_edges_wrapper_matches_polylines() {
+        // Given: a single-component boundary in scrambled order.
+        // When: the edges come from the raw segments vs. the prechained loops.
+        // Then: they are identical.
+        let scrambled = scramble_from(l_shape_unit_segments(), (0, 0));
+        assert_eq!(
+            pixel_ant_edges(&scrambled, 1_234),
+            pixel_ant_edges_from_polylines(&mask_polylines(&scrambled), 1_234)
+        );
+    }
+
+    #[test]
+    fn pixel_ant_edges_empty_is_empty() {
+        assert!(pixel_ant_edges(&[], 0).is_empty());
+        assert!(pixel_ant_edges_from_polylines(&[], 0).is_empty());
+        assert!(pixel_ant_edges_from_polylines(&[vec![(0.0, 0.0)]], 0).is_empty());
     }
 }

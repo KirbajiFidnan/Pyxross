@@ -41,6 +41,13 @@ pub struct ThemeColors {
     pub marching_ants: [u8; 4],
     /// Fixed grey baseline painted under the animated white dashes.
     pub marching_ants_under: [u8; 4],
+    /// Selected-animation frame-region guide: pale-yellow marching-ants dashes
+    /// around every frame region (tool-independent).
+    #[serde(default = "frame_region_ant_default")]
+    pub frame_region_ant: [u8; 4],
+    /// Bordeaux baseline painted under the frame-region dashes.
+    #[serde(default = "frame_region_ant_under_default")]
+    pub frame_region_ant_under: [u8; 4],
 
     // Gizmo
     pub gizmo_outline: [u8; 4],
@@ -52,6 +59,27 @@ pub struct ThemeColors {
     pub onion_prev_tint: [u8; 4],
     pub onion_next_tint: [u8; 4],
 
+    // Frame-edit onion overlay viewports (Fix 5): translucent neighbour regions
+    // painted over the frame-edit viewport. Alpha is baked in at 200/255.
+    /// Light-orange tint for the previous-frame onion overlay.
+    #[serde(default = "onion_prev_view_tint_default")]
+    pub onion_prev_view_tint: [u8; 4],
+    /// Light-blue tint for the next-frame onion overlay.
+    #[serde(default = "onion_next_view_tint_default")]
+    pub onion_next_view_tint: [u8; 4],
+
+    // Onion-skin placer preview tints: opaque light-orange / light-blue tokens
+    // for the onion-skin preview. The alpha is NOT stored here (unlike the
+    // *view* tints above); the painter applies the 75/255 preview alpha itself.
+    // Kept separate from the red/green `onion_prev_tint`/`onion_next_tint`
+    // animation tokens, which must not be repurposed.
+    /// Opaque light-orange tint for the previous-frame onion skin.
+    #[serde(default = "onion_skin_prev_tint_default")]
+    pub onion_skin_prev_tint: [u8; 4],
+    /// Opaque light-blue tint for the next-frame onion skin.
+    #[serde(default = "onion_skin_next_tint_default")]
+    pub onion_skin_next_tint: [u8; 4],
+
     // Panels
     pub panel_bg: [u8; 4],
     pub panel_header_bg: [u8; 4],
@@ -60,6 +88,66 @@ pub struct ThemeColors {
     // egui Selection (used by layers/timeline/toolbar for active state)
     pub selection_bg_fill: [u8; 4],
     pub selection_stroke_color: [u8; 4],
+
+    // File chooser listing (darker than `panel_bg`, with a zebra stripe)
+    /// Background of the file chooser's darker listing well.
+    #[serde(default = "list_bg_default")]
+    pub list_bg: [u8; 4],
+    /// Tint of every alternate ("accordion" zebra) listing row.
+    #[serde(default = "list_stripe_bg_default")]
+    pub list_stripe_bg: [u8; 4],
+}
+
+/// Serde default for [`ThemeColors::onion_prev_view_tint`]: light orange with
+/// alpha 200/255. Keeps pre-existing theme files (which lack the field) loading.
+fn onion_prev_view_tint_default() -> [u8; 4] {
+    [255, 190, 120, 200]
+}
+
+/// Serde default for [`ThemeColors::onion_next_view_tint`]: light blue with
+/// alpha 200/255.
+fn onion_next_view_tint_default() -> [u8; 4] {
+    [130, 190, 255, 200]
+}
+
+/// Serde default for [`ThemeColors::frame_region_ant`]: live yellow (the
+/// frame-region marching-ants dashes; the painter scales it to a higher alpha
+/// than the selection ants so it reads as a clearly visible yellow line).
+/// Keeps pre-existing theme files loading.
+fn frame_region_ant_default() -> [u8; 4] {
+    [255, 214, 51, 255]
+}
+
+/// Serde default for [`ThemeColors::frame_region_ant_under`]: bordeaux (the
+/// solid baseline under the frame-region dashes).
+fn frame_region_ant_under_default() -> [u8; 4] {
+    [123, 45, 59, 255]
+}
+
+/// Serde default for [`ThemeColors::onion_skin_prev_tint`]: OPAQUE light orange
+/// (the painter applies the 75/255 preview alpha). Keeps pre-existing theme
+/// files (which lack the field) loading.
+fn onion_skin_prev_tint_default() -> [u8; 4] {
+    [255, 165, 60, 255]
+}
+
+/// Serde default for [`ThemeColors::onion_skin_next_tint`]: OPAQUE light blue
+/// (the painter applies the 75/255 preview alpha).
+fn onion_skin_next_tint_default() -> [u8; 4] {
+    [90, 170, 255, 255]
+}
+
+/// Serde default for [`ThemeColors::list_bg`]: a near-black well, clearly
+/// darker than the panel background. Keeps pre-existing theme files loading.
+fn list_bg_default() -> [u8; 4] {
+    [26, 26, 26, 255]
+}
+
+/// Serde default for [`ThemeColors::list_stripe_bg`]: the alternate zebra row
+/// tint, a step lighter than [`ThemeColors::list_bg`] but still darker than
+/// the panel. Keeps pre-existing theme files loading.
+fn list_stripe_bg_default() -> [u8; 4] {
+    [34, 34, 34, 255]
 }
 
 /// Generates a `_color32()` (egui) and `_core()` (core [`Color`]) accessor
@@ -97,17 +185,49 @@ impl ThemeColors {
             marching_ants_under32,
             marching_ants_under_core
         ),
+        (frame_region_ant, frame_region_ant32, frame_region_ant_core),
+        (
+            frame_region_ant_under,
+            frame_region_ant_under32,
+            frame_region_ant_under_core
+        ),
         (gizmo_outline, gizmo_outline32, gizmo_outline_core),
         (gizmo_fill_normal, gizmo_fill_normal32, gizmo_fill_normal_core),
         (gizmo_fill_hover, gizmo_fill_hover32, gizmo_fill_hover_core),
         (gizmo_pivot, gizmo_pivot32, gizmo_pivot_core),
         (onion_prev_tint, onion_prev_tint32, onion_prev_tint_core),
         (onion_next_tint, onion_next_tint32, onion_next_tint_core),
+        (
+            onion_prev_view_tint,
+            onion_prev_view_tint32,
+            onion_prev_view_tint_core
+        ),
+        (
+            onion_next_view_tint,
+            onion_next_view_tint32,
+            onion_next_view_tint_core
+        ),
+        (onion_skin_prev_tint, onion_skin_prev_tint32, onion_skin_prev_tint_core),
+        (onion_skin_next_tint, onion_skin_next_tint32, onion_skin_next_tint_core),
         (panel_bg, panel_bg32, panel_bg_core),
         (panel_header_bg, panel_header_bg32, panel_header_bg_core),
         (panel_border, panel_border32, panel_border_core),
         (selection_bg_fill, selection_bg_fill32, selection_bg_fill_core),
         (selection_stroke_color, selection_stroke_color32, selection_stroke_color_core),
+        (list_bg, list_bg32, list_bg_core),
+        (list_stripe_bg, list_stripe_bg32, list_stripe_bg_core),
+    }
+
+    /// The `onion_skin_prev_tint` token as a core [`Color`] — OPAQUE light
+    /// orange. The painter applies the 75/255 onion-preview alpha.
+    pub fn onion_skin_prev_tint(&self) -> Color {
+        Color::from(self.onion_skin_prev_tint)
+    }
+
+    /// The `onion_skin_next_tint` token as a core [`Color`] — OPAQUE light
+    /// blue. The painter applies the 75/255 onion-preview alpha.
+    pub fn onion_skin_next_tint(&self) -> Color {
+        Color::from(self.onion_skin_next_tint)
     }
 
     pub fn gizmo_colors(&self) -> crate::render::gizmo::GizmoColors {
@@ -234,17 +354,25 @@ impl Theme {
                 selection_stroke: [80, 160, 255, 255],
                 marching_ants: [255, 255, 255, 255],
                 marching_ants_under: [96, 96, 96, 255],
+                frame_region_ant: frame_region_ant_default(),
+                frame_region_ant_under: frame_region_ant_under_default(),
                 gizmo_outline: [255, 255, 255, 255],
                 gizmo_fill_normal: [255, 255, 255, 180],
                 gizmo_fill_hover: [100, 180, 255, 255],
                 gizmo_pivot: [255, 100, 100, 255],
                 onion_prev_tint: [255, 80, 80, 255],
                 onion_next_tint: [80, 255, 80, 255],
+                onion_prev_view_tint: onion_prev_view_tint_default(),
+                onion_next_view_tint: onion_next_view_tint_default(),
+                onion_skin_prev_tint: onion_skin_prev_tint_default(),
+                onion_skin_next_tint: onion_skin_next_tint_default(),
                 panel_bg: [42, 42, 42, 255],
                 panel_header_bg: [58, 58, 58, 255],
                 panel_border: [74, 74, 74, 255],
                 selection_bg_fill: [58, 106, 154, 255],
                 selection_stroke_color: [255, 255, 255, 255],
+                list_bg: list_bg_default(),
+                list_stripe_bg: list_stripe_bg_default(),
             },
             skins: HashMap::new(),
         }

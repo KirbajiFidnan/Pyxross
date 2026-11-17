@@ -71,7 +71,7 @@ impl Component for ToolPropertyComponent {
             Tool::Tile => {
                 self.tile_properties(ui, &view);
             }
-            Tool::Eyedropper | Tool::Draw => {
+            Tool::Eyedropper | Tool::Draw | Tool::AnimationPlacer => {
                 ui.weak(TOOL_PROPERTY_PLACEHOLDER);
             }
         }

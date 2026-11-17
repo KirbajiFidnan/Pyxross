@@ -121,6 +121,10 @@ fn action_label(action: Action) -> &'static str {
         Action::SelectLasso => "Select lasso",
         Action::SelectFill => "Select fill",
         Action::SelectTileTool => "Select tile tool",
+        Action::SelectAnimationPlacer => "Select animation placer (A)",
+        Action::SaveProject => "Save project",
+        Action::SaveProjectAs => "Save project as",
+        Action::OpenProject => "Open project",
     }
 }
 
@@ -145,7 +149,7 @@ fn binding_label(binding: Option<KeyBinding>) -> String {
     parts.join("+")
 }
 
-fn logical_keys() -> [crate::input::LogicalKey; 22] {
+fn logical_keys() -> [crate::input::LogicalKey; 24] {
     [
         crate::input::LogicalKey::Z,
         crate::input::LogicalKey::Y,
@@ -169,6 +173,8 @@ fn logical_keys() -> [crate::input::LogicalKey; 22] {
         crate::input::LogicalKey::L,
         crate::input::LogicalKey::B,
         crate::input::LogicalKey::T,
+        crate::input::LogicalKey::A,
+        crate::input::LogicalKey::O,
     ]
 }
 
@@ -196,6 +202,8 @@ fn key_label(key: crate::input::LogicalKey) -> &'static str {
         crate::input::LogicalKey::L => "L",
         crate::input::LogicalKey::B => "B",
         crate::input::LogicalKey::T => "T",
+        crate::input::LogicalKey::A => "A",
+        crate::input::LogicalKey::O => "O",
     }
 }
 

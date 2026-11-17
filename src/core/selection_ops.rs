@@ -12,6 +12,7 @@ use crate::core::buffer::PixelBuffer;
 use crate::core::clip::PixelClip;
 use crate::core::color::Color;
 use crate::core::math::Rect2i;
+use crate::core::tilemap::TileSize;
 
 /// 4-connected neighbourhood offsets.
 const NEIGHBORS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
@@ -280,23 +281,34 @@ pub fn polygon_area(points: &[(i32, i32)]) -> f64 {
 }
 
 /// The grid cell rect containing `(x, y)` for a `tile`-sized grid.
-fn cell_rect(cx: i32, cy: i32, tile: i32) -> Rect2i {
-    Rect2i::new(cx.saturating_mul(tile), cy.saturating_mul(tile), tile, tile)
+fn cell_rect(cx: i32, cy: i32, tile_w: i32, tile_h: i32) -> Rect2i {
+    Rect2i::new(
+        cx.saturating_mul(tile_w),
+        cy.saturating_mul(tile_h),
+        tile_w,
+        tile_h,
+    )
 }
 
 /// Every grid cell the segment `origin -> dest` passes through.
 ///
 /// Cells are walked one at a time (Amanatides & Woo), deduplicated, and
-/// returned in traversal order.  `tile_size` 0 is treated as 1.
-pub fn tile_cells_on_segment(origin: (i32, i32), dest: (i32, i32), tile_size: u32) -> Vec<Rect2i> {
-    let tile = tile_size.max(1).min(i32::MAX as u32) as i32;
+/// returned in traversal order. Grid steps are PER AXIS (`tile_size.w` for x,
+/// `tile_size.h` for y); a zero axis is treated as 1.
+pub fn tile_cells_on_segment(
+    origin: (i32, i32),
+    dest: (i32, i32),
+    tile_size: TileSize,
+) -> Vec<Rect2i> {
+    let tile_w = tile_size.w.max(1).min(i32::MAX as u32) as i32;
+    let tile_h = tile_size.h.max(1).min(i32::MAX as u32) as i32;
     let (ox, oy) = origin;
     let (dx, dy) = dest;
 
-    let mut cx = ox.div_euclid(tile);
-    let mut cy = oy.div_euclid(tile);
-    let ex = dx.div_euclid(tile);
-    let ey = dy.div_euclid(tile);
+    let mut cx = ox.div_euclid(tile_w);
+    let mut cy = oy.div_euclid(tile_h);
+    let ex = dx.div_euclid(tile_w);
+    let ey = dy.div_euclid(tile_h);
 
     let vx = (dx - ox) as f64;
     let vy = (dy - oy) as f64;
@@ -316,14 +328,14 @@ pub fn tile_cells_on_segment(origin: (i32, i32), dest: (i32, i32), tile_size: u3
     };
 
     let next_x = if step_x > 0 {
-        (cx + 1) as f64 * tile as f64
+        (cx + 1) as f64 * tile_w as f64
     } else {
-        cx as f64 * tile as f64
+        cx as f64 * tile_w as f64
     };
     let next_y = if step_y > 0 {
-        (cy + 1) as f64 * tile as f64
+        (cy + 1) as f64 * tile_h as f64
     } else {
-        cy as f64 * tile as f64
+        cy as f64 * tile_h as f64
     };
     let mut t_max_x = if vx != 0.0 {
         (next_x - ox as f64) / vx
@@ -336,19 +348,19 @@ pub fn tile_cells_on_segment(origin: (i32, i32), dest: (i32, i32), tile_size: u3
         f64::INFINITY
     };
     let t_delta_x = if vx != 0.0 {
-        tile as f64 / vx.abs()
+        tile_w as f64 / vx.abs()
     } else {
         f64::INFINITY
     };
     let t_delta_y = if vy != 0.0 {
-        tile as f64 / vy.abs()
+        tile_h as f64 / vy.abs()
     } else {
         f64::INFINITY
     };
 
     let mut cells: Vec<Rect2i> = Vec::new();
     loop {
-        let rect = cell_rect(cx, cy, tile);
+        let rect = cell_rect(cx, cy, tile_w, tile_h);
         if cells.last() != Some(&rect) {
             cells.push(rect);
         }
@@ -619,7 +631,7 @@ mod tests {
 
     #[test]
     fn tile_cells_on_segment_covers_crossed_cells_only() {
-        let cells = tile_cells_on_segment((5, 5), (25, 5), 10);
+        let cells = tile_cells_on_segment((5, 5), (25, 5), TileSize::square(10));
         assert_eq!(
             cells,
             vec![
@@ -630,7 +642,7 @@ mod tests {
         );
 
         // tile_size 0 is treated as 1.
-        let single = tile_cells_on_segment((0, 0), (3, 0), 0);
+        let single = tile_cells_on_segment((0, 0), (3, 0), TileSize::square(0));
         assert_eq!(
             single,
             vec![

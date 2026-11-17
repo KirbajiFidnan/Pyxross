@@ -6,6 +6,7 @@
 
 - **Startup [D31]:** editor opens directly, with an empty default document. No launcher screen, no startup dialog.
 - New/Open/Save live in the File menu. The **New dialog** asks canvas size + tile size (default preset assumption: 256×256 canvas, 16×16 tiles — confirm in R6).
+- **Save As [D82]:** always writes a single `.pyxross` file. The panel has **no** directory/single-file choice — only a static **`.pyxross`** format label. In-place **Ctrl+S** is unchanged (keeps the current path); only Save As is affected.
 - Closing with unsaved changes → save prompt. Crash on next launch → recovery offer (see PERSISTENCE.md).
 
 ## 2. Default Layout (Pyxel Edit-faithful)
@@ -52,3 +53,39 @@
 
 - All panels and widgets are **built in code** (egui); no separate UI definition files.
 - Reasons: immediate-mode simplicity, skin-system integration, diff-friendly iteration.
+
+## 7. File Manager [D81, D82]
+
+Native/portal file dialogs are removed (D81): the **File Manager** panel (id 208) is the only picker for files and folders. It is presented as a **floating window titled "File Manager"**.
+
+- **One reusable panel, three modes.** The mode sets the list filter and the OK label:
+  - **Open Project** — `.pyxross` (directory or single-file, D80) + `manifest.json` + directories.
+  - **Import PNG** — `*.png` + directories.
+  - **Choose Folder** — directories only.
+- **Top toolbar:** back ◀ / forward ▶ (disabled when there is no history in that direction); **Up** (disabled at the filesystem root); **New folder "+"**; an editable current-path field with a **▾ dropdown** that jumps to a parent directory.
+- **List area:** a scrollable **well** that is **darker than the rest of the panel** (`list_bg`) and grows/shrinks with the panel. Rows use a **light/dark zebra** (`list_stripe_bg`) and look like the Layers-panel rows — **not buttons**. **Folders expand/collapse in place** with a `+`/`-` twisty (accordion, nestable), with **files listed last**. A single click selects; a double-click on a folder navigates into it; a double-click on a file confirms.
+- **Bottom row:** a **"File name:"** editable field with a quick-pick **▾**; a **"File type:"** dropdown (defaults to the mode's filter — **"All formats" only widens the list**, while confirmation is still validated against the mode's filter); and **OK / Cancel**.
+- **Keyboard:** Enter confirms, Esc cancels.
+- **Chrome:** every color comes from theme tokens — no hard-coded colors (CONTEXT hard rule 3). Two tokens back the list: **`list_bg`** (the darker well) and **`list_stripe_bg`** (the zebra stripe); both have a built-in default and a `serde` default, and the shipped `theme.json` is unchanged. The panel is drawn through the existing panel system (float-only, static nest).
+- **Save As integration:** the Save As panel's **"Change…"** opens the File Manager in **ChooseFolder** mode; the chosen folder is written back as the Save As destination.
+
+## 8. Import Panels [D83, D84]
+
+Both import panels share the base behavior of the Save As (id 207) and Create Document panels: **float-only**, **`NestMode::Static`**, and **not resizable** — they are moved only by dragging, never detached or resized. Their files arrive from the **File Manager** (Import GIF → `.gif` filter; Import Images → `.png` filter).
+
+### Import GIF [D83]
+
+- **Menu:** File → **"Import GIF…"** opens the File Manager filtered to `.gif`; the chosen file opens the **"Import GIF"** panel (id 209).
+- **Content:** a **"Line length"** input (how many regions sit side by side per row). The frames are tiled left-to-right, row by row; when the frame count does not fill the last row, the surplus cells stay **empty** (e.g. 22 frames at line length 4 → a 4×6 grid with 2 empty cells).
+- Import does not modify the current document; the content opens as a **new document** at its own size, named after the file's stem ("Untitled" if none).
+- **OK / Cancel** placed **symmetrically** near the bottom center.
+
+### Import Image [D84]
+
+- **Menu:** File → **"Import Images…"** opens the File Manager filtered to `.png`; the chosen file opens the **"Import Image"** panel (id 210).
+- **Content:** two **live-linked** inputs — **"Split by pixels"** (region size, W×H) and **"Split by number of regions"** (grid count, W×H) — laid out **symmetrically** about the center. Editing one updates the other immediately (two-way, `ceil`).
+- When the split does not divide evenly, the content size rounds up to the nearest divisible number and opens as a **new document**.
+- Import does not modify the current document; the content opens as a **new document** at its own size, named after the file's stem ("Untitled" if none).
+- **OK / Cancel** placed **symmetrically** near the bottom center.
+
+Both panels color strictly from theme tokens (no hard-coded colors — CONTEXT hard rule 3).

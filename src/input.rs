@@ -38,10 +38,17 @@ pub enum Action {
     SelectLasso,
     SelectFill,
     SelectTileTool,
+    SelectAnimationPlacer,
+    /// Save the active project (default key: Ctrl/Cmd+S).
+    SaveProject,
+    /// Save the active project under a new directory (Ctrl/Cmd+Shift+S).
+    SaveProjectAs,
+    /// Open a project directory (Ctrl/Cmd+O).
+    OpenProject,
 }
 
 impl Action {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 31] = [
         Self::Undo,
         Self::Redo,
         Self::Copy,
@@ -69,6 +76,10 @@ impl Action {
         Self::SelectLasso,
         Self::SelectFill,
         Self::SelectTileTool,
+        Self::SelectAnimationPlacer,
+        Self::SaveProject,
+        Self::SaveProjectAs,
+        Self::OpenProject,
     ];
 }
 
@@ -97,6 +108,8 @@ pub enum LogicalKey {
     L,
     B,
     T,
+    A,
+    O,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
@@ -230,6 +243,8 @@ impl Keymap {
             LogicalKey::L => egui::Key::L,
             LogicalKey::B => egui::Key::B,
             LogicalKey::T => egui::Key::T,
+            LogicalKey::A => egui::Key::A,
+            LogicalKey::O => egui::Key::O,
         };
         hit(key)
     }
@@ -294,12 +309,16 @@ mod keymap_tests {
             let count = Action::ALL
                 .iter()
                 .filter(|action| {
-                    keymap
-                        .binding(**action)
-                        .is_some_and(|binding| binding.key == key)
+                    keymap.binding(**action).is_some_and(|binding| {
+                        binding.key == key && binding.modifiers == Modifiers::default()
+                    })
                 })
                 .count();
-            assert_eq!(count, 1, "{key:?} must be bound to exactly one action");
+            assert_eq!(
+                count, 1,
+                "{key:?} must be bound to exactly one UNMODIFIED action \
+                 (a modified binding like Ctrl+S is a distinct shortcut)"
+            );
         }
     }
 
@@ -422,6 +441,40 @@ mod keymap_tests {
             egui::Modifiers::NONE
         ));
     }
+
+    #[test]
+    fn file_shortcuts_resolve_to_their_actions() {
+        let keymap = Keymap::defaults();
+        let ctx = egui::Context::default();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        assert!(pressed(&ctx, &keymap, Action::SaveProject, egui::Key::S, ctrl));
+        assert!(pressed(
+            &ctx,
+            &keymap,
+            Action::SaveProjectAs,
+            egui::Key::S,
+            ctrl_shift
+        ));
+        assert!(pressed(&ctx, &keymap, Action::OpenProject, egui::Key::O, ctrl));
+        // A bare S is the rectangle selector, never Save.
+        assert!(!pressed(
+            &ctx,
+            &keymap,
+            Action::SaveProject,
+            egui::Key::S,
+            egui::Modifiers::NONE
+        ));
+    }
 }
 
 /// The active editing tool.
@@ -452,6 +505,11 @@ pub enum Tool {
     /// selectable from the UI; treated as the Pen's mode wherever a match needs
     /// a behaviour.
     Draw,
+    /// Animation placer (Phase 3): auto-indexes animation frames from a
+    /// rectangle of sheet cells. Selected by the `A` hotkey and listed in the
+    /// toolbox. A primary drag defines the rectangle and on release its cells
+    /// are walked row-major into the ACTIVE animation; a bare click is a no-op.
+    AnimationPlacer,
 }
 
 /// The active Fieldier child: which selection behaviour the Fieldier performs.

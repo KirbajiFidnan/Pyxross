@@ -54,8 +54,8 @@ pub enum TilePalettePanelEvent {
     /// Make the tile with this id the selected placement source and switch to
     /// the Tile tool.
     Select(TileId),
-    /// Append a new EMPTY tile (`tile_size` × `tile_size`, transparent) and
-    /// select it.
+    /// Append a new EMPTY tile (one tile cell, `tile_size.w` × `tile_size.h`,
+    /// transparent) and select it.
     AddEmpty,
     /// Remove the tile with this id.
     Delete(TileId),

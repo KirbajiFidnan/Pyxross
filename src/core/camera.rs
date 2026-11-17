@@ -1,13 +1,13 @@
-//! Camera — integer-snapped zoom (10–3200%) and pan state.
+//! Camera — integer-snapped zoom (10–12800%) and pan state.
 //!
 //! Coordinate convention: a canvas pixel at canvas coord `c` spans screen pixels
 //! `[pan + c*scale, pan + (c+1)*scale)`.
 //!
-//! Zoom levels are integer percentages in `10..=3200` (nearest-neighbor everywhere).
+//! Zoom levels are integer percentages in `10..=12800` (nearest-neighbor everywhere).
 
 use crate::core::math::Rect2i;
 
-/// Integer-snapped zoom (10%–3200%) and pan state.
+/// Integer-snapped zoom (10%–12800%) and pan state.
 ///
 /// `zoom_percent` is an integer percentage in `[MIN_ZOOM_PERCENT, MAX_ZOOM_PERCENT]`;
 /// `pan` is the canvas-space offset of the viewport's top-left corner, in canvas
@@ -22,8 +22,12 @@ pub struct Camera {
 impl Camera {
     /// Minimum zoom: 10%.
     pub const MIN_ZOOM_PERCENT: u32 = 10;
-    /// Maximum zoom: 3200%.
-    pub const MAX_ZOOM_PERCENT: u32 = 3200;
+    /// Maximum zoom: 12800% (128×).
+    ///
+    /// Raised from 3200% so the Frame Edit viewport can zoom deep into a single
+    /// frame region for pixel-accurate editing. This is a GLOBAL cap, so the
+    /// main canvas can also zoom to 12800%.
+    pub const MAX_ZOOM_PERCENT: u32 = 12_800;
 
     /// New camera: 100% zoom, pan (0, 0).
     pub fn new() -> Self {

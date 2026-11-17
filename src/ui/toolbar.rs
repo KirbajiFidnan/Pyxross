@@ -70,13 +70,14 @@ pub enum ToolbarEvent {
 }
 
 /// All tools in toolbox display order.
-pub(crate) const TOOLS: [Tool; 6] = [
+pub(crate) const TOOLS: [Tool; 7] = [
     Tool::Pencil,
     Tool::Eraser,
     Tool::Fill,
     Tool::Eyedropper,
     Tool::Fieldier,
     Tool::Tile,
+    Tool::AnimationPlacer,
 ];
 
 /// Display label for a tool.
@@ -89,6 +90,7 @@ pub(crate) fn tool_label(tool: Tool) -> &'static str {
         Tool::Fieldier => "Fieldier",
         Tool::Tile => "Tile",
         Tool::Draw => "Draw",
+        Tool::AnimationPlacer => "Animation",
     }
 }
 
@@ -738,7 +740,7 @@ mod tests {
 
     #[test]
     fn toolbox_lists_only_the_real_tools() {
-        assert_eq!(TOOLS.len(), 6);
+        assert_eq!(TOOLS.len(), 7);
         assert!(
             !TOOLS.contains(&Tool::Draw),
             "the hidden Draw tool must never be selectable from the toolbox"
@@ -748,9 +750,13 @@ mod tests {
         }
         assert!(TOOLS.contains(&Tool::Fieldier));
         assert!(TOOLS.contains(&Tool::Tile));
+        assert!(
+            TOOLS.contains(&Tool::AnimationPlacer),
+            "the animation placer is a real toolbox tool"
+        );
         assert_eq!(
             TOOLS.len(),
-            6,
+            7,
             "rectangle/wand/lasso are Fieldier children, not separate toolbox entries"
         );
     }

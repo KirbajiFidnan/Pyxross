@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn right_dock_panels_share_width_and_stack_downward() {
-        let manager = DockManager::demo();
+        let manager = DockManager::demo_with_dummies();
         let dock = Rect::from_min_max(pos2(400.0, 0.0), pos2(640.0, 480.0));
         let panels = manager.panel_rects(DockSide::Right, dock);
 
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn last_bottom_dock_panel_fills_remaining_width() {
-        let manager = DockManager::demo();
+        let manager = DockManager::demo_with_dummies();
         let dock = Rect::from_min_max(pos2(0.0, 300.0), pos2(640.0, 480.0));
         let panels = manager.panel_rects(DockSide::Bottom, dock);
 
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn left_dock_panels_stack_downward_and_fill_width() {
-        let mut manager = DockManager::demo();
+        let mut manager = DockManager::demo_with_dummies();
         manager
             .transition_panel(PanelId::new(3), PanelPlacement::DockedLeft)
             .unwrap();
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn left_dock_resize_uses_the_horizontal_axis() {
-        let mut manager = DockManager::demo();
+        let mut manager = DockManager::demo_with_dummies();
         manager
             .transition_panel(PanelId::new(3), PanelPlacement::DockedLeft)
             .unwrap();

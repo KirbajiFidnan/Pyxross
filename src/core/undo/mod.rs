@@ -1128,7 +1128,7 @@ mod tests {
 
         let mut layers = LayerStack::new(8, 8);
         let lid = layers.active_layer_id();
-        layers.layer_mut(lid).unwrap().tilemap = Some(TileMap::new(4, 2, 2));
+        layers.layer_mut(lid).unwrap().tilemap = Some(TileMap::new(crate::core::tilemap::TileSize::square(4), 2, 2));
         let before = TileCell::new(TileId(1));
         let after = TileCell {
             tile_id: TileId(2),

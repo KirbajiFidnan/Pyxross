@@ -3,7 +3,7 @@
 //! tile bytes.
 //!
 //! Core invariant: for every occupied tilemap cell, the layer buffer's
-//! footprint rect `(cx*tile_size, cy*tile_size, ow, oh)` (ow/oh = oriented tile
+//! footprint rect `(cx*tile_size.w, cy*tile_size.h, ow, oh)` (ow/oh = oriented tile
 //! dims) holds EXACTLY the oriented root-tile bytes. Editing a canvas cell that
 //! a tile covers writes BACK to the root tile (un-oriented) and re-stamps ALL
 //! instances of that tile on every layer, so the root data stays the single
@@ -85,15 +85,16 @@ fn cell_footprints(
 ) -> Option<(TileCell, u32, u32, Rect2i)> {
     let cell = tm.cell((cx, cy))?;
     let tile = pal.get(cell.tile_id)?;
-    let tile_size = tm.tile_size.max(1);
+    let tile_w = tm.tile_size.w.max(1);
+    let tile_h = tm.tile_size.h.max(1);
     let rotated = cell.rotation % 2 == 1;
     let (ow, oh) = if rotated {
         (u32::from(tile.h), u32::from(tile.w))
     } else {
         (u32::from(tile.w), u32::from(tile.h))
     };
-    let ox = (cx as u64 * u64::from(tile_size)) as i32;
-    let oy = (cy as u64 * u64::from(tile_size)) as i32;
+    let ox = (cx as u64 * u64::from(tile_w)) as i32;
+    let oy = (cy as u64 * u64::from(tile_h)) as i32;
     Some((cell, ow, oh, Rect2i::new(ox, oy, ow as i32, oh as i32)))
 }
 
@@ -393,7 +394,7 @@ pub fn blit_one_cell(
 mod tests {
     use super::*;
     use crate::core::model::LayerStack;
-    use crate::core::tilemap::{Tile, TileCell, TileId};
+    use crate::core::tilemap::{Tile, TileCell, TileId, TileSize};
     use crate::core::undo::Command;
 
     fn solid_tile(id: u64, w: u16, h: u16, color: [u8; 4]) -> Tile {
@@ -476,7 +477,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255])); // root tile
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         // Two cells both reference tile 1: (0,0) identity, (1,0) identity.
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         tm.set_cell((1, 0), Some(TileCell::new(TileId(1))));
@@ -528,7 +529,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         tm.set_cell((1, 1), Some(TileCell::new(TileId(1)))); // far from origin
         layers.layer_mut(lid).unwrap().tilemap = Some(tm);
         re_stamp_tile_instances(&mut layers, &palette, &[TileId(1)]);
@@ -550,7 +551,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         layers.layer_mut(lid).unwrap().tilemap = Some(tm);
         re_stamp_tile_instances(&mut layers, &palette, &[TileId(1)]);
@@ -572,7 +573,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         tm.set_cell((1, 0), Some(TileCell::new(TileId(1))));
         layers.layer_mut(lid).unwrap().tilemap = Some(tm);
@@ -636,7 +637,7 @@ mod tests {
             ]
             .concat(),
         });
-        let mut tm = TileMap::new(1, 8, 6);
+        let mut tm = TileMap::new(TileSize::square(1), 8, 6);
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         tm.set_cell(
             (1, 0),
@@ -736,7 +737,7 @@ mod tests {
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
         for lid in [lid_a, lid_b] {
-            let mut tm = TileMap::new(4, 2, 2);
+            let mut tm = TileMap::new(TileSize::square(4), 2, 2);
             tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
             layers.layer_mut(lid).unwrap().tilemap = Some(tm);
         }
@@ -765,7 +766,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         tm.set_cell((1, 0), Some(TileCell::new(TileId(1))));
         layers.layer_mut(lid).unwrap().tilemap = Some(tm);
@@ -827,7 +828,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         layers.layer_mut(lid).unwrap().tilemap = Some(tm);
         // Bake via blit_cell.
@@ -870,7 +871,7 @@ mod tests {
         let lid = layers.active_layer_id();
         let mut palette = TilePalette::new();
         palette.add(solid_tile(1, 2, 2, [10, 20, 30, 255]));
-        let mut tm = TileMap::new(4, 2, 2);
+        let mut tm = TileMap::new(TileSize::square(4), 2, 2);
         tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         layers.layer_mut(lid).unwrap().tilemap = Some(tm);
         re_stamp_tile_instances(&mut layers, &palette, &[TileId(1)]);

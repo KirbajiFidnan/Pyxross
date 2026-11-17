@@ -11,13 +11,24 @@
 //! state and applies panel events as undoable commands (D59, D62). Toolbar and
 //! layer panels are pure views that only emit events.
 
+mod animation_hosts;
 pub mod canvas;
 pub mod clipboard;
+pub mod dock_animation_preview_panel;
+pub mod dock_animation_settings;
+pub mod dock_animations_panel;
 pub mod dock_color_palette_panel;
 pub mod dock_color_picker_panel;
+pub mod dock_create_document_panel;
+pub mod dock_file_chooser_panel;
+pub mod dock_save_as_panel;
+pub mod dock_frame_edit_panel;
 pub mod dock_hosts;
+pub mod dock_import_gif_panel;
+pub mod dock_import_image_panel;
 pub mod dock_layers_panel;
 pub mod dock_layers_settings;
+pub mod dock_resize_canvas_panel;
 pub mod dock_tile_palette_panel;
 pub mod dock_tool_property_panel;
 pub mod dock_toolbox_panel;
@@ -34,8 +45,8 @@ pub mod project_tabs;
 pub mod projection;
 pub mod settings;
 pub mod theme;
-pub mod timeline;
 pub mod toolbar;
+pub mod top_bar;
 pub mod workspace_persistence;
 pub mod workspace_runtime;
 
@@ -57,15 +68,16 @@ use crate::core::layer_commands::{
 use crate::core::math::Rect2i;
 use crate::core::model::frame::Frame;
 use crate::core::model::region::Region;
-use crate::core::model::sequence::AnimationSequence;
-use crate::core::model::sequence::MAX_FRAMES;
+use crate::core::model::sequence::{AnimationSequence, MAX_FRAMES};
 use crate::core::model::{LayerId, LayerStack};
 use crate::core::select::{
     delete_selected_command, flip_selected_command, rotate_selected_command, SelectMode, Selection,
 };
 use crate::core::stroke_command::StrokeSession;
 use crate::core::tile_edit;
-use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette, TilePixelOverrides};
+use crate::core::tilemap::{
+    Tile, TileCell, TileId, TileMap, TilePalette, TilePixelOverrides, TileSize,
+};
 use crate::core::transform::{
     CurveTransform, LayerBuffer, LayerCommit, TransformAlgorithm, TransformObject, GIZMO_HIT_RADIUS,
 };
@@ -75,10 +87,10 @@ use crate::core::undo::{
 };
 use crate::input::{FieldierChild, Keymap, Tool};
 use crate::io::{
-    autosave_dir_for, clear_recovery_journal, decode_png, encode_gif, encode_png, load_document,
-    load_keymap, load_palettes, load_project_palettes, read_recovery_journal, save_document,
-    save_keymap, sprite_sheet_meta_json, user_keymap_path, user_palette_dir,
-    write_recovery_journal, GifFrameInput, RecoveryJournal,
+    autosave_dir_for, clear_recovery_journal, decode_gif, decode_png, encode_gif, encode_png,
+    load_document, load_keymap, load_palettes, load_project_palettes, read_recovery_journal,
+    save_document, save_document_file, save_keymap, sprite_sheet_meta_json, user_keymap_path,
+    user_palette_dir, write_recovery_journal, GifDecode, GifFrameInput, RecoveryJournal,
 };
 use crate::render::gizmo::GizmoHit;
 use crate::render::RendererState;
@@ -106,7 +118,6 @@ use project::{
 use project_tabs::ProjectTabBar;
 use settings::SettingsPanel;
 use theme::{load_atlas_with_size, ThemeManager};
-use timeline::{clamp_reorder_target, TimelineEvent, TimelinePanel};
 use toolbar::{ToolbarEvent, ToolbarWidget};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -141,6 +152,11 @@ impl<T> NativeHostRetirement<T> {
 const CANVAS_WIDTH: usize = 128;
 const CANVAS_HEIGHT: usize = 128;
 
+/// Imported sheet canvases (Import GIF / Import Image) may not exceed this on
+/// either axis after growth — the same per-axis cap the create/resize panels
+/// enforce. Cells are additionally gated by [`MAX_FRAMES`].
+const IMPORT_MAX_CANVAS_SIDE: u32 = 4096;
+
 /// Undo label for a pixel-edit gesture that ALSO wrote through to root tile
 /// data (the original command + the produced [`TilePixelEditCommand`]s are
 /// wrapped in one composite under this name).
@@ -156,35 +172,23 @@ const SELECTION_DEAD_ZONE_PX: f32 = 3.0;
 /// R6 F3: autosave cadence (5 minutes).
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(300);
 
-const TRANSFORM_PREVIEW_MAX_DIM: usize = 64;
-
-/// Y2-B fast preview algorithm: while a transform gizmo is being DRAGGED the
-/// live preview renders with Rotxel — the palette-pure, low-memory CPU path
-/// (X2) — instead of the user-selected algorithm. Commit is unaffected and
-/// always uses the selected algorithm (the preview==commit guarantee holds at
-/// commit). Choosing through the existing [`TransformAlgorithm`] dispatch means
-/// no new variant and exact 0/90/180/270° results stay byte-identical.
-const TRANSFORM_DRAG_PREVIEW_ALGORITHM: TransformAlgorithm = TransformAlgorithm::Rotxel;
-
-/// The rotation algorithm the live transform preview must use: the fast drag
-/// algorithm while the object is dragged, else the selected (stored)
-/// algorithm. Kept as a pure function so the two-tier choice is unit-testable
-/// without a texture upload.
-fn transform_preview_algorithm(dragging: bool, selected: TransformAlgorithm) -> TransformAlgorithm {
-    if dragging {
-        TRANSFORM_DRAG_PREVIEW_ALGORITHM
-    } else {
-        selected
-    }
+/// The rotation algorithm the live transform preview must use: ALWAYS the
+/// selected (stored) algorithm, so the preview is PIXEL-PERFECT exact
+/// regardless of how large the selection is. No fast/approximate swap is
+/// allowed — wrapping it in a single-entry indirect call keeps the call site
+/// unchanged.
+fn transform_preview_algorithm(_dragging: bool, selected: TransformAlgorithm) -> TransformAlgorithm {
+    selected
 }
 
 /// Dirty key for the transform preview texture (item 7): derived from the
 /// live transform state so [`App::refresh_transform_preview`] only re-renders
 /// and re-uploads when the float actually changed (pos / pivot / angle / scale
 /// / flips). f32 state is compared by bit pattern, which is stable for an
-/// unchanged object. `dragging` is part of the key (Y2-B) because it selects
-/// the preview algorithm, so a release forces a re-render with the selected
-/// algorithm even when the transform state itself is unchanged.
+/// unchanged object. `dragging` no longer selects an algorithm (the preview
+/// always uses the selected one); it stays in the key purely so a release
+/// forces a re-render through the dirty gate even when the transform state
+/// itself is unchanged.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct TransformPreviewKey {
     pos: (u32, u32),
@@ -235,6 +239,33 @@ fn panel_frame() -> egui::Frame {
     egui::Frame::new().inner_margin(4.0)
 }
 
+/// A decoded GIF held between the file-chooser pick and the Import GIF
+/// panel's confirmation (dropped on Cancel, consumed on OK). The path names
+/// the new document opened on confirmation.
+struct PendingGifImport {
+    path: PathBuf,
+    decode: GifDecode,
+}
+
+/// A decoded PNG held between the file-chooser pick and the Import Image
+/// panel's confirmation (dropped on Cancel, consumed on OK). The path names
+/// the new document opened on confirmation.
+struct PendingImageImport {
+    path: PathBuf,
+    image: crate::io::PngImage,
+}
+
+/// Document name for an imported file: the file's stem (e.g. `benny.gif` →
+/// `benny`), falling back to the create-document default `Untitled` when the
+/// stem is missing or empty.
+fn import_document_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("Untitled")
+        .to_owned()
+}
+
 pub fn run() {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop
@@ -266,6 +297,32 @@ struct App {
     palette_host: dock_hosts::PalettePanelHost,
     /// Shared per-frame cells for the docked Tile Palette panel (pure view).
     tile_palette_host: dock_tile_palette_panel::TilePaletteHost,
+    /// Shared cells for the floating "create new document" panel (id 205).
+    create_document_host: dock_create_document_panel::CreateDocumentHost,
+    /// Shared cells for the floating "save as / export" panel (id 207). The
+    /// modal replaces the `rfd::FileDialog::save_file()` flow, which hangs on
+    /// this machine's portal backend.
+    save_as_host: dock_save_as_panel::SaveAsHost,
+    /// Shared cells for the floating file chooser panel (id 208). The in-app
+    /// chooser replaces EVERY native `rfd` dialog (project open, PNG import,
+    /// and the save-as "Change…" folder pick) — the portal backend hangs on
+    /// this machine.
+    file_chooser_host: dock_file_chooser_panel::FileChooserHost,
+    /// Shared cells for the floating "resize canvas" panel (id 206).
+    resize_canvas_host: dock_resize_canvas_panel::ResizeCanvasHost,
+    /// Shared cells for the floating "Import GIF" panel (id 209). The modal
+    /// form (sheet line length) is validated by the panel itself.
+    import_gif_host: dock_import_gif_panel::ImportGifHost,
+    /// Shared cells for the floating "Import Image" panel (id 210). The modal
+    /// form (split by pixels / by regions) is validated by the panel.
+    import_image_host: dock_import_image_panel::ImportImageHost,
+    /// Decoded GIF awaiting the Import GIF panel's confirmation.
+    pending_gif_import: Option<PendingGifImport>,
+    /// Decoded PNG awaiting the Import Image panel's confirmation.
+    pending_image_import: Option<PendingImageImport>,
+    /// Last directory used by the open/save-as file dialogs, persisted to
+    /// `<config>/pyxross/last_dir` so it survives restarts.
+    last_dir: Option<PathBuf>,
     /// In-flight Tile-tool placer gesture: the per-cell diffs of the current
     /// primary (stamp) or secondary (clear) drag, committed as ONE undo step
     /// on release.
@@ -305,11 +362,22 @@ struct App {
     tile_rect_anchor: Option<(u32, u32)>,
     tile_rect_current: Option<(u32, u32)>,
     tile_rect_deleting: bool,
+    /// Animation Placer (Phase 3): the latched press cell anchor and the live
+    /// current cell while a primary drag defines a rectangle of sheet cells to
+    /// auto-index into the active animation. `anim_rect_dragging` becomes true
+    /// once the gesture is a REAL drag (egui's drag threshold crossed or the
+    /// pointer left the press cell), so a bare click is a documented no-op.
+    anim_rect_anchor: Option<(u32, u32)>,
+    anim_rect_current: Option<(u32, u32)>,
+    anim_rect_dragging: bool,
     /// Theme browser panel (F4): switch/refresh themes and preview colors.
     settings: SettingsPanel,
     keybindings: KeybindingsPanel,
     panel_layout: PanelLayout,
     project_tabs: ProjectTabBar,
+    /// Fixed three-slice top bar (menu / middle / project tabs). Owns the
+    /// per-frame tab snapshot and the emitted [`top_bar::TopBarEvent`]s.
+    top_bar: top_bar::TopBarHost,
     workspace_layout: WorkspaceLayoutV1,
     host_registry: WindowHostRegistry,
     workspace_runtime: WorkspacePanelCoordinator,
@@ -324,8 +392,17 @@ struct App {
     /// Loaded skin atlases for the active theme, keyed by (theme name, theme
     /// dir). `None` when the theme has no skins or no file dir.
     skin_atlas_cache: Option<(String, PathBuf, AtlasCache)>,
-    // -- timeline + playback (U13, R3 wave, feature F3) ------
-    timeline: TimelinePanel,
+    /// Shared per-frame cells for the animation dock panels (pure views).
+    animation_host: animation_hosts::AnimationPanelHost,
+    /// The active frame's region feed for the Preview panel (id 204).
+    frame_preview_feed: panel_dock::animation_preview::FramePreviewFeed,
+    /// Shared cells for the Frame Edit panel (id 203): a SECOND, editable
+    /// viewport onto the same canvas, focused on `frame_edit_index`.
+    frame_edit_host: dock_frame_edit_panel::FrameEditHost,
+    /// The frame-edit cursor: the frame the Frame Edit viewport edits. Kept
+    /// separate from the playback/preview index (`animation.current_index()`),
+    /// clamped to the active sequence length.
+    frame_edit_index: usize,
     panel_dock: panel_dock::DockManager,
     panel_dock_demo: bool,
     /// Gesture router shared by the canvas and every nest.
@@ -343,7 +420,10 @@ struct App {
     /// plain rect over the transformed bbox.
     lifted_selection_is_masked: bool,
     /// Per-frame texture backing the floating-pixels preview while a session
-    /// is active (D32): re-uploaded from `TransformObject::render(None)`.
+    /// is active (D32): re-uploaded from `TransformObject::render(None)` —
+    /// full, commit-identical resolution with no bounding cap. The dirty key
+    /// below keeps idle frames from paying the per-frame full-resolution
+    /// render + upload.
     transform_preview: Option<egui::TextureHandle>,
     /// Dirty key of the last uploaded [`Self::transform_preview`]: the preview
     /// is only re-rendered + re-uploaded when the live transform state changes
@@ -438,6 +518,35 @@ impl Default for App {
                 panel_dock::PanelPlacement::DockedRight,
             ))
             .expect("tile palette panel id must be unique");
+        // Animation panels (Phase 2A): the Animations list and the frame
+        // Preview are both docked into the BOTTOM dock. `add_spec` appends to
+        // the end of the dock, so registering Animations first then Preview
+        // puts Preview to its RIGHT.
+        let animation_host = animation_hosts::AnimationPanelHost::default();
+        let frame_preview_feed = panel_dock::animation_preview::FramePreviewFeed::default();
+        let frame_edit_host = dock_frame_edit_panel::FrameEditHost::default();
+        panel_dock
+            .add_spec(dock_animations_panel::animations_panel_spec(
+                &animation_host,
+                panel_dock::PanelPlacement::DockedBottom,
+            ))
+            .expect("animations panel id must be unique");
+        // The Frame Edit panel (203) sits BETWEEN Animations (left) and Preview
+        // (right): `add_spec` appends, so registering it after Animations and
+        // before Preview places it exactly there.
+        panel_dock
+            .add_spec(dock_frame_edit_panel::frame_edit_panel_spec(
+                &frame_edit_host,
+                panel_dock::PanelPlacement::DockedBottom,
+            ))
+            .expect("frame edit panel id must be unique");
+        panel_dock
+            .add_spec(dock_animation_preview_panel::animation_preview_panel_spec(
+                &animation_host,
+                frame_preview_feed.clone(),
+                panel_dock::PanelPlacement::DockedBottom,
+            ))
+            .expect("animation preview panel id must be unique");
         let mut app = Self {
             window: None,
             renderer: None,
@@ -455,6 +564,15 @@ impl Default for App {
             color_picker_host,
             palette_host,
             tile_palette_host,
+            create_document_host: dock_create_document_panel::CreateDocumentHost::default(),
+            save_as_host: dock_save_as_panel::SaveAsHost::default(),
+            file_chooser_host: dock_file_chooser_panel::FileChooserHost::default(),
+            resize_canvas_host: dock_resize_canvas_panel::ResizeCanvasHost::default(),
+            import_gif_host: dock_import_gif_panel::ImportGifHost::new(),
+            import_image_host: dock_import_image_panel::ImportImageHost::new(),
+            pending_gif_import: None,
+            pending_image_import: None,
+            last_dir: discover_last_dir(),
             tile_placer: TilePlacerGesture::default(),
             tile_placer_transform: TilePlacerTransform::default(),
             tile_placer_preview: TilePlacerPreview::default(),
@@ -463,10 +581,14 @@ impl Default for App {
             tile_rect_anchor: None,
             tile_rect_current: None,
             tile_rect_deleting: false,
+            anim_rect_anchor: None,
+            anim_rect_current: None,
+            anim_rect_dragging: false,
             settings: SettingsPanel::default(),
             keybindings: KeybindingsPanel::new(&keymap),
             panel_layout: PanelLayout::new(),
             project_tabs: ProjectTabBar::new(),
+            top_bar: top_bar::TopBarHost::new(),
             workspace_layout: WorkspaceLayoutV1::default(),
             host_registry: WindowHostRegistry::new(),
             workspace_runtime: WorkspacePanelCoordinator::new(),
@@ -483,7 +605,10 @@ impl Default for App {
             transform_preview: None,
             transform_preview_key: None,
             autosave_base: None,
-            timeline: TimelinePanel::new(),
+            animation_host,
+            frame_preview_feed,
+            frame_edit_host,
+            frame_edit_index: 0,
             panel_dock,
             input_capture: InputCapture::new(),
             panel_dock_demo: true,
@@ -506,6 +631,62 @@ impl Default for App {
             .expect("new project must resolve")
             .palettes = load_palettes(user_palette_dir().as_deref());
         app
+    }
+}
+
+/// Config base directory for persisted UI side-files (`<config>/pyxross`).
+fn last_dir_base() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("pyxross"))
+}
+
+/// The directory the open/save-as dialogs should start in: the persisted
+/// `last_dir` when present and non-empty, else the OS Documents folder, else
+/// the home directory.
+fn discover_last_dir() -> Option<PathBuf> {
+    last_dir_base()
+        .as_deref()
+        .and_then(load_last_dir)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .or_else(dirs::document_dir)
+        .or_else(dirs::home_dir)
+}
+
+/// Reads a persisted last-dialog directory from `<base>/last_dir`. Pure (base is
+/// a parameter) so it is testable against a temp dir. `None` when missing/empty.
+fn load_last_dir(base: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(base.join("last_dir")).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+/// Persists `dir` to `<base>/last_dir` (creating `base`). Best-effort: write
+/// failures are ignored. Pure (base is a parameter) so it is testable.
+fn save_last_dir(base: &Path, dir: &Path) {
+    if std::fs::create_dir_all(base).is_ok() {
+        let _ = std::fs::write(base.join("last_dir"), dir.to_string_lossy().as_bytes());
+    }
+}
+
+/// A file operation a menu action can request. Separated from the blocking
+/// dialog handlers so the menu -> handler mapping is unit-testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileOp {
+    Save,
+    SaveAs,
+    Open,
+}
+
+/// Maps a [`top_bar::MenuAction`] to the file op it routes to, if any. Pure.
+fn file_op_for(action: top_bar::MenuAction) -> Option<FileOp> {
+    match action {
+        top_bar::MenuAction::SaveProject => Some(FileOp::Save),
+        top_bar::MenuAction::SaveProjectAs => Some(FileOp::SaveAs),
+        top_bar::MenuAction::OpenProject => Some(FileOp::Open),
+        _ => None,
     }
 }
 
@@ -1225,7 +1406,8 @@ fn tile_override_damage_regions(
             continue;
         };
         let cols = tilemap.cols.max(1) as usize;
-        let tile_size = u64::from(tilemap.tile_size.max(1));
+        let tile_w = u64::from(tilemap.tile_size.w.max(1));
+        let tile_h = u64::from(tilemap.tile_size.h.max(1));
         for (index, cell) in tilemap.cells().iter().enumerate() {
             let Some(cell) = cell.filter(|cell| ids.contains(&cell.tile_id)) else {
                 continue;
@@ -1240,8 +1422,8 @@ fn tile_override_damage_regions(
             };
             let cx = index % cols;
             let cy = index / cols;
-            let x = (cx as u64 * tile_size).min(i32::MAX as u64) as i32;
-            let y = (cy as u64 * tile_size).min(i32::MAX as u64) as i32;
+            let x = (cx as u64 * tile_w).min(i32::MAX as u64) as i32;
+            let y = (cy as u64 * tile_h).min(i32::MAX as u64) as i32;
             let region = Rect2i::new(x, y, w as i32, h as i32).clamp_to(canvas);
             if !region.is_empty() {
                 regions.push(region);
@@ -1384,7 +1566,719 @@ impl App {
             self.ghost_tile = None;
             self.tile_rect_anchor = None;
             self.tile_rect_current = None;
+            self.anim_rect_anchor = None;
+            self.anim_rect_current = None;
+            self.anim_rect_dragging = false;
+            // S5: App-global animation view state must not leak across a
+            // project switch — reset the frame-edit cursor/camera and the onion
+            // flags, then re-sync the newly active animation's controller.
+            // Guarded: closing the LAST project leaves no active session.
+            if self.projects.active_id().is_some() {
+                self.reset_animation_view_state();
+                self.sync_anim_delays();
+            }
         }
+    }
+
+    /// Apply the top bar's emitted events. `SelectProject` activates the target
+    /// project (an `UnknownProject` error — e.g. a tab closed the same frame —
+    /// is ignored) and folds the outcome through the normal activation path.
+    /// `OpenCreateDocument` opens (or raises) the floating create-document panel.
+    fn apply_top_bar_events(&mut self, events: Vec<top_bar::TopBarEvent>) {
+        for event in events {
+            match event {
+                top_bar::TopBarEvent::SelectProject(id) => {
+                    if let Ok(outcome) = self.projects.activate(id) {
+                        self.consume_activation(outcome);
+                    }
+                }
+                top_bar::TopBarEvent::OpenCreateDocument => self.open_create_document_panel(),
+                top_bar::TopBarEvent::CloseProject(id) => self.request_project_close(id),
+                top_bar::TopBarEvent::MenuAction(action) => self.apply_menu_action(action),
+            }
+        }
+    }
+
+    /// Dispatch a menu-bar action to the same handler the corresponding
+    /// shortcut uses. `NewProject` shares [`Self::open_create_document_panel`]
+    /// with `OpenCreateDocument`; `ResizeCanvas` opens the resize panel; the
+    /// file ops route through [`Self::file_op_for`] to the real
+    /// `file_save`/`file_save_as`/`file_open` handlers.
+    fn apply_menu_action(&mut self, action: top_bar::MenuAction) {
+        if let Some(op) = file_op_for(action) {
+            match op {
+                FileOp::Save => {
+                    let _ = self.file_save();
+                }
+                FileOp::SaveAs => {
+                    let _ = self.file_save_as();
+                }
+                FileOp::Open => self.file_open(),
+            }
+            return;
+        }
+        match action {
+            // The create-document panel is the "new project" action; the middle
+            // square button (`OpenCreateDocument`) shares this exact handler.
+            top_bar::MenuAction::NewProject => self.open_create_document_panel(),
+            top_bar::MenuAction::ResizeCanvas => self.open_resize_canvas_panel(),
+            // Import flows open the file chooser; the picked file resolves in
+            // `drain_file_chooser_events` → the two-step Import panels.
+            top_bar::MenuAction::ImportImages => self.file_import_png(),
+            top_bar::MenuAction::ImportGif => self.file_import_gif(),
+            // File ops are handled by `file_op_for` above.
+            top_bar::MenuAction::SaveProject
+            | top_bar::MenuAction::SaveProjectAs
+            | top_bar::MenuAction::OpenProject => {}
+        }
+    }
+
+    /// Open the "resize canvas" floating panel, or raise it when already
+    /// registered (idempotent, no duplicate). Mirrors the create-document
+    /// panel's open/raise pattern.
+    fn open_resize_canvas_panel(&mut self) {
+        let panel_id =
+            panel_dock::PanelId::new(dock_resize_canvas_panel::RESIZE_CANVAS_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(380.0, 180.0),
+            egui::vec2(300.0, 260.0),
+        );
+        let spec = dock_resize_canvas_panel::resize_canvas_panel_spec(
+            &self.resize_canvas_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    /// Open the "create new document" floating panel, or raise it when it is
+    /// already registered (never a duplicate). Mirrors the layer-settings
+    /// open/raise pattern.
+    fn open_create_document_panel(&mut self) {
+        let panel_id =
+            panel_dock::PanelId::new(dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            // Already open: just bring it to the front.
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(360.0, 160.0),
+            egui::vec2(300.0, 240.0),
+        );
+        let spec = dock_create_document_panel::create_document_panel_spec(
+            &self.create_document_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    /// Apply the create-document panel's events. `Create` opens a NEW project
+    /// (tab) sized to the requested region grid and sets its `tile_size` to the
+    /// region side (`region_w`; the panel assumes square regions — a
+    /// non-square region falls back to `region_w`). The panel is closed after a
+    /// successful create. Drains unconditionally so events never linger.
+    fn drain_create_document_events(&mut self) {
+        let events: Vec<dock_create_document_panel::CreateDocumentEvent> = self
+            .create_document_host
+            .events
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        for event in events {
+            match event {
+                dock_create_document_panel::CreateDocumentEvent::Create {
+                    region_w,
+                    region_h,
+                    count_x,
+                    count_y,
+                } => {
+                    let view = dock_create_document_panel::CreateDocumentView {
+                        region_w,
+                        region_h,
+                        count_x,
+                        count_y,
+                    };
+                    let (w, h) = dock_create_document_panel::canvas_size_for(&view);
+                    let (w, h) = (w.max(1), h.max(1));
+                    // A new project = a new tab; `new_project` activates it, so
+                    // the top-bar tab bar updates itself from `projects.tabs()`.
+                    let id = self.new_project("Untitled", w as usize, h as usize);
+                    if let Some(session) = self.projects.session_mut(id) {
+                        session.tile_size = TileSize::new(region_w.max(1), region_h.max(1));
+                        session.new_draft_w = w;
+                        session.new_draft_h = h;
+                    }
+                    // Close the create panel once the document exists.
+                    let panel_id = panel_dock::PanelId::new(
+                        dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID,
+                    );
+                    self.panel_dock.remove_spec(panel_id);
+                }
+            }
+        }
+    }
+
+    /// Open the "save as / export" floating panel for `kind`, carrying the
+    /// freshly-computed export `payload` (`None` for project saves). The
+    /// draft is (re)configured on every open: default location, name, mode,
+    /// and a focus request. Never opens a duplicate — an already-open panel
+    /// is raised instead.
+    fn open_save_as_panel(
+        &mut self,
+        kind: dock_save_as_panel::SaveAsKind,
+        payload: Option<dock_save_as_panel::SavePayload>,
+    ) {
+        {
+            let mut view = self.save_as_host.view.borrow_mut();
+            view.kind = kind;
+            view.payload = payload;
+            view.name = if kind == dock_save_as_panel::SaveAsKind::Project {
+                self.projects.current().name.clone()
+            } else {
+                kind.default_name().to_owned()
+            };
+            view.error = None;
+            view.focus_requested = true;
+            view.location = self.default_save_location();
+        }
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(400.0, 260.0),
+            egui::vec2(420.0, 200.0),
+        );
+        let spec = dock_save_as_panel::save_as_panel_spec(&self.save_as_host, floating_rect);
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    /// Default modal location: `last_dir` → the parent of the current
+    /// project's path → the working directory (first non-empty hit).
+    fn default_save_location(&self) -> PathBuf {
+        if let Some(dir) = self.last_dir.clone() {
+            if !dir.as_os_str().is_empty() {
+                return dir;
+            }
+        }
+        if let Some(path) = self.projects.current().path.clone() {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    /// Close the save-as/export panel (Cancel, or after a successful save). A
+    /// file chooser opened from the modal's "Change…" (ChooseFolder mode) is
+    /// closed along with it, so the pair never strands a floating window.
+    fn close_save_as_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        let _ = self.panel_dock.remove_spec(panel_id);
+        if self.file_chooser_host.view.borrow().mode
+            == dock_file_chooser_panel::FileChooserMode::ChooseFolder
+        {
+            self.close_file_chooser();
+        }
+    }
+
+    /// Open the file chooser floating panel (id 208) for `mode`, seeded at
+    /// `start` (its listing is rebuilt on open). An already-open chooser is
+    /// retargeted and raised instead of duplicated.
+    fn open_file_chooser(
+        &mut self,
+        mode: dock_file_chooser_panel::FileChooserMode,
+        start: PathBuf,
+    ) {
+        {
+            let mut view = self.file_chooser_host.view.borrow_mut();
+            view.mode = mode;
+            view.selected = None;
+            view.focus_requested = true;
+            let _ = dock_file_chooser_panel::navigate(&mut view, start);
+        }
+        let panel_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(430.0, 300.0),
+            egui::vec2(480.0, 400.0),
+        );
+        let spec =
+            dock_file_chooser_panel::file_chooser_panel_spec(&self.file_chooser_host, floating_rect);
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    /// Close the file chooser floating panel.
+    fn close_file_chooser(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        let _ = self.panel_dock.remove_spec(panel_id);
+    }
+
+    /// Apply the file chooser panel's events:
+    /// - `Cancelled` closes the chooser;
+    /// - `Chosen` dispatches on the MODE the chooser was opened with:
+    ///   `OpenProject` → dirty gate / `load_project` (+ `last_dir`),
+    ///   `ImportPng` → `file_import_png_pick` → the Import Image panel,
+    ///   `ImportGif` → `file_import_gif_pick` → the Import GIF panel,
+    ///   `ChooseFolder` → the save-as modal's location (the modal is raised
+    ///   back above the chooser). Every branch closes the chooser.
+    fn drain_file_chooser_events(&mut self) {
+        let events: Vec<dock_file_chooser_panel::FileChooserEvent> = self
+            .file_chooser_host
+            .events
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        for event in events {
+            match event {
+                dock_file_chooser_panel::FileChooserEvent::Cancelled => {
+                    self.close_file_chooser();
+                }
+                dock_file_chooser_panel::FileChooserEvent::Chosen(path) => {
+                    let mode = self.file_chooser_host.view.borrow().mode;
+                    match mode {
+                        dock_file_chooser_panel::FileChooserMode::OpenProject => {
+                            if path.is_dir() {
+                                self.remember_last_dir(&path);
+                            } else if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            if self.projects.current().is_dirty() {
+                                self.projects.current_mut().pending_action =
+                                    Some(PendingAction::Open {
+                                        project: self.projects.current().id,
+                                        path,
+                                    });
+                            } else {
+                                self.load_project(path);
+                            }
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ImportPng => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            self.file_import_png_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ImportGif => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            self.file_import_gif_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ChooseFolder => {
+                            {
+                                let mut view = self.save_as_host.view.borrow_mut();
+                                view.location = path;
+                            }
+                            let save_panel_id =
+                                panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+                            self.panel_dock.raise_floating(save_panel_id);
+                            self.close_file_chooser();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the Import GIF floating panel (id 209), seeded with the freshly
+    /// decoded animation. An already-open panel is reseeded and raised. The
+    /// panel is registered here at OPEN time (like every other modal) so it
+    /// never floats empty at startup; the modal's own validation gates the
+    /// sheet line length.
+    fn open_import_gif_panel(
+        &mut self,
+        path: PathBuf,
+        frame_count: usize,
+        frame_w: u32,
+        frame_h: u32,
+    ) {
+        self.import_gif_host
+            .seed(path, frame_count, frame_w, frame_h, MAX_FRAMES);
+        let panel_id = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let spec = dock_import_gif_panel::import_gif_panel_spec(std::rc::Rc::new(
+            std::cell::RefCell::new(self.import_gif_host.clone()),
+        ));
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    /// Close the Import GIF floating panel.
+    fn close_import_gif_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        let _ = self.panel_dock.remove_spec(panel_id);
+    }
+
+    /// Apply the Import GIF panel's events: `Ok { line_length }` closes the
+    /// panel and applies the sheet (session unchanged when the result exceeds
+    /// the frame/canvas limits — the error lands in `last_error`); `Cancel`
+    /// closes the panel and drops the pending decode (a no-op session).
+    fn drain_import_gif_events(&mut self) {
+        let events = self.import_gif_host.take_events();
+        for event in events {
+            match event {
+                dock_import_gif_panel::ImportGifEvent::Cancel => {
+                    self.close_import_gif_panel();
+                    self.pending_gif_import = None;
+                }
+                dock_import_gif_panel::ImportGifEvent::Ok { line_length } => {
+                    self.close_import_gif_panel();
+                    if let Err(msg) = self.apply_import_gif(line_length) {
+                        self.projects.current_mut().last_error = Some(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the Import Image floating panel (id 210), seeded with the freshly
+    /// decoded image (full-size pixels, derived 1x1 regions — both editable).
+    /// An already-open panel is reseeded and raised. The panel is registered
+    /// at OPEN time (like every other modal) so it never floats empty at
+    /// startup; the modal's own validation gates the split.
+    fn open_import_image_panel(&mut self, path: PathBuf, img_w: u32, img_h: u32) {
+        self.import_image_host.seed(
+            path,
+            img_w,
+            img_h,
+            IMPORT_MAX_CANVAS_SIDE,
+            IMPORT_MAX_CANVAS_SIDE,
+            MAX_FRAMES,
+        );
+        let panel_id = panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let spec = dock_import_image_panel::import_image_panel_spec(std::rc::Rc::new(
+            std::cell::RefCell::new(self.import_image_host.clone()),
+        ));
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    /// Close the Import Image floating panel.
+    fn close_import_image_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
+        let _ = self.panel_dock.remove_spec(panel_id);
+    }
+
+    /// Apply the Import Image panel's events: `Ok { px_w, px_h, … }` closes
+    /// the panel and opens the imported image in a NEW document (no document
+    /// and no session change when the result exceeds the region/canvas
+    /// limits — the error lands in `last_error`); `Cancel` closes the panel
+    /// and drops the pending image (a no-op session).
+    fn drain_import_image_events(&mut self) {
+        let events = self.import_image_host.take_events();
+        for event in events {
+            match event {
+                dock_import_image_panel::ImportImageEvent::Cancel => {
+                    self.close_import_image_panel();
+                    self.pending_image_import = None;
+                }
+                dock_import_image_panel::ImportImageEvent::Ok {
+                    px_w,
+                    px_h,
+                    regions_w: _,
+                    regions_h: _,
+                } => {
+                    self.close_import_image_panel();
+                    if let Err(msg) = self.apply_import_image(px_w, px_h) {
+                        self.projects.current_mut().last_error = Some(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply the save-as/export panel's events: `Save` writes the target and
+    /// closes on success; `Cancel` closes; `BrowseLocation` opens the in-app
+    /// file chooser in ChooseFolder mode seeded at the current location.
+    /// Failures set the INLINE panel error (the panel stays open); `last_error`
+    /// is also set for the legacy status line. Drains unconditionally so
+    /// events never linger.
+    fn drain_save_as_events(&mut self) {
+        let events: Vec<dock_save_as_panel::SaveAsEvent> = self
+            .save_as_host
+            .events
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        for event in events {
+            match event {
+                dock_save_as_panel::SaveAsEvent::Cancel => self.close_save_as_panel(),
+                dock_save_as_panel::SaveAsEvent::BrowseLocation => {
+                    let start = {
+                        let view = self.save_as_host.view.borrow();
+                        view.location.clone()
+                    };
+                    let start = if start.as_os_str().is_empty() {
+                        self.last_dir
+                            .clone()
+                            .unwrap_or_else(|| self.default_save_location())
+                    } else {
+                        start
+                    };
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ChooseFolder,
+                        start,
+                    );
+                }
+                dock_save_as_panel::SaveAsEvent::Save { path, .. } => {
+                    if self.save_as_target(&path) {
+                        self.close_save_as_panel();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes the modal draft to `path`. Project saves ALWAYS write a single
+    /// `.pyxross` archive via `save_document_file` (the D80 user-facing
+    /// dir↔file choice was removed — `save_document` stays only for in-place
+    /// legacy directory saves through `save_to`); exports write their
+    /// pre-computed payload. On success the session is updated (project) and
+    /// `last_error` cleared; on failure the inline panel error (and
+    /// `last_error`) carry the message.
+    fn save_as_target(&mut self, path: &Path) -> bool {
+        let (kind, payload) = {
+            let view = self.save_as_host.view.borrow();
+            (view.kind, view.payload.clone())
+        };
+        let outcome: Result<(), String> = match (kind, payload) {
+            (dock_save_as_panel::SaveAsKind::Project, _) => {
+                let doc = self.app_to_document();
+                save_document_file(&doc, path).map_err(|err| format!("Failed to save: {err}"))
+            }
+            (
+                dock_save_as_panel::SaveAsKind::SpriteSheet,
+                Some(dock_save_as_panel::SavePayload::SpriteSheet { png, meta }),
+            ) => std::fs::write(path, png)
+                .and_then(|_| std::fs::write(path.with_extension("json"), meta))
+                .map_err(|err| format!("Failed to export sprite sheet: {err}")),
+            (
+                dock_save_as_panel::SaveAsKind::Gif,
+                Some(dock_save_as_panel::SavePayload::Gif(bytes)),
+            ) => std::fs::write(path, bytes)
+                .map_err(|err| format!("Failed to export GIF: {err}")),
+            (
+                dock_save_as_panel::SaveAsKind::SelectionPng,
+                Some(dock_save_as_panel::SavePayload::SelectionPng { w, h, rgba }),
+            ) => encode_png(w, h, &rgba)
+                .map_err(|err| err.to_string())
+                .and_then(|bytes| {
+                    std::fs::write(path, bytes)
+                        .map_err(|err| format!("Failed to export selection: {err}"))
+                }),
+            _ => Err("internal: save-as draft has no payload and is not a project save".to_owned()),
+        };
+        match outcome {
+            Ok(()) => {
+                if kind == dock_save_as_panel::SaveAsKind::Project {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("Untitled"));
+                    let session = self.projects.current_mut();
+                    session.path = Some(path.to_path_buf());
+                    session.name = name;
+                    session.mark_saved();
+                    self.update_title();
+                    if let Some(location) = path.parent() {
+                        self.remember_last_dir(location);
+                    }
+                }
+                self.projects.current_mut().last_error = None;
+                true
+            }
+            Err(message) => {
+                self.save_as_host.view.borrow_mut().error = Some(message.clone());
+                self.projects.current_mut().last_error = Some(message);
+                false
+            }
+        }
+    }
+
+    /// Apply the resize-canvas panel's events. Canvas resize is **NOT undoable**
+    /// in this version: a dimension change cannot be represented as a single
+    /// `ReverseDeltaCommand`, so the project is marked dirty (per the task's
+    /// documented decision). After each applied event the texture cache is
+    /// invalidated and the animation delays re-synced.
+    fn drain_resize_canvas_events(&mut self) {
+        let events: Vec<dock_resize_canvas_panel::ResizeCanvasEvent> = self
+            .resize_canvas_host
+            .events
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        for event in events {
+            match event {
+                dock_resize_canvas_panel::ResizeCanvasEvent::ResizeCounts { w, h, pivot } => {
+                    self.apply_resize_counts(w.max(1), h.max(1), pivot);
+                }
+                dock_resize_canvas_panel::ResizeCanvasEvent::ResizeRegions {
+                    w,
+                    h,
+                    pivot,
+                    resample,
+                } => {
+                    self.apply_resize_regions(w.max(1), h.max(1), pivot, resample);
+                }
+            }
+            self.invalidate_host_project_cache();
+            self.sync_anim_delays();
+            self.projects.current_mut().mark_dirty();
+        }
+    }
+
+    /// `ResizeCounts`: the region grid becomes `w × h` cells at the project's
+    /// CURRENT `tile_size` (unchanged). Pixel content is placed 1:1 at `pivot`
+    /// (grow pads with transparency, shrink crops); frame rects are clamped to
+    /// the new canvas.
+    fn apply_resize_counts(
+        &mut self,
+        w: u32,
+        h: u32,
+        pivot: crate::core::canvas_resize::Pivot,
+    ) {
+        let ts = self.projects.current().tile_size;
+        let (new_w, new_h) = crate::core::canvas_resize::canvas_size(ts.w, ts.h, w, h);
+        let (new_w, new_h) = (new_w.max(1), new_h.max(1));
+        self.projects
+            .current_mut()
+            .layers
+            .resize_canvas(new_w as usize, new_h as usize, pivot, false);
+        self.clamp_frames_to_canvas(new_w as i32, new_h as i32);
+    }
+
+    /// `ResizeRegions`: each region becomes `w × h` (PER-AXIS; the new
+    /// `tile_size` is `TileSize::new(w, h)` — non-square regions are honoured).
+    /// The current region counts are preserved, so the new canvas is
+    /// `(w*count_w, h*count_h)`. Pixels are resampled per `resample` (`false` =
+    /// 1:1 pivot copy, `true` = NN scale); frame rects are scaled by the region
+    /// ratio and clamped.
+    fn apply_resize_regions(
+        &mut self,
+        w: u32,
+        h: u32,
+        pivot: crate::core::canvas_resize::Pivot,
+        resample: bool,
+    ) {
+        let old_tile = self.projects.current().tile_size;
+        let old_w = self.projects.current().layers.width() as u32;
+        let old_h = self.projects.current().layers.height() as u32;
+        let count_w = (old_w / old_tile.w).max(1);
+        let count_h = (old_h / old_tile.h).max(1);
+        let (new_w, new_h) = crate::core::canvas_resize::canvas_size(w, h, count_w, count_h);
+        let (new_w, new_h) = (new_w.max(1), new_h.max(1));
+        self.projects
+            .current_mut()
+            .layers
+            .resize_canvas(new_w as usize, new_h as usize, pivot, resample);
+        self.projects.current_mut().tile_size = TileSize::new(w, h);
+        self.scale_frames_to_canvas(w, h, old_tile, new_w as i32, new_h as i32);
+    }
+
+    /// Clamp every frame's region rect into `0..new_w × 0..new_h` (overflow is
+    /// cropped), across ALL animations.
+    fn clamp_frames_to_canvas(&mut self, new_w: i32, new_h: i32) {
+        let canvas = Rect2i::new(0, 0, new_w.max(1), new_h.max(1));
+        let session = self.projects.current_mut();
+        for i in 0..session.animations.len() {
+            let Some(seq) = session.animations.get_mut(i) else {
+                continue;
+            };
+            for idx in 0..seq.len() {
+                if let Some(frame) = seq.frame_mut(idx) {
+                    frame.region.rect = frame.region.rect.clamp_to(canvas);
+                }
+            }
+        }
+    }
+
+    /// Scale every frame's region rect by the region ratio
+    /// `(w/old_tile, h/old_tile)` and clamp into the new canvas, across ALL
+    /// animations. Keeps regions aligned to the resized grid.
+    fn scale_frames_to_canvas(
+        &mut self,
+        w: u32,
+        h: u32,
+        old_tile: TileSize,
+        new_w: i32,
+        new_h: i32,
+    ) {
+        let den_x = i64::from(old_tile.w.max(1));
+        let den_y = i64::from(old_tile.h.max(1));
+        let rx = i64::from(w);
+        let ry = i64::from(h);
+        let canvas = Rect2i::new(0, 0, new_w.max(1), new_h.max(1));
+        let session = self.projects.current_mut();
+        for i in 0..session.animations.len() {
+            let Some(seq) = session.animations.get_mut(i) else {
+                continue;
+            };
+            for idx in 0..seq.len() {
+                let Some(frame) = seq.frame_mut(idx) else {
+                    continue;
+                };
+                let r = frame.region.rect;
+                let x = ((i64::from(r.x) * rx) / den_x) as i32;
+                let y = ((i64::from(r.y) * ry) / den_y) as i32;
+                let rw = ((i64::from(r.w) * rx) / den_x).max(0) as i32;
+                let rh = ((i64::from(r.h) * ry) / den_y).max(0) as i32;
+                frame.region.rect = Rect2i::new(x, y, rw, rh).clamp_to(canvas);
+            }
+        }
+    }
+
+    /// S5: reset App-global animation view state when the active project
+    /// changes. The frame-edit cursor goes back to 0, the frame-edit camera is
+    /// recentred on that frame, and both onion flags are cleared, so a new
+    /// project can never inherit the previous cursor, camera or onion state.
+    fn reset_animation_view_state(&mut self) {
+        self.frame_edit_index = 0;
+        self.frame_edit_host.index.set(0);
+        // Force the delay text to re-seed from the new cursor frame.
+        self.frame_edit_host.delay_seed.set((usize::MAX, 0));
+        self.frame_edit_host
+            .camera
+            .set(crate::core::camera::Camera::new());
+        self.recenter_frame_edit_camera();
+        {
+            let project = self.projects.current_mut();
+            project.onion_prev = false;
+            project.onion_next = false;
+        }
+        self.frame_edit_host.onion_prev.set(false);
+        self.frame_edit_host.onion_next.set(false);
+        *self.frame_edit_host.interactions.borrow_mut() = None;
     }
 
     /// Drop the ghost tile unless it still fits the current canvas (dimensions
@@ -1654,7 +2548,7 @@ impl App {
                 }
                 PanelId::FrameEditor => {
                     ui.label(format!("Frame {}", project.animation.current_index() + 1));
-                    if let Some(frame) = project.sequence.frame(project.animation.current_index()) {
+                    if let Some(frame) = project.sequence().frame(project.animation.current_index()) {
                         let rect = frame.region().rect();
                         ui.label(format!(
                             "Region: {},{} {}×{}",
@@ -1981,6 +2875,13 @@ impl App {
                         self.tile_rect_current = None;
                         self.ghost_tile = None;
                     }
+                    // Leaving the Animation Placer drops any in-flight
+                    // auto-index rectangle latch, so a later re-entry is clean.
+                    if tool != Tool::AnimationPlacer {
+                        self.anim_rect_anchor = None;
+                        self.anim_rect_current = None;
+                        self.anim_rect_dragging = false;
+                    }
                 }
                 ToolbarEvent::ColorChanged(color) => self.projects.current_mut().color = color,
                 ToolbarEvent::SecondaryColorChanged(color) => {
@@ -2173,6 +3074,54 @@ impl App {
             selected: session.tile_palette.selected,
             pixel_overrides: self.live_tile_pixel_overrides(),
         };
+        // Animation panels snapshot: the list, the settings row (only while the
+        // floating settings panel is open) and the transport/onion/loop cells.
+        let active_animation = session.animations.active();
+        let rows: Vec<animation_hosts::AnimationRow> = session
+            .animations
+            .iter()
+            .enumerate()
+            .map(|(index, sequence)| animation_hosts::AnimationRow {
+                index,
+                name: sequence.name().to_string(),
+                frame_count: sequence.len(),
+                active: index == active_animation,
+            })
+            .collect();
+        *self.animation_host.list.borrow_mut() = animation_hosts::AnimationListView {
+            animations: rows,
+            remove_enabled: session.animations.len() > 1,
+        };
+        {
+            let mut settings_row = self.animation_host.settings_row.borrow_mut();
+            let open = *self.animation_host.open_settings.borrow();
+            // Refresh the settings snapshot each frame (index + name + frame
+            // count). The TEXT buffers (`rename_buffer`, `multiplier_buffer`)
+            // are deliberately NOT touched here: they are seeded when the panel
+            // is opened/switched, exactly like the Layer settings panel, so a
+            // per-frame write cannot clobber the user's in-progress typing.
+            match open.and_then(|index| session.animations.get(index).map(|seq| (index, seq))) {
+                Some((index, sequence)) => {
+                    *settings_row = Some(animation_hosts::AnimationRow {
+                        index,
+                        name: sequence.name().to_string(),
+                        frame_count: sequence.len(),
+                        active: index == active_animation,
+                    });
+                    drop(settings_row);
+                    *self.animation_host.settings_loop.borrow_mut() = sequence.looping();
+                }
+                None => {
+                    *settings_row = None;
+                }
+            }
+        }
+        *self.animation_host.playing.borrow_mut() = session.animation.is_playing();
+        *self.animation_host.loop_on.borrow_mut() = session.sequence().looping();
+        *self.animation_host.onion_prev.borrow_mut() = session.onion_prev;
+        *self.animation_host.onion_next.borrow_mut() = session.onion_next;
+        *self.animation_host.current_frame.borrow_mut() = session.animation.current_index();
+        *self.animation_host.frame_count.borrow_mut() = session.sequence().len();
     }
 
     /// Keep the per-layer settings floating panel in sync with the open layer:
@@ -2204,6 +3153,36 @@ impl App {
             .set_title(settings_id, format!("Layer: {name}"));
     }
 
+    /// Keep the floating animation settings panel in sync with its animation:
+    /// title it, and remove it when the animation is gone or nothing is open.
+    fn sync_animation_settings_panel(&mut self) {
+        let settings_id =
+            panel_dock::PanelId::new(dock_animation_settings::ANIMATION_SETTINGS_PANEL_ID);
+        if self.panel_dock.placement(settings_id).is_none() {
+            return;
+        }
+        let open = *self.animation_host.open_settings.borrow();
+        let Some(index) = open else {
+            self.panel_dock.remove_spec(settings_id);
+            return;
+        };
+        let name = self
+            .projects
+            .current()
+            .animations
+            .get(index)
+            .map(|sequence| sequence.name().to_string());
+        let Some(name) = name else {
+            // The animation was removed while its settings panel was open.
+            self.panel_dock.remove_spec(settings_id);
+            *self.animation_host.open_settings.borrow_mut() = None;
+            *self.animation_host.settings_row.borrow_mut() = None;
+            return;
+        };
+        self.panel_dock
+            .set_title(settings_id, format!("Animation: {name}"));
+    }
+
     /// Applies the dock actions drained after a dock frame.
     fn handle_dock_actions(&mut self, actions: Vec<panel_dock::DockAction>) {
         for action in actions {
@@ -2222,6 +3201,10 @@ impl App {
         if id.raw() == dock_layers_panel::LAYER_SETTINGS_PANEL_ID {
             *self.layers_host.open_settings.borrow_mut() = None;
             self.layers_host.rename_buffer.borrow_mut().clear();
+        }
+        if id.raw() == dock_animation_settings::ANIMATION_SETTINGS_PANEL_ID {
+            *self.animation_host.open_settings.borrow_mut() = None;
+            *self.animation_host.settings_row.borrow_mut() = None;
         }
         if id.raw() == dock_color_picker_panel::COLOR_PICKER_PANEL_ID {
             self.color_picker_host.view.borrow_mut().open = false;
@@ -2281,6 +3264,199 @@ impl App {
             .drain(..)
             .collect();
         self.apply_tile_palette_events(tile_events);
+        let animation_events: Vec<animation_hosts::AnimationPanelEvent> =
+            self.animation_host.events.borrow_mut().drain(..).collect();
+        self.apply_animation_events(animation_events);
+        let frame_edit_events: Vec<dock_frame_edit_panel::FrameEditPanelEvent> = self
+            .frame_edit_host
+            .events
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        self.apply_frame_edit_events(frame_edit_events);
+    }
+
+    /// Replace the ACTIVE animation's playback controller with a fresh one
+    /// built from its multiplier-scaled effective delays and its loop flag.
+    ///
+    /// POLICY (B2): the controller is REPLACED — frame 0, stopped — because the
+    /// ACTIVE animation itself changed (a select/add/remove), where keeping the
+    /// old frame index/timing would be meaningless. The sequence's loop flag is
+    /// ALWAYS re-applied; it is never left at `new_from_delays`'s `true`
+    /// default. Edits that only change the active animation's frames or delays
+    /// use [`Self::sync_anim_delays`] instead, which updates in place and
+    /// preserves the current frame and play/stop state.
+    fn rebuild_animation_controller(&mut self) {
+        let session = self.projects.current_mut();
+        let delays = session.effective_frame_delays();
+        let frame_count = session.sequence().len();
+        let looping = session.sequence().looping();
+        session.animation = AnimationController::new_from_delays(frame_count, delays);
+        session.animation.set_looping(looping);
+    }
+
+    /// Apply the animation panels' gestures. The panels are pure views; every
+    /// model mutation happens here through [`self.projects`]. Indices are
+    /// always bounds-checked so a stale event can never panic.
+    fn apply_animation_events(&mut self, events: Vec<animation_hosts::AnimationPanelEvent>) {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut dirty = false;
+        for event in events {
+            match event {
+                Ev::Select(index) => {
+                    if self.projects.current_mut().animations.set_active(index) {
+                        self.rebuild_animation_controller();
+                    }
+                }
+                Ev::Add => {
+                    let session = self.projects.current_mut();
+                    let name = format!("Animation {}", session.animations.len() + 1);
+                    session.animations.add(name);
+                    self.rebuild_animation_controller();
+                    dirty = true;
+                }
+                Ev::Remove(index) => {
+                    // `remove` refuses the last animation (never-empty invariant).
+                    let active_before = self.projects.current().animations.active();
+                    if self.projects.current_mut().animations.remove(index) {
+                        // B2: only a change of the ACTIVE animation rebuilds the
+                        // controller. Removing a later animation leaves the
+                        // active sequence (and its playback state) untouched.
+                        if index == active_before {
+                            self.rebuild_animation_controller();
+                        }
+                        dirty = true;
+                    }
+                }
+                Ev::OpenSettings(index) => self.open_animation_settings(index),
+                Ev::SetName { index, name } => {
+                    let session = self.projects.current_mut();
+                    if let Some(sequence) = session.animations.get_mut(index) {
+                        sequence.set_name(name);
+                        dirty = true;
+                    }
+                }
+                Ev::SetDelayMultiplier { index, mult } => {
+                    // B2: only the ACTIVE animation's timing feeds the
+                    // controller. Editing a non-active animation must leave the
+                    // active controller completely untouched (no stop/rewind).
+                    let active = self.projects.current().animations.active();
+                    let session = self.projects.current_mut();
+                    if let Some(sequence) = session.animations.get_mut(index) {
+                        sequence.set_delay_multiplier(mult);
+                    }
+                    if index == active {
+                        // Playback must use the new effective delays immediately,
+                        // preserving the current frame and play/stop state.
+                        self.sync_anim_delays();
+                    }
+                    dirty = true;
+                }
+                Ev::SetLoop { index, on } => {
+                    let session = self.projects.current_mut();
+                    if let Some(sequence) = session.animations.get_mut(index) {
+                        sequence.set_looping(on);
+                        if index == session.animations.active() {
+                            session.animation.set_looping(on);
+                        }
+                        dirty = true;
+                    }
+                }
+                Ev::SetFrameDelay { ms } => {
+                    let session = self.projects.current_mut();
+                    let index = session.animation.current_index();
+                    if let Some(frame) = session.sequence_mut().frame_mut(index) {
+                        frame.set_delay_ms(ms);
+                    }
+                    // In-place: keep the current frame + play/stop state.
+                    self.sync_anim_delays();
+                    dirty = true;
+                }
+                Ev::OnionPrev(on) => {
+                    self.projects.current_mut().onion_prev = on;
+                }
+                Ev::OnionNext(on) => {
+                    self.projects.current_mut().onion_next = on;
+                }
+                Ev::SetFramesTool => {
+                    // "Set Frames" arms the Animation Placer tool so the user can
+                    // (re)place frame regions. This is a pure, commit-free tool
+                    // switch: routing it through `apply_toolbar_events` would
+                    // COMMIT a live transform, which this event must not do.
+                    self.projects
+                        .current_mut()
+                        .tool_state
+                        .select_tool(Tool::AnimationPlacer);
+                }
+                Ev::Play => self.projects.current_mut().animation.play(),
+                Ev::Stop => self.projects.current_mut().animation.stop(),
+                Ev::StopReset => self.projects.current_mut().animation.restart(),
+                Ev::PrevFrame => {
+                    // Fix 3 (consistency): playback stepping wraps like the
+                    // frame-edit cursor — frame 0's PREV goes to the last frame.
+                    let session = self.projects.current_mut();
+                    let len = session.sequence().len();
+                    if len > 0 {
+                        let current = session.animation.current_index() as i64;
+                        let next = (current - 1).rem_euclid(len as i64) as usize;
+                        session.animation.goto(next);
+                    }
+                }
+                Ev::NextFrame => {
+                    let session = self.projects.current_mut();
+                    let len = session.sequence().len();
+                    if len > 0 {
+                        let current = session.animation.current_index() as i64;
+                        let next = (current + 1).rem_euclid(len as i64) as usize;
+                        session.animation.goto(next);
+                    }
+                }
+            }
+        }
+        // The frame-edit cursor tracks the ACTIVE animation: a switch, add or
+        // remove can shorten the sequence, so re-clamp it into bounds.
+        self.clamp_frame_edit_index();
+        if dirty {
+            self.mark_dirty();
+        }
+    }
+
+    /// Open (or retarget) the floating animation settings panel for the
+    /// animation at `index`. Mirrors the Layer settings panel: register the
+    /// float spec, seed the text buffers from the model, then raise it.
+    fn open_animation_settings(&mut self, index: usize) {
+        let settings_id =
+            panel_dock::PanelId::new(dock_animation_settings::ANIMATION_SETTINGS_PANEL_ID);
+        let Some(sequence) = self.projects.current().animations.get(index) else {
+            return;
+        };
+        let name = sequence.name().to_string();
+        let multiplier = format!("{:.2}", sequence.delay_multiplier());
+        let looping = sequence.looping();
+        let registered = self.panel_dock.placement(settings_id).is_some();
+        let already = *self.animation_host.open_settings.borrow() == Some(index);
+        if registered && already {
+            // Gear pressed again for the open animation: treat as close.
+            self.panel_dock.remove_spec(settings_id);
+            *self.animation_host.open_settings.borrow_mut() = None;
+            *self.animation_host.settings_row.borrow_mut() = None;
+            return;
+        }
+        if !registered {
+            let spec = dock_animation_settings::animation_settings_panel_spec(
+                &self.animation_host,
+                egui::Rect::from_min_size(egui::pos2(360.0, 140.0), egui::vec2(280.0, 180.0)),
+            );
+            if self.panel_dock.add_spec(spec).is_ok() {
+                self.panel_dock.raise_floating(settings_id);
+            }
+        } else {
+            self.panel_dock.raise_floating(settings_id);
+        }
+        *self.animation_host.open_settings.borrow_mut() = Some(index);
+        *self.animation_host.rename_buffer.borrow_mut() = name;
+        *self.animation_host.multiplier_buffer.borrow_mut() = multiplier;
+        *self.animation_host.settings_loop.borrow_mut() = looping;
     }
 
     /// Apply Palette panel gestures: color picks route through the toolbar
@@ -2376,10 +3552,10 @@ impl App {
     /// project's tile palette and selects it. The "+ Selection" (AddFromSelection)
     /// path was removed (UX item 5) — tiles are created empty only.
     fn add_empty_tile(&mut self) {
-        let tile_size = self.projects.current().tile_size.max(1) as u16;
-        let w = tile_size;
-        let h = tile_size;
-        let pixels = vec![0u8; tile_size as usize * tile_size as usize * 4];
+        let ts = self.projects.current().tile_size;
+        let w = ts.w.max(1) as u16;
+        let h = ts.h.max(1) as u16;
+        let pixels = vec![0u8; w as usize * h as usize * 4];
         let session = self.projects.current_mut();
         let id = session.tile_palette.add(Tile {
             id: TileId(0),
@@ -2800,7 +3976,7 @@ impl App {
         if session.tool_state.tool() != Tool::Tile {
             return preview;
         }
-        let tile_size = session.tile_size.max(1) as u32;
+        let ts = session.tile_size;
         let layer_id = session.layers.active_layer_id();
         // Item 6: every assigned cell of the ACTIVE layer's tilemap carries its
         // tile_id label.
@@ -2831,7 +4007,7 @@ impl App {
         preview.gesture_cells = gesture_cells.clone();
         let cols = session.layers.width() as u32;
         let rows = session.layers.height() as u32;
-        let (max_cx, max_cy) = (cols.div_ceil(tile_size), rows.div_ceil(tile_size));
+        let (max_cx, max_cy) = (cols.div_ceil(ts.w), rows.div_ceil(ts.h));
         // The hover cell obeys the panel mask: a palette / toolbox / timeline
         // panel covers the pointer, and the placer must not highlight a cell
         // underneath it. Computed before the early returns so a GHOST or a
@@ -2844,7 +4020,7 @@ impl App {
                     self.canvas_widget
                         .screen_to_canvas(pos, camera, canvas_size)
                 })
-                .map(|(px, py)| TileMap::snap_cell((px, py), tile_size))
+                .map(|(px, py)| TileMap::snap_cell((px, py), ts))
                 .filter(|&(cx, cy)| cx < max_cx && cy < max_cy)
         };
         // Items 2+3: ONE decision point shared with the gesture. The effect
@@ -2868,7 +4044,7 @@ impl App {
             };
             let t = &self.tile_placer_transform;
             let pixels = oriented_ghost_pixels(&(*gw, *gh, ghost.clone()), t.flip_x, t.flip_y, t.rotation);
-            let (ox0, oy0) = ((cell.0 * tile_size) as i32, (cell.1 * tile_size) as i32);
+            let (ox0, oy0) = ((cell.0 * ts.w) as i32, (cell.1 * ts.h) as i32);
             for (dx, dy, color) in pixels {
                 let px = ox0 + dx;
                 let py = oy0 + dy;
@@ -2895,7 +4071,7 @@ impl App {
                 return;
             };
             let pixels = oriented_preview_pixels(tile, placed.flip_x, placed.flip_y, placed.rotation);
-            let (ox0, oy0) = ((cx * tile_size) as i32, (cy * tile_size) as i32);
+            let (ox0, oy0) = ((cx * ts.w) as i32, (cy * ts.h) as i32);
             preview.preview_pixels.extend(
                 pixels
                     .into_iter()
@@ -2988,9 +4164,9 @@ impl App {
         /// Hard upper bound so a pathological rect can never allocate without
         /// limit even if the viewport mapping is unavailable.
         const MAX_PREVIEW_CELLS: usize = 4096;
-        let tile_size = self.projects.current().tile_size.max(1) as u32;
-        let cols = canvas_size.0.div_ceil(tile_size);
-        let rows = canvas_size.1.div_ceil(tile_size);
+        let ts = self.projects.current().tile_size;
+        let cols = canvas_size.0.div_ceil(ts.w);
+        let rows = canvas_size.1.div_ceil(ts.h);
         // Resolve the visible canvas-pixel window by intersecting the canvas's
         // on-screen rect with the current viewport and inverting the mapping.
         let viewport = ctx.input(|i| i.viewport_rect());
@@ -3011,16 +4187,18 @@ impl App {
             .screen_to_canvas(visible.max, camera, canvas_size)
             .unwrap_or((canvas_size.0 as i32, canvas_size.1 as i32));
         // Pad by one cell so a partially visible edge cell is still previewed.
-        let pad = tile_size as i32;
-        let (vx0, vy0, vx1, vy1) = (vx0 - pad, vy0 - pad, vx1 + pad, vy1 + pad);
-        let cl = |px: i32| i64::from(px).div_euclid(i64::from(tile_size));
-        let c_min_x = cl(vx0).max(0).max(i64::from(min_cx)) as u32;
-        let c_min_y = cl(vy0).max(0).max(i64::from(min_cy)) as u32;
-        let c_max_x = cl(vx1)
+        let pad_x = ts.w as i32;
+        let pad_y = ts.h as i32;
+        let (vx0, vy0, vx1, vy1) = (vx0 - pad_x, vy0 - pad_y, vx1 + pad_x, vy1 + pad_y);
+        let cl_x = |px: i32| i64::from(px).div_euclid(i64::from(ts.w));
+        let cl_y = |py: i32| i64::from(py).div_euclid(i64::from(ts.h));
+        let c_min_x = cl_x(vx0).max(0).max(i64::from(min_cx)) as u32;
+        let c_min_y = cl_y(vy0).max(0).max(i64::from(min_cy)) as u32;
+        let c_max_x = cl_x(vx1)
             .min(i64::from(cols.saturating_sub(1)))
             .min(i64::from(max_cx))
             .max(0) as u32;
-        let c_max_y = cl(vy1)
+        let c_max_y = cl_y(vy1)
             .min(i64::from(rows.saturating_sub(1)))
             .min(i64::from(max_cy))
             .max(0) as u32;
@@ -3093,6 +4271,40 @@ impl App {
                 preview_pixels: preview.preview_pixels.clone(),
                 indices: preview.indices.clone(),
             };
+        }
+        // Animation Placer (Phase 3): while the tool is active, highlight the
+        // FIRST frame's region (red), the LAST frame's region (green), the whole
+        // indexed area (grey), plus the live in-flight rectangle.
+        if self.projects.current().tool_state.tool() == Tool::AnimationPlacer {
+            let in_flight = self.animation_placer_in_flight_rect();
+            let sequence = self.projects.current().sequence();
+            if sequence.len() > 0 {
+                let first = sequence.frame(0).map(|f| f.region().rect());
+                let last = sequence.frame(sequence.len() - 1).map(|f| f.region().rect());
+                if let (Some(first), Some(last)) = (first, last) {
+                    let mut area = first;
+                    for frame in sequence.iter() {
+                        area = area.union(frame.region().rect());
+                    }
+                    return CanvasOverlay::AnimationPlacer {
+                        first,
+                        last,
+                        area,
+                        in_flight,
+                    };
+                }
+            }
+            // Empty sequence: still show the live rectangle alone so the drag
+            // remains readable.
+            if let Some(rect) = in_flight {
+                return CanvasOverlay::AnimationPlacer {
+                    first: rect,
+                    last: rect,
+                    area: rect,
+                    in_flight: Some(rect),
+                };
+            }
+            return CanvasOverlay::None;
         }
         if let Some(t) = &self.projects.current().transform {
             match t {
@@ -3174,6 +4386,21 @@ impl App {
         if let Some(sel) = &self.projects.current().selection {
             return Self::selection_overlay(sel);
         }
+        // Persistent frame-region borders for the ACTIVE animation: a
+        // tool-independent marching-ants highlight of every frame region. It is
+        // the LOWEST overlay priority — tool overlays (Tile/AnimationPlacer),
+        // the transform gizmo, live selection gestures and the committed
+        // selection all win when active, so frame regions never mask what the
+        // artist is doing. The Animation Placer tool's richer red/green/grey
+        // overlay is handled above.
+        {
+            let sequence = self.projects.current().sequence();
+            if sequence.len() > 0 {
+                let regions: Vec<Rect2i> =
+                    sequence.iter().map(|frame| frame.region().rect()).collect();
+                return CanvasOverlay::FrameRegions(regions);
+            }
+        }
         CanvasOverlay::None
     }
 
@@ -3242,7 +4469,7 @@ impl App {
         // marching ants stay visible while the new area is swept; `base` is a
         // clone for the release merge (D77 item 2). A Replace gesture drops the
         // old selection outright.
-        let tile_size = self.projects.current().tile_size;
+        let ts = self.projects.current().tile_size;
         let session = self.projects.current_mut();
         let base = if mode != SelectMode::Replace {
             session.selection.clone()
@@ -3259,7 +4486,7 @@ impl App {
             FieldierChild::Rectangle if region => SelectGesture::TileBorder {
                 origin: pt,
                 current: pt,
-                cells: crate::core::selection_ops::tile_cells_on_segment(pt, pt, tile_size),
+                cells: crate::core::selection_ops::tile_cells_on_segment(pt, pt, ts),
                 base,
                 mode,
             },
@@ -3275,7 +4502,7 @@ impl App {
     /// Select-tool drag: update the move preview destination or the marquee.
     fn select_drag(&mut self, pt: (i32, i32)) {
         let session = self.projects.current_mut();
-        let tile_size = session.tile_size;
+        let ts = session.tile_size;
         let next = match std::mem::replace(&mut session.gesture, SelectGesture::Idle) {
             SelectGesture::AreaMove { origin, dest, .. } => match &session.selection {
                 Some(sel) => {
@@ -3338,7 +4565,7 @@ impl App {
                 // pointer crossed since the last sample joins the accumulated,
                 // path-ordered set (D77 item 4).
                 for cell in
-                    crate::core::selection_ops::tile_cells_on_segment(current, pt, tile_size)
+                    crate::core::selection_ops::tile_cells_on_segment(current, pt, ts)
                 {
                     if !cells.contains(&cell) {
                         cells.push(cell);
@@ -3535,12 +4762,14 @@ impl App {
                     // (matching the single-click Alt override), NOT the
                     // alpha-connected component. Otherwise a fast second click
                     // would silently break Alt+Shift.
-                    let tile = self.projects.current().tile_size.max(1) as i32;
+                    let ts = self.projects.current().tile_size;
+                    let tw = ts.w.max(1) as i32;
+                    let th = ts.h.max(1) as i32;
                     let seed_cell = Rect2i::new(
-                        seed.0.div_euclid(tile) * tile,
-                        seed.1.div_euclid(tile) * tile,
-                        tile,
-                        tile,
+                        seed.0.div_euclid(tw) * tw,
+                        seed.1.div_euclid(th) * th,
+                        tw,
+                        th,
                     );
                     let clip = wand
                         .restrict_to_region
@@ -3573,12 +4802,14 @@ impl App {
         let Some(seed) = seed else {
             return;
         };
-        let tile = self.projects.current().tile_size.max(1) as i32;
+        let ts = self.projects.current().tile_size;
+        let tw = ts.w.max(1) as i32;
+        let th = ts.h.max(1) as i32;
         let seed_cell = Rect2i::new(
-            seed.0.div_euclid(tile) * tile,
-            seed.1.div_euclid(tile) * tile,
-            tile,
-            tile,
+            seed.0.div_euclid(tw) * tw,
+            seed.1.div_euclid(th) * th,
+            tw,
+            th,
         );
         let clip = wand
             .restrict_to_region
@@ -3726,6 +4957,19 @@ impl App {
             }));
         self.projects.current_mut().selection = None;
         self.projects.current_mut().gesture = SelectGesture::Idle;
+        // Arm Fieldier/Rectangle without committing the live transform.
+        self.arm_rectangle_selection_tool();
+    }
+
+    /// While a floating transform session is live the primary selection tool
+    /// should be the Fieldier's Rectangle (the session drives a rectangle
+    /// selection by default). Deliberately NOT routed through
+    /// `apply_toolbar_events(ToolSelected)` — that would COMMIT the live
+    /// transform. It is a pure tool-state change, so a transform gesture in
+    /// flight is never interrupted.
+    fn arm_rectangle_selection_tool(&mut self) {
+        let tool_state = &mut self.projects.current_mut().tool_state;
+        tool_state.select_child(FieldierChild::Rectangle);
     }
 
     /// Transform-session pointer routing (D32): stroke drags drive the floating
@@ -4297,21 +5541,28 @@ impl App {
     /// result; drops the texture once the session ends. The curve variant has
     /// no pixel preview (it paints vectorially) and clears any stale texture.
     ///
-    /// **Two-tier algorithm (Y2-B):** while the session is being DRAGGED
-    /// (`SelectionTransform::preview_dragging`) the preview renders with the
-    /// FAST algorithm ([`TRANSFORM_DRAG_PREVIEW_ALGORITHM`], Rotxel); when idle
-    /// it renders with the selected algorithm (`object.algorithm()`, kept in
-    /// sync with `ProjectSession::transform_algorithm` by the W2 wiring). The
-    /// override never mutates the object, so commit still uses the selected
-    /// algorithm.
+    /// **Exact preview (Y2-B updated):** the preview ALWAYS renders with the
+    /// selected algorithm (`object.algorithm()`, kept in sync with
+    /// `ProjectSession::transform_algorithm` by the W2 wiring), even while the
+    /// session is being DRAGGED — so the preview is pixel-perfect at any
+    /// selection size (no fast/approximate swap). The override never mutates
+    /// the object, so commit still uses the selected algorithm.
+    ///
+    /// **Full commit resolution:** the preview renders with `render(None)` —
+    /// NO bounding cap — so the texture is BYTE-IDENTICAL to what a commit
+    /// produces (same algorithm, same dims, same pixels): no 64px downscale,
+    /// so the preview can never show "giant pixels" when it is scaled back up
+    /// to the canvas bbox.
     ///
     /// Item 7 dirty-gate: the render + upload runs only when
     /// [`TransformPreviewKey`] (pos / pivot / angle / scale / flips / dragging)
-    /// differs from the last upload, so an idle hover frame no longer pays the
-    /// render + texture-upload cost. `dragging` is part of the key so a release
-    /// re-renders with the selected algorithm even when the transform state is
-    /// unchanged. A missing texture always forces a re-upload, so a cleared key
-    /// can never leave the preview blank.
+    /// differs from the last upload, so an idle hover frame (even at full
+    /// resolution) no longer pays the render + texture-upload cost. `dragging`
+    /// is part of the key so a release re-renders even when the transform
+    /// state is unchanged; during an actual drag every change costs the same
+    /// as a commit render — the accepted trade-off for an exact preview. A
+    /// missing texture always forces a re-upload, so a cleared key can never
+    /// leave the preview blank.
     fn refresh_transform_preview(&mut self) {
         let current = self
             .projects
@@ -4337,8 +5588,11 @@ impl App {
             .and_then(TransformSession::selection_mut)
             .and_then(|t| {
                 let alg = transform_preview_algorithm(t.preview_dragging, t.object.algorithm());
+                // Full commit resolution: `None` (no bounding cap) makes the
+                // preview byte-identical to what the commit path renders —
+                // same algorithm, same dims, same pixels.
                 t.object
-                    .render_with_algorithm(Some(TRANSFORM_PREVIEW_MAX_DIM), alg)
+                    .render_with_algorithm(None, alg)
                     .into_iter()
                     .next()
             });
@@ -4436,7 +5690,7 @@ impl App {
             }
             // The other tools act on the cursor pixel itself; a 1 px footprint
             // keeps their inside test the strict point-in-draw-rect test.
-            Tool::Fill | Tool::Eyedropper | Tool::Fieldier | Tool::Tile => 1,
+            Tool::Fill | Tool::Eyedropper | Tool::Fieldier | Tool::Tile | Tool::AnimationPlacer => 1,
         };
         let pressed = ctx.input(|i| i.pointer.primary_pressed());
         let down = ctx.input(|i| i.pointer.primary_down());
@@ -5033,6 +6287,13 @@ impl App {
             self.handle_tile_placer_interactions(interactions);
             return;
         }
+        // The Animation Placer owns the primary gesture: a drag defines a
+        // rectangle of sheet cells that is auto-indexed into the active
+        // animation on release. Route it before the generic eyedropper/match.
+        if active_tool == Tool::AnimationPlacer {
+            self.handle_animation_placer_interactions(interactions);
+            return;
+        }
         if interactions.eyedropper_started {
             self.projects
                 .current_mut()
@@ -5051,7 +6312,10 @@ impl App {
                 self.handle_stroke_interactions(interactions)
             }
             Tool::Fill => {
-                if let Some(pt) = interactions.clicked {
+                // Fill applies ONCE on the primary PRESS frame. Use the RAW
+                // press signal (set only on the press frame) so a bare release
+                // adds nothing and a held button never re-paints.
+                if let Some(pt) = interactions.raw_pressed_over_canvas {
                     self.apply_fill(pt);
                 }
             }
@@ -5066,6 +6330,11 @@ impl App {
                 // Kept for exhaustiveness.
             }
             Tool::Fieldier => {}
+            Tool::AnimationPlacer => {
+                // Unreachable: `handle_interactions_in` routes
+                // Tool::AnimationPlacer to `handle_animation_placer_interactions`
+                // before the generic match. Kept for exhaustiveness.
+            }
         }
     }
 
@@ -5107,6 +6376,156 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Animation placer (Tool::AnimationPlacer) — Phase 3
+    // -----------------------------------------------------------------------
+
+    /// Drives the Animation-placer gesture on the MAIN canvas.
+    ///
+    /// The grid cell size is the project's `tile_size` (the SAME snap the tile
+    /// placer uses). A primary drag latches the press cell as the rectangle
+    /// anchor (from the widget's raw press, so the true press cell is caught
+    /// even before egui's drag threshold) and tracks the current cell; on
+    /// release [`Self::apply_animation_rect`] auto-indexes the cells row-major
+    /// into the ACTIVE animation.
+    ///
+    /// A bare click (press + release with no drag) is a documented NO-OP: the
+    /// gesture only applies once `anim_rect_dragging` is true, i.e. once egui's
+    /// drag threshold crossed or the pointer left the press cell. This keeps an
+    /// accidental click from replacing the animation with a single frame.
+    fn handle_animation_placer_interactions(&mut self, interactions: CanvasInteractions) {
+        // Latch the press cell on the raw press frame.
+        if let Some(pt) = interactions.raw_pressed_over_canvas {
+            let ts = self.projects.current().tile_size;
+            let cell = TileMap::snap_cell(pt, ts);
+            self.anim_rect_anchor = Some(cell);
+            self.anim_rect_current = Some(cell);
+            self.anim_rect_dragging = false;
+        }
+        // egui's drag threshold crossed this frame: a real drag.
+        if interactions.stroke_started {
+            self.anim_rect_dragging = true;
+        }
+        // Track the current cell while the gesture is live.
+        if let Some(pt) = interactions.stroke_point {
+            if self.anim_rect_anchor.is_some() {
+                let ts = self.projects.current().tile_size;
+                let cell = TileMap::snap_cell(pt, ts);
+                if Some(cell) != self.anim_rect_anchor {
+                    self.anim_rect_dragging = true;
+                }
+                self.anim_rect_current = Some(cell);
+            }
+        }
+        if interactions.stroke_ended {
+            if self.anim_rect_dragging {
+                if let (Some(anchor), Some(current)) =
+                    (self.anim_rect_anchor, self.anim_rect_current)
+                {
+                    self.apply_animation_rect(anchor, current);
+                }
+            }
+            self.anim_rect_anchor = None;
+            self.anim_rect_current = None;
+            self.anim_rect_dragging = false;
+        }
+    }
+
+    /// The `(min_cx, max_cx, min_cy, max_cy)` grid cells of the animation
+    /// rectangle `anchor..=current`, clamped to the canvas grid. Shared by the
+    /// live preview and the apply so they can never disagree.
+    fn animation_rect_cells(
+        &self,
+        anchor: (u32, u32),
+        current: (u32, u32),
+    ) -> Option<(u32, u32, u32, u32)> {
+        let project = self.projects.current();
+        let ts = project.tile_size;
+        let cols = (project.layers.width() as u32).div_ceil(ts.w);
+        let rows = (project.layers.height() as u32).div_ceil(ts.h);
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let (ax, ay) = (anchor.0.min(cols - 1), anchor.1.min(rows - 1));
+        let (bx, by) = (current.0.min(cols - 1), current.1.min(rows - 1));
+        Some((ax.min(bx), ax.max(bx), ay.min(by), ay.max(by)))
+    }
+
+    /// The live in-flight animation rectangle in canvas pixels, or `None` when no
+    /// rectangle gesture is latched. Used by the overlay preview.
+    fn animation_placer_in_flight_rect(&self) -> Option<Rect2i> {
+        let (anchor, current) = (self.anim_rect_anchor?, self.anim_rect_current?);
+        let (min_cx, max_cx, min_cy, max_cy) = self.animation_rect_cells(anchor, current)?;
+        let ts = self.projects.current().tile_size;
+        let tw = ts.w.max(1) as i32;
+        let th = ts.h.max(1) as i32;
+        Some(Rect2i::new(
+            min_cx as i32 * tw,
+            min_cy as i32 * th,
+            (max_cx - min_cx + 1) as i32 * tw,
+            (max_cy - min_cy + 1) as i32 * th,
+        ))
+    }
+
+    /// Auto-index the animation rectangle into the ACTIVE animation.
+    ///
+    /// REPLACE semantics: the active sequence's frames are REPLACED by the
+    /// cells of the rectangle, walked row-major (left-to-right, then the next
+    /// row), so frame index 0 is the top-left cell's region, index 1 the cell
+    /// to its right, wrapping to the next row. This is the natural reading of
+    /// "the rectangle defines the animation's frame list". The sequence name,
+    /// loop flag and delay multiplier are preserved; every new frame gets the
+    /// default 100 ms delay.
+    ///
+    /// A rectangle that would exceed [`MAX_FRAMES`] is REFUSED wholesale (the
+    /// existing frames are left untouched) rather than partially applied.
+    fn apply_animation_rect(&mut self, anchor: (u32, u32), current: (u32, u32)) {
+        let Some((min_cx, max_cx, min_cy, max_cy)) =
+            self.animation_rect_cells(anchor, current)
+        else {
+            return;
+        };
+        let count = ((max_cx - min_cx + 1) as usize) * ((max_cy - min_cy + 1) as usize);
+        if count == 0 || count > MAX_FRAMES {
+            // REFUSED: never truncate the user's rectangle silently.
+            return;
+        }
+        let ts = self.projects.current().tile_size;
+        let tw = ts.w.max(1) as i32;
+        let th = ts.h.max(1) as i32;
+        let mut frames = Vec::with_capacity(count);
+        let mut index = 0usize;
+        for cy in min_cy..=max_cy {
+            for cx in min_cx..=max_cx {
+                let rect = Rect2i::new(
+                    cx as i32 * tw,
+                    cy as i32 * th,
+                    tw,
+                    th,
+                );
+                frames.push(Frame::new(
+                    Region::new(rect, format!("Frame {}", index + 1)),
+                    100,
+                ));
+                index += 1;
+            }
+        }
+        {
+            let sequence = self.projects.current_mut().sequence_mut();
+            while sequence.len() > 0 {
+                let _ = sequence.remove(0);
+            }
+            for frame in frames {
+                if !sequence.push(frame) {
+                    break;
+                }
+            }
+        }
+        // Rebuild the controller's delay table + frame count, then mark dirty.
+        self.sync_anim_delays();
+        self.mark_dirty();
+    }
+
+    // -----------------------------------------------------------------------
     // Tile placer (Tool::Tile)
     // -----------------------------------------------------------------------
 
@@ -5139,8 +6558,8 @@ impl App {
             if let Some(pt) = interactions.stroke_point.or(interactions.clicked) {
                 if shift {
                     let project = self.projects.current();
-                    let tile_size = project.tile_size.max(1) as u32;
-                    let (cx, cy) = TileMap::snap_cell(pt, tile_size);
+                    let ts = project.tile_size;
+                    let (cx, cy) = TileMap::snap_cell(pt, ts);
                     self.tile_rect_anchor = Some((cx, cy));
                     self.tile_rect_current = Some((cx, cy));
                     self.tile_rect_deleting = self.tile_placer_transform.eraser;
@@ -5164,8 +6583,8 @@ impl App {
             if self.tile_rect_anchor.is_some() {
                 // Shift rectangle: only track the current cell; apply on release.
                 let project = self.projects.current();
-                let tile_size = project.tile_size.max(1) as u32;
-                self.tile_rect_current = Some(TileMap::snap_cell(pt, tile_size));
+                let ts = project.tile_size;
+                self.tile_rect_current = Some(TileMap::snap_cell(pt, ts));
             } else {
                 let mode = self.tile_effect();
                 self.tile_placer_cell(pt, mode);
@@ -5211,9 +6630,9 @@ impl App {
     /// an anchor equal to the current cell is still a one-cell rectangle.
     fn apply_tile_rect(&mut self, anchor: (u32, u32), current: (u32, u32)) {
         let project = self.projects.current();
-        let tile_size = project.tile_size.max(1) as u32;
-        let cols = (project.layers.width() as u32).div_ceil(tile_size);
-        let rows = (project.layers.height() as u32).div_ceil(tile_size);
+        let ts = project.tile_size;
+        let cols = (project.layers.width() as u32).div_ceil(ts.w);
+        let rows = (project.layers.height() as u32).div_ceil(ts.h);
         let clamp = |c: (u32, u32)| (c.0.min(cols.saturating_sub(1)), c.1.min(rows.saturating_sub(1)));
         let (ax, ay) = clamp(anchor);
         let (bx, by) = clamp(current);
@@ -5224,8 +6643,8 @@ impl App {
         let mode = self.tile_effect_with_eraser(self.tile_rect_deleting);
         for cy in min_cy..=max_cy {
             for cx in min_cx..=max_cx {
-                let origin_x = (cx as u64 * u64::from(tile_size)) as i32;
-                let origin_y = (cy as u64 * u64::from(tile_size)) as i32;
+                let origin_x = (cx as u64 * u64::from(ts.w)) as i32;
+                let origin_y = (cy as u64 * u64::from(ts.h)) as i32;
                 self.tile_placer_cell((origin_x, origin_y), mode);
             }
         }
@@ -5237,8 +6656,8 @@ impl App {
     /// on a cell boundary snaps like every other placer action.
     fn tile_placer_eyedrop(&mut self, pt: (i32, i32)) {
         let project = self.projects.current();
-        let tile_size = project.tile_size.max(1) as u32;
-        let (cx, cy) = TileMap::snap_cell(pt, tile_size);
+        let ts = project.tile_size;
+        let (cx, cy) = TileMap::snap_cell(pt, ts);
         let layer_id = project.layers.active_layer_id();
         let cell = project
             .layers
@@ -5265,10 +6684,10 @@ impl App {
             project.layers.height() as i32,
         );
         let rect = Rect2i::new(
-            (cx as u64 * u64::from(tile_size)) as i32,
-            (cy as u64 * u64::from(tile_size)) as i32,
-            tile_size as i32,
-            tile_size as i32,
+            (cx as u64 * u64::from(ts.w)) as i32,
+            (cy as u64 * u64::from(ts.h)) as i32,
+            ts.w as i32,
+            ts.h as i32,
         )
         .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
         if rect.is_empty() {
@@ -5320,14 +6739,14 @@ impl App {
             return;
         }
         let project = self.projects.current();
-        let tile_size = project.tile_size.max(1) as u32;
+        let ts = project.tile_size;
         let (cw, ch) = (
             project.layers.width() as u32,
             project.layers.height() as u32,
         );
-        let (cx, cy) = TileMap::snap_cell(pt, tile_size);
-        let cols = cw.div_ceil(tile_size);
-        let rows = ch.div_ceil(tile_size);
+        let (cx, cy) = TileMap::snap_cell(pt, ts);
+        let cols = cw.div_ceil(ts.w);
+        let rows = ch.div_ceil(ts.h);
         if cx >= cols || cy >= rows {
             return;
         }
@@ -5377,15 +6796,17 @@ impl App {
                 t.rotation,
             );
             // The recorded footprint must cover ANY orientation this ghost can
-            // take DURING the gesture (rotate/flip mid-hold), so record a
-            // maximal square `m×m` from the ghost's largest dimension and the
-            // tile_size, exactly like the tile path's BLOCKER-1 fix.
-            let max_dim = (tile_size as i32).max(gw.max(gh) as i32);
+            // take DURING the gesture (rotate/flip mid-hold), so record maximal
+            // per-axis dims from the ghost's largest dimension and the tile_size,
+            // exactly like the tile path's BLOCKER-1 fix.
+            let ghost_max = gw.max(gh) as i32;
+            let max_w = (ts.w as i32).max(ghost_max);
+            let max_h = (ts.h as i32).max(ghost_max);
             let max_rect = Rect2i::new(
-                (cx as u64 * u64::from(tile_size)) as i32,
-                (cy as u64 * u64::from(tile_size)) as i32,
-                max_dim,
-                max_dim,
+                (cx as u64 * u64::from(ts.w)) as i32,
+                (cy as u64 * u64::from(ts.h)) as i32,
+                max_w,
+                max_h,
             )
             .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
             // The actual blit footprint is the ORIENTED ghost dims at the cell
@@ -5393,8 +6814,8 @@ impl App {
             // overwrites the WHOLE destination footprint, including transparent
             // pixels (the preview only draws the opaque ones).
             let rect = Rect2i::new(
-                (cx as u64 * u64::from(tile_size)) as i32,
-                (cy as u64 * u64::from(tile_size)) as i32,
+                (cx as u64 * u64::from(ts.w)) as i32,
+                (cy as u64 * u64::from(ts.h)) as i32,
                 ow as i32,
                 oh as i32,
             )
@@ -5424,8 +6845,8 @@ impl App {
             // Copy the oriented bytes into the clipped footprint (a partially
             // off-canvas ghost is clipped, not wrapped).
             let (ox0, oy0) = (rect.x, rect.y);
-            let origin_x = (cx as u64 * u64::from(tile_size)) as i32;
-            let origin_y = (cy as u64 * u64::from(tile_size)) as i32;
+            let origin_x = (cx as u64 * u64::from(ts.w)) as i32;
+            let origin_y = (cy as u64 * u64::from(ts.h)) as i32;
             let mut bytes = vec![0u8; rect.area() as usize * 4];
             for y in 0..rect.h {
                 for x in 0..rect.w {
@@ -5462,7 +6883,7 @@ impl App {
         // at a different `tile_size`, or before a canvas resize), GROW/shrink it
         // to match — otherwise `set_cell` would silently drop the stamp as
         // out-of-bounds and the click would appear to do nothing.
-        self.ensure_tilemap(layer_id, tile_size, cols, rows);
+        self.ensure_tilemap(layer_id, ts, cols, rows);
 
         let clearing = matches!(mode, TileEffect::Delete);
         let existing = {
@@ -5499,24 +6920,9 @@ impl App {
         if existing == after {
             return;
         }
-        // Honest feedback: stamping a fully-transparent tile (the EMPTY tile
-        // "+ Empty" creates) writes a cell that renders as nothing on the
-        // canvas. The panel warns about it too; this covers the placer path.
-        if !clearing {
-            let transparent = self
-                .projects
-                .current()
-                .tile_palette
-                .selected_tile()
-                .is_some_and(|tile| tile.pixels.chunks_exact(4).all(|px| px[3] == 0));
-            if transparent {
-                self.projects.current_mut().last_error = Some(
-                    "The placed tile is empty (fully transparent) — nothing is visible. \
-                     Add pixels to the tile."
-                        .to_string(),
-                );
-            }
-        }
+        // Stamping a fully-transparent ("+ Empty") tile is a silent, valid
+        // operation: the cell is written and the placer continues, but no
+        // bottom-band status message is surfaced for it.
         // The first-touch flag decides whether the ORIGINAL cell `before` and
         // the pre-bake footprint bytes are recorded. Later touches only update
         // `after` and re-bake.
@@ -5546,18 +6952,20 @@ impl App {
                     .map(|tile| i32::from(tile.w.max(tile.h)))
                     .unwrap_or(0)
             };
-            let max_dim = {
+            let (max_w, max_h) = {
                 let project = self.projects.current();
-                let mut m = tile_size as i32;
-                m = m.max(tile_max(project, existing));
-                m = m.max(tile_max(project, after));
-                m
+                let existing_max = tile_max(project, existing);
+                let after_max = tile_max(project, after);
+                (
+                    (ts.w as i32).max(existing_max).max(after_max),
+                    (ts.h as i32).max(existing_max).max(after_max),
+                )
             };
             let max_rect = Rect2i::new(
-                (cx as u64 * u64::from(tile_size)) as i32,
-                (cy as u64 * u64::from(tile_size)) as i32,
-                max_dim,
-                max_dim,
+                (cx as u64 * u64::from(ts.w)) as i32,
+                (cy as u64 * u64::from(ts.h)) as i32,
+                max_w,
+                max_h,
             )
             .clamp_to(Rect2i::new(0, 0, canvas_w, canvas_h));
             let project = self.projects.current_mut();
@@ -5605,7 +7013,7 @@ impl App {
     /// Ensure the active layer owns a tilemap sized to the CURRENT canvas cell
     /// count, growing/shrinking an existing one. Used only by the Stamp/Delete
     /// paths (a ghost writes no cell and must not create a tilemap).
-    fn ensure_tilemap(&mut self, layer_id: LayerId, tile_size: u32, cols: u32, rows: u32) {
+    fn ensure_tilemap(&mut self, layer_id: LayerId, tile_size: TileSize, cols: u32, rows: u32) {
         let layers = &mut self.projects.current_mut().layers;
         let layer = layers.layer_mut(layer_id).expect("active layer exists");
         if layer.tilemap.is_none() {
@@ -5989,12 +7397,14 @@ impl App {
         // constraints hold when present.
         let selection_clip = project.selection.as_ref().map(PixelClip::from_selection);
         let region_clip = fill.restrict_to_region.then(|| {
-            let tile = project.tile_size.max(1) as i32;
+            let ts = project.tile_size;
+            let tw = ts.w.max(1) as i32;
+            let th = ts.h.max(1) as i32;
             PixelClip::from_rect(Rect2i::new(
-                pt.0.div_euclid(tile) * tile,
-                pt.1.div_euclid(tile) * tile,
-                tile,
-                tile,
+                pt.0.div_euclid(tw) * tw,
+                pt.1.div_euclid(th) * th,
+                tw,
+                th,
             ))
         });
         let clip = match (selection_clip, region_clip) {
@@ -6346,6 +7756,8 @@ impl App {
         self.projects.current_mut().selection = None;
         self.projects.current_mut().gesture = SelectGesture::Idle;
         self.lifted_selection_is_masked = false;
+        // Arm Fieldier/Rectangle without committing the live transform.
+        self.arm_rectangle_selection_tool();
     }
 
     /// Mirror a clipboard region to the OS image clipboard when the host
@@ -6482,6 +7894,16 @@ impl App {
     /// `ctrl` is set must still work. The keymap path is kept so custom
     /// non-Command bindings work.
     fn handle_shortcuts(&mut self) {
+        // While any in-app text input (TextEdit) holds keyboard focus, suppress
+        // ALL global shortcuts (tool/panel/file/clipboard/undo) so typing in any
+        // input box never triggers a hotkey. This is the ONE shared gate for
+        // every input box — no per-field wiring. `Context::text_edit_focused`
+        // (egui 0.36) is true only when the focused widget is a TextEdit, so a
+        // focused non-text widget never blocks the hotkeys. Focus state persists
+        // in egui's memory from the previous frame, so this reads correctly here.
+        if self.ctx.text_edit_focused() {
+            return;
+        }
         if self.projects.current_mut().transform.is_some() {
             let (
                 rotate_cw,
@@ -6625,6 +8047,10 @@ impl App {
             select_lasso,
             select_fill,
             select_tile_tool,
+            select_animation_placer,
+            save_project,
+            save_project_as,
+            open_project,
         ) = self.ctx.input(|i| {
             // Clipboard shortcuts: egui-winit swallows the raw Ctrl/Cmd+C/X/V
             // press, so detect them from the events it emits instead. Copy/Cut
@@ -6667,6 +8093,19 @@ impl App {
                 self.keymap.pressed(crate::input::Action::SelectLasso, i),
                 self.keymap.pressed(crate::input::Action::SelectFill, i),
                 self.keymap.pressed(crate::input::Action::SelectTileTool, i),
+                // `A` also moves the floating transform LEFT, but that raw read
+                // lives inside the live-transform branch above, which `return`s
+                // before this point. Outside a transform, `A` selects the
+                // animation placer tool.
+                self.keymap
+                    .pressed(crate::input::Action::SelectAnimationPlacer, i),
+                // File operations (Ctrl+S / Ctrl+Shift+S / Ctrl+O). A live
+                // transform returns earlier, so these follow the existing
+                // policy of being ignored during a floating transform.
+                self.keymap.pressed(crate::input::Action::SaveProject, i),
+                self.keymap
+                    .pressed(crate::input::Action::SaveProjectAs, i),
+                self.keymap.pressed(crate::input::Action::OpenProject, i),
             )
         });
         if cancel_selection {
@@ -6747,6 +8186,317 @@ impl App {
                 .tool_state
                 .select_tool(Tool::Tile);
         }
+        if select_animation_placer {
+            self.select_animation_placer_tool();
+        }
+        // File shortcuts route through the SAME handlers as the menu actions.
+        if save_project {
+            let _ = self.file_save();
+        }
+        if save_project_as {
+            let _ = self.file_save_as();
+        }
+        if open_project {
+            self.file_open();
+        }
+    }
+
+    /// Select the Animation placer tool from a keybinding (mirrors
+    /// `select_tile_tool`): commit any live floating transform first, then
+    /// switch.
+    fn select_animation_placer_tool(&mut self) {
+        self.transform_session_commit();
+        self.projects
+            .current_mut()
+            .tool_state
+            .select_tool(Tool::AnimationPlacer);
+    }
+
+    /// The active animation frame's preview image: the shared canvas texture,
+    /// the canvas size, and the current frame's region clamped to the canvas.
+    /// `None` when there is no texture or no active frame. This is the single
+    /// computation behind [`Self::frame_preview_feed`].
+    fn active_frame_preview(&self) -> Option<(egui::TextureId, egui::Vec2, Rect2i)> {
+        let texture = self.canvas_texture.as_ref()?;
+        let session = self.projects.current();
+        let index = session.animation.current_index();
+        let frame = session.sequence().frame(index)?;
+        let canvas = Rect2i::new(
+            0,
+            0,
+            session.layers.width() as i32,
+            session.layers.height() as i32,
+        );
+        let region = frame.region().rect().clamp_to(canvas);
+        if region.is_empty() {
+            return None;
+        }
+        Some((
+            texture.id(),
+            egui::vec2(
+                session.layers.width() as f32,
+                session.layers.height() as f32,
+            ),
+            region,
+        ))
+    }
+
+    /// The ACTIVE animation's frame-edit cursor frame's preview image: the
+    /// shared canvas texture, the canvas size, and the cursor frame's region
+    /// clamped to the canvas. Mirrors [`Self::active_frame_preview`] but tracks
+    /// [`Self::frame_edit_index`] instead of the playback index.
+    fn active_frame_edit_preview(&self) -> Option<(egui::TextureId, egui::Vec2, Rect2i)> {
+        let texture = self.canvas_texture.as_ref()?;
+        let session = self.projects.current();
+        let frame = session.sequence().frame(self.frame_edit_index)?;
+        let canvas = Rect2i::new(
+            0,
+            0,
+            session.layers.width() as i32,
+            session.layers.height() as i32,
+        );
+        let region = frame.region().rect().clamp_to(canvas);
+        if region.is_empty() {
+            return None;
+        }
+        Some((
+            texture.id(),
+            egui::vec2(
+                session.layers.width() as f32,
+                session.layers.height() as f32,
+            ),
+            region,
+        ))
+    }
+
+    /// The `(canvas_size, grid, brush, ...)` view for the Frame Edit viewport.
+    ///
+    /// A trimmed subset of the main canvas view: no transform/selection gesture
+    /// state, because the frame-edit viewport drives the shared tool pipeline
+    /// only through its own [`CanvasInteractions`] (see
+    /// [`Self::handle_frame_edit_interactions`]).
+    fn frame_edit_canvas_view(&self) -> CanvasView {
+        let session = self.projects.current();
+        let tool = session.tool_state.tool();
+        CanvasView {
+            canvas_size: (
+                session.layers.width() as u32,
+                session.layers.height() as u32,
+            ),
+            grid_visible: session.grid_visible,
+            tile_size: session.tile_size,
+            brush: matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw).then(|| {
+                let settings = session.draw_settings(tool);
+                BrushSpec::sanitize(settings.size, settings.shape)
+            }),
+            draw_mode: match tool {
+                Tool::Eraser => DrawMode::Eraser,
+                _ => DrawMode::Pen,
+            },
+            brush_color: session.color,
+            line: None,
+            selection_clip: Self::selection_pixel_clip(session.selection.as_ref()),
+            selection_drag_active: false,
+            transform_drag_active: false,
+            marquee_probe: None,
+            canvas_color_at: None,
+        }
+    }
+
+    /// Clamp [`Self::frame_edit_index`] into the active sequence.
+    ///
+    /// Policy: a mere clamp never recenters the frame-edit camera — the camera
+    /// is preserved across all frame changes (see [`Self::set_frame_edit_index`]).
+    fn clamp_frame_edit_index(&mut self) {
+        let len = self.projects.current().sequence().len();
+        let max = len.saturating_sub(1);
+        if self.frame_edit_index > max {
+            self.frame_edit_index = max;
+        }
+    }
+
+    /// Reset the frame-edit camera to the region's top-left.
+    ///
+    /// POLICY (Fix 2): the camera is recentered ONLY when genuinely required —
+    /// project activation / document load ([`Self::reset_animation_view_state`])
+    /// or a first open. Moving to another frame (prev/next/set) NEVER calls
+    /// this: the pan and zoom stay exactly as the user left them. The viewport
+    /// is REGION-RELATIVE (the widget displays only the cursor frame's sub-rect,
+    /// whose top-left is the camera's local origin), so recentring means pan
+    /// `(0, 0)` at the current zoom. The camera lives on the Frame Edit host,
+    /// independent of the main `session.camera`.
+    fn recenter_frame_edit_camera(&mut self) {
+        let mut camera = self.frame_edit_host.camera.get();
+        camera.set_pan(0, 0);
+        self.frame_edit_host.camera.set(camera);
+    }
+
+    /// Move the frame-edit cursor to `index`, clamped into bounds.
+    ///
+    /// The frame-edit camera is deliberately NOT touched: changing frames keeps
+    /// the current pan and zoom (Fix 2).
+    fn set_frame_edit_index(&mut self, index: usize) {
+        let len = self.projects.current().sequence().len();
+        let clamped = if len == 0 { 0 } else { index.min(len - 1) };
+        self.frame_edit_index = clamped;
+    }
+
+    /// Step the frame-edit cursor by `delta` with WRAP-AROUND (Fix 3): from
+    /// frame 0, PREV goes to the last frame; from the last, NEXT goes to 0.
+    /// A no-op when the sequence is empty.
+    fn step_frame_edit(&mut self, delta: i32) {
+        let len = self.projects.current().sequence().len();
+        if len == 0 {
+            return;
+        }
+        let len_i = len as i64;
+        let next = (self.frame_edit_index as i64 + delta as i64).rem_euclid(len_i) as usize;
+        self.frame_edit_index = next;
+    }
+
+    /// Recompute the Frame Edit viewport's onion overlay from the cursor frame's
+    /// WRAPPED neighbours and the session's onion flags, and publish it.
+    ///
+    /// The overlay carries the wrapped previous/next frame regions as a
+    /// painter-only [`CanvasOverlay::OnionOverlay`]: `prev` is the frame BEFORE
+    /// the cursor (wrapping to the last frame when the cursor is at 0) and `next`
+    /// is the frame AFTER it (wrapping to the first at the end). Each side is
+    /// `None` when its onion flag is off, the sequence is empty, the region is
+    /// empty, or the region lies fully outside the canvas. Regions are clamped to
+    /// the canvas bounds. The overlay is painter-only: it never captures or
+    /// alters the pointer. The tints are applied by the overlay painter, not
+    /// here.
+    fn refresh_frame_edit_overlay(&self) {
+        let session = self.projects.current();
+        let len = session.sequence().len();
+        let canvas = Rect2i::new(
+            0,
+            0,
+            session.layers.width() as i32,
+            session.layers.height() as i32,
+        );
+        let wrapped = |offset: i64| -> Option<Rect2i> {
+            if len == 0 {
+                return None;
+            }
+            let index = (self.frame_edit_index as i64 + offset).rem_euclid(len as i64) as usize;
+            session
+                .sequence()
+                .frame(index)
+                .map(|frame| frame.region().rect().clamp_to(canvas))
+                .filter(|rect| !rect.is_empty())
+        };
+        let prev = if session.onion_prev { wrapped(-1) } else { None };
+        let next = if session.onion_next { wrapped(1) } else { None };
+        *self.frame_edit_host.overlay.borrow_mut() = if prev.is_none() && next.is_none() {
+            CanvasOverlay::None
+        } else {
+            CanvasOverlay::OnionOverlay { prev, next }
+        };
+    }
+
+    /// Publish this frame's model snapshot into the Frame Edit host before the
+    /// dock renders: cursor index/count, delay text seed, onion flags, camera,
+    /// texture id, canvas view and onion overlay. Stale interactions from the
+    /// previous frame are cleared; the App drains this frame's after rendering.
+    fn publish_frame_edit_view(&mut self) {
+        self.clamp_frame_edit_index();
+        let (frame_count, onion_prev, onion_next, delay) = {
+            let session = self.projects.current();
+            let delay = session
+                .sequence()
+                .frame(self.frame_edit_index)
+                .map(|frame| frame.delay_ms())
+                .unwrap_or(100);
+            (
+                session.sequence().len(),
+                session.onion_prev,
+                session.onion_next,
+                delay,
+            )
+        };
+        self.frame_edit_host.index.set(self.frame_edit_index);
+        self.frame_edit_host.frame_count.set(frame_count);
+        self.frame_edit_host.onion_prev.set(onion_prev);
+        self.frame_edit_host.onion_next.set(onion_next);
+        // Seed the delay text only when the cursor frame or its delay changed,
+        // so an in-progress edit is never clobbered mid-frame.
+        if self.frame_edit_host.delay_seed.get() != (self.frame_edit_index, delay) {
+            *self.frame_edit_host.delay_buffer.borrow_mut() = delay.to_string();
+            self.frame_edit_host
+                .delay_seed
+                .set((self.frame_edit_index, delay));
+        }
+        self.frame_edit_host
+            .image_id
+            .set(self.canvas_texture.as_ref().map(|texture| texture.id()));
+        // Fix 1: the viewport displays ONLY the cursor frame's region. Publish
+        // the region into the host; the panel applies it to its own widget.
+        let region = self
+            .projects
+            .current()
+            .sequence()
+            .frame(self.frame_edit_index)
+            .map(|frame| frame.region().rect())
+            .filter(|rect| !rect.is_empty());
+        self.frame_edit_host.region.set(region);
+        *self.frame_edit_host.view.borrow_mut() = self.frame_edit_canvas_view();
+        self.refresh_frame_edit_overlay();
+        *self.frame_edit_host.interactions.borrow_mut() = None;
+    }
+
+    /// Apply the Frame Edit control-bar gestures. The panel is a pure view;
+    /// every model mutation happens here, bounds-checked.
+    fn apply_frame_edit_events(&mut self, events: Vec<dock_frame_edit_panel::FrameEditPanelEvent>) {
+        use dock_frame_edit_panel::FrameEditPanelEvent as Ev;
+        for event in events {
+            match event {
+                Ev::SetFrameDelay { ms } => {
+                    let index = self.frame_edit_index;
+                    let session = self.projects.current_mut();
+                    if let Some(frame) = session.sequence_mut().frame_mut(index) {
+                        frame.set_delay_ms(ms);
+                    }
+                    // In-place: keep the current frame + play/stop state.
+                    self.sync_anim_delays();
+                    // The buffer now matches the canonical value; keep the seed
+                    // in step so an in-progress edit is not clobbered next frame.
+                    self.frame_edit_host.delay_seed.set((index, ms));
+                    self.mark_dirty();
+                }
+                Ev::OnionPrev(on) => {
+                    self.projects.current_mut().onion_prev = on;
+                }
+                Ev::OnionNext(on) => {
+                    self.projects.current_mut().onion_next = on;
+                }
+                Ev::PrevFrame => self.step_frame_edit(-1),
+                Ev::NextFrame => self.step_frame_edit(1),
+            }
+        }
+        // Reflect this frame's toggles in the overlay immediately.
+        self.refresh_frame_edit_overlay();
+    }
+
+    /// Feed the Frame Edit viewport's interactions into the SAME gesture
+    /// pipeline as the main canvas.
+    ///
+    /// The widget's own geometry already produced canvas-space stroke points, so
+    /// the main `update_tool_gesture` (which is bound to the main canvas widget
+    /// and camera) is deliberately NOT run. Instead its raw press is adapted
+    /// into the press-paints stream, so a press without movement is a one-pixel
+    /// stroke exactly like the main canvas. The widget's own camera receives the
+    /// pan/zoom it applied; the main `session.camera` is never touched here.
+    fn handle_frame_edit_interactions(&mut self, mut interactions: CanvasInteractions) {
+        if let Some(pt) = interactions.raw_pressed_over_canvas {
+            interactions.stroke_segment_started = true;
+            interactions.stroke_point = Some(pt);
+            interactions.stroke_started = false;
+        }
+        // The panel content already wrote the widget's updated camera back into
+        // the host, so only the shared tool pipeline remains to run here.
+        let ctx = self.ctx.clone();
+        self.handle_interactions_in(&ctx, interactions);
     }
 
     /// A deliberate Fieldier child switch from a keybinding: commit any live
@@ -6766,6 +8516,12 @@ impl App {
         // A loaded document defines a new canvas; any ghost from the previous
         // document must not leak.
         self.ghost_tile = None;
+        // B1/B2: the load path already builds the controller from the effective
+        // delays + loop flag; re-sync to make the invariant explicit.
+        self.sync_anim_delays();
+        // S5: a loaded document must not inherit the previous project's
+        // frame-edit cursor/camera or onion flags.
+        self.reset_animation_view_state();
     }
 
     fn file_new(&mut self) {
@@ -6781,20 +8537,25 @@ impl App {
         }
     }
 
+    /// Open a project via the in-app file chooser (D80): the picked path is
+    /// either a single-file `.pyxross` archive, the `manifest.json` of a
+    /// native directory project, or a directory itself — all handed to
+    /// `load_project`, which dispatches on the path shape. `last_dir` is set
+    /// on confirm inside `drain_file_chooser_events`. The native
+    /// `rfd::pick_file()` portal dialog hangs on this machine; the chooser
+    /// panel (id 208) replaces it.
     fn file_open(&mut self) {
-        let Some(path) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
-        if self.projects.current().is_dirty() {
-            self.projects.current_mut().pending_action = Some(PendingAction::Open {
-                project: self.projects.current().id,
-                path,
-            });
-        } else {
-            self.load_project(path);
-        }
+        let seed = self
+            .last_dir
+            .clone()
+            .unwrap_or_else(|| self.default_save_location());
+        self.open_file_chooser(dock_file_chooser_panel::FileChooserMode::OpenProject, seed);
     }
 
+    /// Save the active project. In-place saves go through `save_to`, which
+    /// dispatches on the stored path's shape (archive file for `.pyxross` /
+    /// directory project otherwise); a project without a path prompts
+    /// `file_save_as`.
     fn file_save(&mut self) -> bool {
         if let Some(path) = self.projects.current().path.clone() {
             self.save_to(path)
@@ -6803,16 +8564,47 @@ impl App {
         }
     }
 
+    /// Save the active project under a new name via the in-app save-as modal
+    /// (the `rfd::FileDialog::save_file()` portal dialog hangs on this
+    /// machine — the modal replaces it). The modal applies the D80 DIR↔FILE
+    /// contract: a directory project by default, or a single `.pyxross`
+    /// archive.
     fn file_save_as(&mut self) -> bool {
-        let Some(path) = rfd::FileDialog::new().pick_folder() else {
-            return false;
-        };
-        self.save_to(path)
+        self.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        true
     }
 
+    /// Remember the directory a file dialog resolved to as `last_dir` and
+    /// persist it to `<config>/pyxross/last_dir` (best-effort).
+    fn remember_last_dir(&mut self, path: &Path) {
+        let dir = path.to_path_buf();
+        self.last_dir = Some(dir.clone());
+        if let Some(base) = last_dir_base() {
+            save_last_dir(&base, &dir);
+        }
+    }
+
+    /// Save `doc` to `path`, dispatching on the path shape (D80):
+    /// - `is_dir()`, or a path WITHOUT a `.pyxross` extension → directory
+    ///   project via `save_document` (the pre-D80 form — legacy extensionless
+    ///   directory projects keep their exact behaviour);
+    /// - otherwise (a `.pyxross` file) → single-file archive via
+    ///   `save_document_file` (atomic `.tmp` + rename write).
+    ///
+    /// In-place saves therefore overwrite the archive when the session path is
+    /// a `.pyxross` file and rewrite the directory when it is one.
     fn save_to(&mut self, path: PathBuf) -> bool {
         let doc = self.app_to_document();
-        match save_document(&doc, &path) {
+        let directory_form = path.is_dir()
+            || !path
+                .extension()
+                .is_some_and(|extension| extension == "pyxross");
+        let result = if directory_form {
+            save_document(&doc, &path)
+        } else {
+            save_document_file(&doc, &path)
+        };
+        match result {
             Ok(()) => {
                 let name = path
                     .file_name()
@@ -6840,6 +8632,18 @@ impl App {
         self.ghost_tile = None;
         self.tile_rect_anchor = None;
         self.tile_rect_current = None;
+        // A picked `manifest.json` is the marker of a native directory
+        // project: load the directory itself, because `load_document` reads
+        // plain JSON as an archive and would reject it.
+        if path.is_file()
+            && path
+                .file_name()
+                .is_some_and(|name| name == "manifest.json")
+        {
+            if let Some(parent) = path.parent() {
+                return self.load_project(parent.to_path_buf());
+            }
+        }
         if let Some(project) = self.projects.find_by_path(&path) {
             let _ = self.activate_project(project);
             self.update_title();
@@ -6856,7 +8660,15 @@ impl App {
                 );
                 debug_assert_eq!(self.projects.active_id(), Some(project));
                 self.document_to_app(&doc);
-                let project_palettes = load_project_palettes(&path);
+                // Palettes live inside the project directory; a single-file
+                // `.pyxross` archive has no `palettes/` dir, so probe only the
+                // directory form (probing a file path would look in the wrong
+                // place).
+                let project_palettes = if path.is_dir() {
+                    load_project_palettes(&path)
+                } else {
+                    Vec::new()
+                };
                 self.projects
                     .current_mut()
                     .palettes
@@ -6879,7 +8691,7 @@ impl App {
         }
     }
 
-    fn create_new_canvas(&mut self, width: u32, height: u32, tile: u32) {
+    fn create_new_canvas(&mut self, width: u32, height: u32, tile: TileSize) {
         let w = width.max(1) as usize;
         let h = height.max(1) as usize;
         self.projects.current_mut().layers = LayerStack::new(w, h);
@@ -6887,22 +8699,29 @@ impl App {
         self.clear_selection();
         self.projects.current_mut().clipboard = None;
         self.transform_preview = None;
-        self.projects.current_mut().sequence = {
-            let mut seq = AnimationSequence::new("Animation 1");
+        // A new canvas starts a FRESH animation set: one "Animation 1" with a
+        // single full-canvas frame. Replacing the whole set drops any extra
+        // animations from the previous document.
+        {
+            let session = self.projects.current_mut();
+            session.animations = crate::core::model::AnimationSet::new();
+            let seq = session.sequence_mut();
             seq.set_looping(true);
             seq.push(Frame::new(
                 Region::new(Rect2i::new(0, 0, w as i32, h as i32), "Frame 1"),
                 100,
             ));
-            seq
-        };
+        }
         self.projects.current_mut().animation = AnimationController::new_from_delays(1, vec![100]);
+        // Enforce the invariant even on this fresh-canvas path: the controller's
+        // delays/loop flag always come from the active sequence.
+        self.sync_anim_delays();
         {
             let session = self.projects.current_mut();
             session.path = None;
             session.name = String::from("Untitled");
             session.mark_saved();
-            session.tile_size = tile.max(1);
+            session.tile_size = tile;
         }
         self.projects.current_mut().new_draft_w = width.max(1);
         self.projects.current_mut().new_draft_h = height.max(1);
@@ -7034,9 +8853,14 @@ impl App {
                     .prefix("Height: "),
             );
             ui.add(
-                egui::DragValue::new(&mut self.projects.current_mut().tile_size)
+                egui::DragValue::new(&mut self.projects.current_mut().tile_size.w)
                     .range(1..=128)
-                    .prefix("Tile: "),
+                    .prefix("Tile W: "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.projects.current_mut().tile_size.h)
+                    .range(1..=128)
+                    .prefix("Tile H: "),
             );
             ui.horizontal(|ui| {
                 if ui.button("Create").clicked() {
@@ -7202,67 +9026,242 @@ impl App {
         ))
     }
 
-    fn import_png_bytes(&mut self, img: &crate::io::PngImage) -> Result<(), String> {
-        let project = self.projects.current();
-        let canvas_w = project.layers.width();
-        let canvas_h = project.layers.height();
-        let w = img.width.min(canvas_w);
-        let h = img.height.min(canvas_h);
-        if w == 0 || h == 0 {
+    /// Applies a confirmed Import GIF (`line_length` frames per sheet row).
+    ///
+    /// Layout: the frame grid becomes a `line_length`-wide sheet sized
+    /// `cells × frame` (cells rounded up to full lines); frames blit to their
+    /// row-major cell rects in animation order, empty leftover cells stay
+    /// transparent. The canvas GROWS to the sheet size — never shrinks, and
+    /// existing content stays at its place (top-left). The animation sequence
+    /// is REPLACED by one frame per GIF frame (each preserving its delay); the
+    /// regions keep join to the sheet cells. Rejects — session unchanged, the
+    /// error returned — when the sheet exceeds the frame limit or the canvas
+    /// cap.
+    /// Confirm an Import GIF (`line_length` cells per row) by opening the
+    /// decoded animation in a NEW document named after the imported file's
+    /// stem (create-document parity: `new_project` creates AND activates the
+    /// session, the fresh session starts clean, and the pre-existing
+    /// document is never touched). The new canvas is exactly the sheet size —
+    /// the frames land in their cell rects with the real per-frame delays.
+    /// Rejects — no document created, the error returned — when the sheet
+    /// exceeds the frame/canvas limits.
+    fn apply_import_gif(&mut self, line_length: u32) -> Result<(), String> {
+        let pending = self
+            .pending_gif_import
+            .take()
+            .ok_or_else(|| "No GIF import pending".to_string())?;
+        let sheet = crate::core::import::gif_sheet(
+            pending.decode.frames.len(),
+            line_length,
+            pending.decode.frame_w,
+            pending.decode.frame_h,
+        )
+        .ok_or_else(|| "Imported GIF has no frames".to_string())?;
+        if sheet.cells > MAX_FRAMES {
+            return Err(format!(
+                "{} cells exceed the {MAX_FRAMES} cell limit",
+                sheet.cells
+            ));
+        }
+        let (new_w, new_h) = (sheet.canvas_w, sheet.canvas_h);
+        if new_w > IMPORT_MAX_CANVAS_SIDE || new_h > IMPORT_MAX_CANVAS_SIDE {
+            return Err(format!(
+                "canvas {new_w}x{new_h} exceeds {IMPORT_MAX_CANVAS_SIDE}x{IMPORT_MAX_CANVAS_SIDE}"
+            ));
+        }
+        let rects = crate::core::import::region_rects(
+            line_length,
+            sheet.rows as u32,
+            pending.decode.frame_w,
+            pending.decode.frame_h,
+        );
+        let mut sheet_buffer = PixelBuffer::new(sheet.canvas_w as usize, sheet.canvas_h as usize);
+        for (index, frame) in pending.decode.frames.iter().enumerate() {
+            // The cells count always covers the frame count (rounded up);
+            // `get` is defensive only.
+            let Some(rect) = rects.get(index) else {
+                break;
+            };
+            if !sheet_buffer.blit_region(*rect, &frame.rgba) {
+                return Err("Failed to stage imported layer".to_string());
+            }
+        }
+        let sheet_rect = Rect2i::new(0, 0, sheet.canvas_w as i32, sheet.canvas_h as i32);
+        let selection = Selection::capture(&sheet_buffer, sheet_rect)
+            .ok_or_else(|| "Failed to capture imported selection".to_string())?;
+        let sheet_bytes = sheet_buffer.as_bytes().to_vec();
+        // A NEW document sized exactly to the sheet, named after the file's
+        // stem — the create-document creation+activation flow, birebir
+        // (the tab bar follows `projects.tabs()`). Everything fallible has
+        // already run; the writes below cannot fail.
+        let id = self.new_project(
+            import_document_name(&pending.path),
+            new_w as usize,
+            new_h as usize,
+        );
+        if let Some(session) = self.projects.session_mut(id) {
+            // Match the create-document rule: the tile grid follows the
+            // region cell size — here the GIF frame size — so the new canvas
+            // shows the region grid instead of the default 16x16 overlay.
+            session.tile_size = TileSize::new(pending.decode.frame_w, pending.decode.frame_h);
+            // First layer (the fresh session's "Layer 1"): blit the whole
+            // sheet in — the canvas IS the sheet size, so this is a full
+            // rect copy.
+            if !session
+                .layers
+                .active_layer_mut()
+                .buffer
+                .blit_region(sheet_rect, &sheet_bytes)
+            {
+                return Err("Failed to stage imported layer".to_string());
+            }
+            // Replace the fresh default single-frame sequence with one frame
+            // per animation frame, keeping the fresh sequence's name, default
+            // 1.0x delay multiplier and loop flag — the delays read back
+            // exactly as stored.
+            let seq_name = session.sequence().name().to_owned();
+            let seq_multiplier = session.sequence().delay_multiplier_centi();
+            let seq_looping = session.sequence().looping();
+            let mut next_sequence = AnimationSequence::new(seq_name);
+            next_sequence.set_delay_multiplier_centi(seq_multiplier);
+            next_sequence.set_looping(seq_looping);
+            for (index, frame) in pending.decode.frames.iter().enumerate() {
+                let rect = rects[index];
+                if !next_sequence.push(Frame::new(
+                    Region::new(rect, format!("Frame {}", index + 1)),
+                    frame.delay_ms,
+                )) {
+                    return Err("Project frame limit reached".to_string());
+                }
+            }
+            let delays: Vec<u32> = (0..next_sequence.len())
+                .map(|index| next_sequence.effective_delay_ms(index))
+                .collect();
+            let looping = next_sequence.looping();
+            let mut next_animation =
+                AnimationController::new_from_delays(next_sequence.len(), delays);
+            next_animation.set_looping(looping);
+            *session.sequence_mut() = next_sequence;
+            session.animation = next_animation;
+            session.selection = Some(selection);
+            // create-document parity: a freshly created session starts clean
+            // (unmodified) — deliberately no mark_dirty here.
+        }
+        self.invalidate_host_project_cache();
+        Ok(())
+    }
+
+    /// Confirms an Import Image (`px_w × px_h` cells per region) by opening the
+    /// image in a NEW document named after the imported file's stem
+    /// (create-document parity: `new_project` creates AND activates the
+    /// session, the fresh session starts clean, and the pre-existing
+    /// document is never touched). The new canvas is exactly the grid size —
+    /// the image lands at (0,0), one frame per region (each 100 ms, frame N
+    /// shows the N-th grid cell). Rejects — no document created, the error
+    /// returned — when the split is empty or the region/canvas limits are
+    /// exceeded.
+    fn apply_import_image(&mut self, px_w: u32, px_h: u32) -> Result<(), String> {
+        let pending = self
+            .pending_image_import
+            .take()
+            .ok_or_else(|| "No image import pending".to_string())?;
+        if px_w == 0 || px_h == 0 {
+            return Err("Split size is empty".to_string());
+        }
+        let (regions_w, regions_h) = crate::core::import::regions_from_pixels(
+            pending.image.width as u32,
+            pending.image.height as u32,
+            px_w,
+            px_h,
+        );
+        if regions_w == 0 || regions_h == 0 || pending.image.width == 0 || pending.image.height == 0
+        {
             return Err("Imported image is empty".to_string());
         }
-        let source_stride = img
-            .width
-            .checked_mul(4)
-            .ok_or_else(|| "Imported image is too large".to_string())?;
-        let source_len = img
-            .width
-            .checked_mul(img.height)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| "Imported image is too large".to_string())?;
-        if img.rgba.len() != source_len {
-            return Err("Imported image has invalid pixel data".to_string());
+        if regions_w as usize * regions_h as usize > MAX_FRAMES {
+            return Err(format!(
+                "{} regions exceed the {MAX_FRAMES} region limit",
+                regions_w * regions_h
+            ));
         }
-        let clipped_len = w
-            .checked_mul(h)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| "Imported image is too large".to_string())?;
-        let clipped_stride = w
-            .checked_mul(4)
-            .ok_or_else(|| "Imported image is too large".to_string())?;
-        let mut clipped = Vec::with_capacity(clipped_len);
-        for row in img.rgba.chunks_exact(source_stride).take(h) {
-            clipped.extend_from_slice(&row[..clipped_stride]);
+        let (canvas_w, canvas_h) =
+            crate::core::import::canvas_from_grid(regions_w, regions_h, px_w, px_h);
+        if canvas_w > IMPORT_MAX_CANVAS_SIDE || canvas_h > IMPORT_MAX_CANVAS_SIDE {
+            return Err(format!(
+                "canvas {canvas_w}x{canvas_h} exceeds {IMPORT_MAX_CANVAS_SIDE}x{IMPORT_MAX_CANVAS_SIDE}"
+            ));
         }
-        if project.sequence.len() >= MAX_FRAMES {
-            return Err("Project frame limit reached".to_string());
-        }
-        let rect = Rect2i::new(0, 0, w as i32, h as i32);
-        let frame_name = format!("Frame {}", project.sequence.len() + 1);
-        let mut next_sequence = project.sequence.clone();
-        if !next_sequence.push(Frame::new(Region::new(rect, frame_name), 100)) {
-            return Err("Project frame limit reached".to_string());
-        }
-        let delays: Vec<u32> = next_sequence.iter().map(|f| f.delay_ms()).collect();
-        let next_animation = AnimationController::new_from_delays(next_sequence.len(), delays);
-        let mut imported_buffer = PixelBuffer::new(canvas_w, canvas_h);
-        if !imported_buffer.blit_region(rect, &clipped) {
+        let rects = crate::core::import::region_rects(regions_w, regions_h, px_w, px_h);
+        let mut sheet_buffer = PixelBuffer::new(canvas_w as usize, canvas_h as usize);
+        let image_rect = Rect2i::new(
+            0,
+            0,
+            pending.image.width as i32,
+            pending.image.height as i32,
+        );
+        if !sheet_buffer.blit_region(image_rect, &pending.image.rgba) {
             return Err("Failed to stage imported layer".to_string());
         }
-        let selection = Selection::capture(&imported_buffer, rect)
+        let sheet_rect = Rect2i::new(0, 0, canvas_w as i32, canvas_h as i32);
+        let selection = Selection::capture(&sheet_buffer, sheet_rect)
             .ok_or_else(|| "Failed to capture imported selection".to_string())?;
-        let layer_id = self
-            .projects
-            .current_mut()
-            .layers
-            .add_layer_with_region("Imported", rect, &clipped)
-            .ok_or_else(|| "Failed to create imported layer".to_string())?;
-        self.projects.current_mut().layers.set_active(layer_id);
-        let project = self.projects.current_mut();
-        project.sequence = next_sequence;
-        project.animation = next_animation;
-        project.selection = Some(selection);
-        project.mark_dirty();
+        let sheet_bytes = sheet_buffer.as_bytes().to_vec();
+        // A NEW document sized exactly to the grid, named after the file's
+        // stem — the create-document creation+activation flow, birebir.
+        // Everything fallible has already run; the writes below cannot fail.
+        let id = self.new_project(
+            import_document_name(&pending.path),
+            canvas_w as usize,
+            canvas_h as usize,
+        );
+        if let Some(session) = self.projects.session_mut(id) {
+            // Match the create-document rule: the tile grid follows the
+            // region cell size — here the requested split size — so the new
+            // canvas shows the region grid instead of the default 16x16
+            // overlay.
+            session.tile_size = TileSize::new(px_w, px_h);
+            // First layer (the fresh session's "Layer 1"): blit the whole
+            // grid in — the canvas IS the grid size, so this is a full rect
+            // copy.
+            if !session
+                .layers
+                .active_layer_mut()
+                .buffer
+                .blit_region(sheet_rect, &sheet_bytes)
+            {
+                return Err("Failed to stage imported layer".to_string());
+            }
+            // Replace the fresh default single-frame sequence with one frame
+            // per region (100 ms each), keeping the fresh sequence's name,
+            // default 1.0x delay multiplier and loop flag — the delays read
+            // back exactly.
+            let seq_name = session.sequence().name().to_owned();
+            let seq_multiplier = session.sequence().delay_multiplier_centi();
+            let seq_looping = session.sequence().looping();
+            let mut next_sequence = AnimationSequence::new(seq_name);
+            next_sequence.set_delay_multiplier_centi(seq_multiplier);
+            next_sequence.set_looping(seq_looping);
+            for (index, rect) in rects.iter().enumerate() {
+                if !next_sequence.push(Frame::new(
+                    Region::new(*rect, format!("Frame {}", index + 1)),
+                    100,
+                )) {
+                    return Err("Project frame limit reached".to_string());
+                }
+            }
+            let delays: Vec<u32> = (0..next_sequence.len())
+                .map(|index| next_sequence.effective_delay_ms(index))
+                .collect();
+            let looping = next_sequence.looping();
+            let mut next_animation =
+                AnimationController::new_from_delays(next_sequence.len(), delays);
+            next_animation.set_looping(looping);
+            *session.sequence_mut() = next_sequence;
+            session.animation = next_animation;
+            session.selection = Some(selection);
+            // create-document parity: a freshly created session starts clean
+            // (unmodified) — deliberately no mark_dirty here.
+        }
         self.invalidate_host_project_cache();
         Ok(())
     }
@@ -7279,13 +9278,6 @@ impl App {
                 return;
             }
         };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG", &["png"])
-            .set_file_name("sprite_sheet.png")
-            .save_file()
-        else {
-            return;
-        };
         let meta = match sprite_sheet_meta_json(&self.app_to_document()) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -7294,22 +9286,30 @@ impl App {
                 return;
             }
         };
-        match std::fs::write(&path, png)
-            .and_then(|_| std::fs::write(path.with_extension("json"), meta))
-        {
-            Ok(()) => self.projects.current_mut().last_error = None,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export sprite sheet: {err}"));
-            }
-        }
+        // The payload is computed ONCE (above); the in-app modal only picks
+        // the destination — writing happens on Save (PNG + sibling .json).
+        self.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::SpriteSheet,
+            Some(dock_save_as_panel::SavePayload::SpriteSheet { png, meta }),
+        );
     }
 
     fn file_export_gif(&mut self) {
         let mut frames = Vec::new();
+        // Playback and GIF export share `effective_delay_ms` as the single
+        // source of truth for timing: the multiplier applied for on-screen
+        // playback is exactly the delay written into the GIF.
+        let delays = self.projects.current().effective_frame_delays();
+        let rects: Vec<Rect2i> = self
+            .projects
+            .current()
+            .sequence()
+            .iter()
+            .map(|frame| frame.region().rect())
+            .collect();
+        let frame_specs: Vec<(Rect2i, u32)> = rects.into_iter().zip(delays).collect();
         let project = self.projects.current_mut();
-        for frame in project.sequence.iter() {
-            let rect = frame.region().rect();
+        for (rect, delay_ms) in frame_specs {
             let Some(composite) = project
                 .layers
                 .composite_layers_region(rect, &project.tile_palette)
@@ -7321,7 +9321,7 @@ impl App {
                 width: composite.width(),
                 height: composite.height(),
                 rgba: composite.as_bytes().to_vec(),
-                delay_ms: frame.delay_ms(),
+                delay_ms,
             });
         }
         let gif = match encode_gif(&frames) {
@@ -7332,20 +9332,11 @@ impl App {
                 return;
             }
         };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("GIF", &["gif"])
-            .set_file_name("animation.gif")
-            .save_file()
-        else {
-            return;
-        };
-        match std::fs::write(&path, gif) {
-            Ok(()) => self.projects.current_mut().last_error = None,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export GIF: {err}"));
-            }
-        }
+        // Compute once, then let the in-app modal pick the destination.
+        self.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::Gif,
+            Some(dock_save_as_panel::SavePayload::Gif(gif)),
+        );
     }
 
     fn file_export_selected(&mut self) {
@@ -7356,29 +9347,37 @@ impl App {
                 return;
             }
         };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG", &["png"])
-            .set_file_name("selection.png")
-            .save_file()
-        else {
-            return;
+        // Compute once, then let the in-app modal pick the destination.
+        self.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::SelectionPng,
+            Some(dock_save_as_panel::SavePayload::SelectionPng { w, h, rgba }),
+        );
+    }
+
+    /// Import PNG pick (drained from the file chooser): decode the file and
+    /// stage it as a pending import, then open the Import Image panel (id 210)
+    /// seeded at full image size (regions 1x1). Every other session and host
+    /// field stays untouched on failure; decode errors use the established
+    /// `"Failed to import PNG: {err}"` pattern in `last_error`.
+    fn file_import_png_pick(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.projects.current_mut().last_error =
+                    Some(format!("Failed to import PNG: {err}"));
+                return;
+            }
         };
-        match encode_png(w, h, &rgba)
-            .and_then(|bytes| std::fs::write(&path, bytes).map_err(crate::io::PngError::Io))
-        {
-            Ok(()) => self.projects.current_mut().last_error = None,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export selection: {err}"));
+        match decode_png(&bytes) {
+            Ok(image) => {
+                let img_w = image.width as u32;
+                let img_h = image.height as u32;
+                self.pending_image_import = Some(PendingImageImport {
+                    path: path.to_path_buf(),
+                    image,
+                });
+                self.open_import_image_panel(path.to_path_buf(), img_w, img_h);
             }
-        }
-    }
-
-    /// Records the import error in `last_error`; every other session and host
-    /// field remains unchanged when decode or staging fails.
-    fn file_import_png_path(&mut self, path: &std::path::Path) {
-        match std::fs::read(path) {
-            Ok(bytes) => self.file_import_png_bytes(&bytes),
             Err(err) => {
                 self.projects.current_mut().last_error =
                     Some(format!("Failed to import PNG: {err}"));
@@ -7386,30 +9385,58 @@ impl App {
         }
     }
 
-    fn file_import_png_image(&mut self, image: &crate::io::PngImage) {
-        if let Err(msg) = self.import_png_bytes(image) {
-            self.projects.current_mut().last_error = Some(msg);
-        }
-    }
-
-    fn file_import_png_bytes(&mut self, bytes: &[u8]) {
-        match decode_png(bytes) {
-            Ok(img) => self.file_import_png_image(&img),
+    /// Import GIF pick (drained from the file chooser): decode the file and
+    /// stage it as a pending import, then open the Import GIF panel (id 209)
+    /// seeded with the animation's canvas size and frame count. Every other
+    /// session and host field stays untouched on failure; decode errors use
+    /// the `"Failed to import GIF: {err}"` pattern in `last_error`.
+    fn file_import_gif_pick(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
             Err(err) => {
                 self.projects.current_mut().last_error =
-                    Some(format!("Failed to import PNG: {err}"));
+                    Some(format!("Failed to import GIF: {err}"));
+                return;
+            }
+        };
+        match decode_gif(&bytes) {
+            Ok(decode) => {
+                let frame_count = decode.frames.len();
+                let frame_w = decode.frame_w;
+                let frame_h = decode.frame_h;
+                self.pending_gif_import = Some(PendingGifImport {
+                    path: path.to_path_buf(),
+                    decode,
+                });
+                self.open_import_gif_panel(path.to_path_buf(), frame_count, frame_w, frame_h);
+            }
+            Err(err) => {
+                self.projects.current_mut().last_error =
+                    Some(format!("Failed to import GIF: {err}"));
             }
         }
     }
 
+    /// Import a PNG via the in-app file chooser. The native `pick_file`
+    /// portal dialog hangs on this machine; the pick resolves in
+    /// `drain_file_chooser_events` → `file_import_png_pick` → the Import Image
+    /// panel (id 210).
     fn file_import_png(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG", &["png"])
-            .pick_file()
-        else {
-            return;
-        };
-        self.file_import_png_path(&path);
+        self.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportPng,
+            self.default_save_location(),
+        );
+    }
+
+    /// Import a GIF via the in-app file chooser. The native `pick_file`
+    /// portal dialog hangs on this machine; the pick resolves in
+    /// `drain_file_chooser_events` → `file_import_gif_pick` → the Import GIF
+    /// panel (id 209).
+    fn file_import_gif(&mut self) {
+        self.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportGif,
+            self.default_save_location(),
+        );
     }
 
     fn ui_frame(&mut self, ui: &mut egui::Ui) {
@@ -7432,6 +9459,12 @@ impl App {
         self.handle_shortcuts();
 
         let frame_rect = ui.max_rect();
+        // Fixed top bar: reserve the top band and run the canvas + dock inside
+        // the remaining body rect, so every interior `ui.max_rect()` /
+        // `available_size` (dock viewport, canvas painter) shrinks below the bar
+        // and nothing can spill into it. `TOP_BAR_HEIGHT` is non-resizable.
+        let top_bar_layout = top_bar::split_frame(frame_rect);
+        let body_rect = top_bar_layout.body_rect;
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
         let pointer_inside_window = pointer.is_some_and(|p| {
             ui.ctx()
@@ -7449,11 +9482,12 @@ impl App {
         // `panel_dock_demo` gates the query because it gates the RENDERING:
         // `panel_dock.show_inside` (which paints every panel) only runs when it
         // is set, so with the dock hidden there is no panel chrome and the
-        // canvas must own the whole frame. The viewport is the frame rect — the
-        // very rect `show_inside` lays the panels out in.
+        // canvas must own the body. The viewport is the BODY rect (the frame
+        // minus the top bar) — the very rect `show_inside` lays the panels out
+        // in — so a pointer inside the top bar is owned by the bar, not a panel.
         let target = pointer
-            .filter(|p| frame_rect.contains(*p))
-            .map(|p| self.surface_at_pointer(p, frame_rect));
+            .filter(|p| body_rect.contains(*p))
+            .map(|p| self.surface_at_pointer(p, body_rect));
         self.input_capture.set_target(target);
 
         self.refresh_transform_preview();
@@ -7462,6 +9496,11 @@ impl App {
             self.projects.current_mut().layers.height() as u32,
         );
         let texture_id = self.canvas_texture.as_ref().map(|t| t.id());
+        // The canvas + dock run inside a BODY child Ui (frame minus the top
+        // bar): interior `ui.max_rect()` / `available_size` see `body_rect`, so
+        // the dock viewport and the canvas painter shrink below the bar and
+        // never spill into it.
+        ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
         if let Some(texture_id) = texture_id {
             let camera = self.projects.current().camera;
             let tool = self.projects.current().tool_state.tool();
@@ -7563,7 +9602,19 @@ impl App {
             }
             self.projects.current_mut().camera = interactions.updated_camera;
             let interactions = self.update_tool_gesture(ui.ctx(), interactions);
-            self.handle_interactions_in(ui.ctx(), interactions);
+            // The Frame Edit panel (203) owns the pointer when it is the
+            // topmost surface: its own viewport handles the gesture after the
+            // dock renders (see below). Skipping the main handler here guarantees
+            // a frame-edit press cannot double-fire a tool action on the main
+            // canvas. Every other surface keeps the existing behavior.
+            let frame_edit_is_target = matches!(
+                target,
+                Some(SurfaceId::Panel(id))
+                    if id.raw() == dock_frame_edit_panel::FRAME_EDIT_PANEL_ID
+            );
+            if !frame_edit_is_target {
+                self.handle_interactions_in(ui.ctx(), interactions);
+            }
         }
         let preview_image = self.canvas_texture.as_ref().map(|texture| {
             (
@@ -7572,6 +9623,15 @@ impl App {
             )
         });
         self.panel_dock.preview_feed().set(preview_image);
+        // Publish the active animation frame's region to the Preview panel
+        // (id 204): the shared canvas texture plus its full size and the frame
+        // rect, clamped to the canvas so a stale/oversized region cannot sample
+        // outside the sheet.
+        self.frame_preview_feed.set(self.active_frame_preview());
+        // Publish the Frame Edit panel's snapshot (id 203): its own camera,
+        // canvas view, onion overlay, shared texture and cursor before the dock
+        // renders it. The App drains the viewport's interactions after.
+        self.publish_frame_edit_view();
         if ui.ctx().input(|input| input.key_pressed(egui::Key::F12)) {
             self.panel_dock_demo = !self.panel_dock_demo;
         }
@@ -7579,6 +9639,7 @@ impl App {
         // panels are pure views over typed cells the App writes before render.
         self.write_dock_snapshots();
         self.sync_layer_settings_panel();
+        self.sync_animation_settings_panel();
         if self.panel_dock_demo {
             let chrome = PanelChrome {
                 colors: &self.theme.current().colors,
@@ -7595,10 +9656,43 @@ impl App {
             // Drain the dock panel events into the model/undo exactly once
             // per frame (the panels only ever push into the host cells).
             self.drain_dock_events();
+            // The Frame Edit viewport stores its interactions during render;
+            // feed them through the same gesture pipeline as the main canvas.
+            let frame_edit_interactions = self.frame_edit_host.interactions.borrow_mut().take();
+            if let Some(interactions) = frame_edit_interactions {
+                self.handle_frame_edit_interactions(interactions);
+            }
         }
+        });
+
+        // Apply the create-document panel's Create events: this may open a new
+        // project (tab) and close the panel, before the top bar snapshots tabs.
+        self.drain_create_document_events();
+        // Apply the resize-canvas panel's events (canvas dims / tile_size).
+        self.drain_resize_canvas_events();
+        // Apply the save-as/export panel's events (writes + panel close).
+        self.drain_save_as_events();
+        // Apply the file chooser panel's events (open/import/choose-folder).
+        self.drain_file_chooser_events();
+        // Apply the Import GIF panel's events (sheet layout + grow canvas).
+        self.drain_import_gif_events();
+        // Apply the Import Image panel's events (grid split + grow canvas).
+        self.drain_import_image_events();
+
+        // Fixed top bar — painted LAST in the central-panel layer, after the
+        // canvas and the docked panels, so it is above both. Floating dock
+        // windows are `egui::Window`s in `Order::Middle` and therefore stay
+        // above the bar (and are constrained to `body_rect`, so they cannot be
+        // dragged into the bar's band either).
+        self.top_bar.set_tabs(self.projects.tabs());
+        let colors = self.theme.current().colors;
+        self.top_bar.ui(ui, &top_bar_layout, &colors);
+        let top_bar_events = self.top_bar.drain_events();
+        self.apply_top_bar_events(top_bar_events);
+
         // Feedback status line: render the session's last_error (e.g. "the
-        // tile palette is empty", "cannot place tiles on a group layer",
-        // "the placed tile is empty/transparent") so silent no-ops are
+        // tile palette is empty", "cannot place tiles on a group layer")
+        // so silent no-ops are
         // VISIBLE instead of disappearing without a trace. Painted last so
         // it sits above the dock overlay.
         if let Some(message) = self.projects.current().last_error.as_deref() {
@@ -7998,86 +10092,24 @@ impl ApplicationHandler for App {
     }
 }
 impl App {
-    // ------------------------------------------------------------------
-    // U13: timeline + playback events (R3 wave, feature F3)
-    // ------------------------------------------------------------------
-
-    /// Apply timeline panel gestures to the animation state. The timeline is
-    /// a pure view (D59/D62); the App owns the sequence and controller and
-    /// applies each event as an action.
-    fn apply_timeline_events(&mut self, events: Vec<TimelineEvent>) {
-        for event in events {
-            match event {
-                TimelineEvent::SelectFrame(index) => {
-                    self.projects.current_mut().animation.goto(index)
-                }
-                TimelineEvent::SetDuration { index, ms } => {
-                    if let Some(frame) = self.projects.current_mut().sequence.frame_mut(index) {
-                        frame.set_delay_ms(ms);
-                    }
-                    self.sync_anim_delays();
-                    self.mark_dirty();
-                }
-                TimelineEvent::Reorder { from, to } => {
-                    if from == to {
-                        continue;
-                    }
-                    let to = clamp_reorder_target(to, self.projects.current_mut().sequence.len());
-                    if self.projects.current_mut().sequence.reorder(from, to) {
-                        self.sync_anim_delays();
-                        self.mark_dirty();
-                    }
-                }
-                TimelineEvent::AddFrame => {
-                    let region = self
-                        .projects
-                        .current()
-                        .sequence
-                        .frame(self.projects.current().animation.current_index())
-                        .map(|f| f.region().clone())
-                        .unwrap_or_else(|| {
-                            Region::new(
-                                Rect2i::new(0, 0, CANVAS_WIDTH as i32, CANVAS_HEIGHT as i32),
-                                "Frame 1",
-                            )
-                        });
-                    let project = self.projects.current_mut();
-                    if project.sequence.push(Frame::new(region, 100)) {
-                        self.sync_anim_delays();
-                        let project = self.projects.current_mut();
-                        project.animation.set_frame_count(project.sequence.len());
-                        project.animation.goto(project.sequence.len() - 1);
-                        self.mark_dirty();
-                    }
-                }
-                TimelineEvent::RemoveFrame(index) => {
-                    if self.projects.current_mut().sequence.len() <= 1 {
-                        continue;
-                    }
-                    if self.projects.current_mut().sequence.remove(index).is_some() {
-                        self.sync_anim_delays();
-                        self.mark_dirty();
-                    }
-                }
-                TimelineEvent::ToggleLoop => {
-                    let on = !self.projects.current_mut().sequence.looping();
-                    self.projects.current_mut().sequence.set_looping(on);
-                    self.projects.current_mut().animation.set_looping(on);
-                    self.mark_dirty();
-                }
-                TimelineEvent::Play => self.projects.current_mut().animation.play(),
-                TimelineEvent::Stop => self.projects.current_mut().animation.stop(),
-                TimelineEvent::Restart => self.projects.current_mut().animation.restart(),
-            }
-        }
-    }
-
-    /// Mirror the sequence's per-frame delays into the controller.
+    /// Mirror the active sequence's MULTIPLIER-SCALED per-frame delays, frame
+    /// count and loop flag onto the EXISTING controller, so on-screen playback
+    /// and GIF export share one timing source
+    /// ([`ProjectSession::effective_frame_delays`]).
+    ///
+    /// In-place (`set_delays` / `set_frame_count` / `set_looping`): the current
+    /// frame index and the play/stop state are PRESERVED. This is the right
+    /// primitive for edits to the active animation's frames or delays; use
+    /// [`Self::rebuild_animation_controller`] when the active animation itself
+    /// changes.
     fn sync_anim_delays(&mut self) {
         let project = self.projects.current_mut();
-        let delays: Vec<u32> = project.sequence.iter().map(|f| f.delay_ms()).collect();
+        let delays = project.effective_frame_delays();
+        let frame_count = project.sequence().len();
+        let looping = project.sequence().looping();
         project.animation.set_delays(delays);
-        project.animation.set_frame_count(project.sequence.len());
+        project.animation.set_frame_count(frame_count);
+        project.animation.set_looping(looping);
     }
 
     /// Advance playback by one frame delta (called from the redraw path).
@@ -8102,6 +10134,22 @@ mod tests {
 
     const RED: Color = Color::rgb(255, 0, 0);
 
+    /// Run one app frame in a Ui whose FRAME rect is expanded UPWARD by the
+    /// fixed top-bar height, so the resulting BODY rect equals the caller's
+    /// original frame. The top bar still reserves (and paints) its band — it
+    /// simply sits above the visible frame — which keeps every existing
+    /// interaction test's coordinate assumptions valid while the production
+    /// layout reserves the bar on screen. The bar's real on-screen geometry is
+    /// covered by the `top_bar` unit tests.
+    fn ui_frame_with_top_bar(ui: &mut egui::Ui, app: &mut App) {
+        let frame = ui.max_rect();
+        let expanded = egui::Rect::from_min_max(
+            egui::pos2(frame.left(), frame.top() - top_bar::TOP_BAR_HEIGHT),
+            frame.max,
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(expanded), |ui| app.ui_frame(ui));
+    }
+
     fn tilemap_cache_signature(
         layers: &LayerStack,
         layer_id: LayerId,
@@ -8116,6 +10164,411 @@ mod tests {
                 cache.buffer.as_bytes().to_vec(),
             )
         })
+    }
+
+    #[test]
+    fn top_bar_tab_snapshot_lists_open_projects_and_select_activates() {
+        let mut app = App::default();
+        let first = app
+            .projects
+            .active_id()
+            .expect("App::default opens one project");
+        let second = app.projects.new_project("Second", 8, 8).project();
+        // The snapshot the top bar paints lists BOTH projects; the newly created
+        // one is active, the original is not.
+        app.top_bar.set_tabs(app.projects.tabs());
+        let tabs = app.top_bar.tabs();
+        assert_eq!(tabs.len(), 2, "two open projects -> two tabs");
+        let first_tab = tabs.iter().find(|t| t.id == first).expect("first tab");
+        let second_tab = tabs.iter().find(|t| t.id == second).expect("second tab");
+        assert!(!first_tab.active, "the original project is no longer active");
+        assert!(second_tab.active, "the new project must be the active tab");
+        // SelectProject switches the active project.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::SelectProject(first)]);
+        assert_eq!(app.projects.active_id(), Some(first));
+        // An unknown id (e.g. a tab closed the same frame) is ignored.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::SelectProject(ProjectId::new(9_999))]);
+        assert_eq!(app.projects.active_id(), Some(first));
+    }
+
+    #[test]
+    fn open_create_document_registers_floating_panel_and_is_idempotent() {
+        let mut app = App::default();
+        let id = panel_dock::PanelId::new(dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID);
+        assert_eq!(app.panel_dock.placement(id), None, "closed by default");
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::OpenCreateDocument]);
+        assert_eq!(
+            app.panel_dock.placement(id),
+            Some(panel_dock::PanelPlacement::Floating),
+            "OpenCreateDocument registers the floating create panel"
+        );
+        assert_eq!(
+            app.panel_dock.metadata(id).map(|m| m.title.clone()).as_deref(),
+            Some("create new document"),
+            "the panel keeps its contracted title"
+        );
+        // Opening again must not duplicate; it just raises the same panel.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::OpenCreateDocument]);
+        assert_eq!(
+            app.panel_dock.placement(id),
+            Some(panel_dock::PanelPlacement::Floating)
+        );
+        assert!(app.panel_dock.metadata(id).is_some(), "single panel entry");
+    }
+
+    #[test]
+    fn create_document_event_opens_project_with_region_canvas_and_tile_size() {
+        let mut app = App::default();
+        let tabs_before = app.projects.tabs().len();
+        // 16x16 regions tiled 4x8 -> 64x128 canvas, tile_size = region_w = 16.
+        app.create_document_host
+            .events
+            .borrow_mut()
+            .push(dock_create_document_panel::CreateDocumentEvent::Create {
+                region_w: 16,
+                region_h: 16,
+                count_x: 4,
+                count_y: 8,
+            });
+        // Open the panel too, so we can assert it closes after a create.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::OpenCreateDocument]);
+        let panel_id =
+            panel_dock::PanelId::new(dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_some());
+
+        app.drain_create_document_events();
+
+        assert_eq!(
+            app.projects.tabs().len(),
+            tabs_before + 1,
+            "Create opens a NEW project (tab)"
+        );
+        let session = app.projects.current();
+        assert_eq!(session.layers.width(), 64, "canvas w = region_w * count_x");
+        assert_eq!(session.layers.height(), 128, "canvas h = region_h * count_y");
+        assert_eq!(session.tile_size, TileSize::square(16), "tile_size = region side");
+        assert_eq!(
+            app.panel_dock.placement(panel_id),
+            None,
+            "the create panel closes after creating"
+        );
+    }
+
+    #[test]
+    fn new_project_menu_action_and_open_create_document_open_same_panel() {
+        let panel_id =
+            panel_dock::PanelId::new(dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID);
+        // The middle button path.
+        let mut via_button = App::default();
+        via_button.apply_top_bar_events(vec![top_bar::TopBarEvent::OpenCreateDocument]);
+        assert_eq!(
+            via_button.panel_dock.placement(panel_id),
+            Some(panel_dock::PanelPlacement::Floating)
+        );
+        // The File -> "new project" menu path opens the SAME panel.
+        let mut via_menu = App::default();
+        via_menu.apply_top_bar_events(vec![top_bar::TopBarEvent::MenuAction(
+            top_bar::MenuAction::NewProject,
+        )]);
+        assert_eq!(
+            via_menu.panel_dock.placement(panel_id),
+            Some(panel_dock::PanelPlacement::Floating)
+        );
+        // Idempotent: a second NewProject does not duplicate; just raises.
+        via_menu.apply_top_bar_events(vec![top_bar::TopBarEvent::MenuAction(
+            top_bar::MenuAction::NewProject,
+        )]);
+        assert_eq!(
+            via_menu.panel_dock.placement(panel_id),
+            Some(panel_dock::PanelPlacement::Floating)
+        );
+    }
+
+    #[test]
+    fn resize_canvas_menu_action_opens_panel_206() {
+        let mut app = App::default();
+        let id = panel_dock::PanelId::new(dock_resize_canvas_panel::RESIZE_CANVAS_PANEL_ID);
+        assert_eq!(app.panel_dock.placement(id), None, "closed by default");
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::MenuAction(
+            top_bar::MenuAction::ResizeCanvas,
+        )]);
+        assert_eq!(
+            app.panel_dock.placement(id),
+            Some(panel_dock::PanelPlacement::Floating),
+            "ResizeCanvas opens the id-206 floating panel"
+        );
+        // Idempotent.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::MenuAction(
+            top_bar::MenuAction::ResizeCanvas,
+        )]);
+        assert_eq!(
+            app.panel_dock.placement(id),
+            Some(panel_dock::PanelPlacement::Floating)
+        );
+    }
+
+    #[test]
+    fn resize_counts_event_resizes_canvas_keeps_tile_size_and_updates_tilemap() {
+        use crate::core::canvas_resize::Pivot;
+        let mut app = App::default();
+        {
+            let s = app.projects.current_mut();
+            s.tile_size = TileSize::square(16);
+            // 4x4 regions of 16px -> 64x64 canvas.
+            s.layers.resize_canvas(64, 64, Pivot::TopLeft, false);
+            s.layers
+                .active_layer_mut()
+                .buffer
+                .set_pixel(0, 0, RED);
+            s.layers.active_layer_mut().tilemap = Some(TileMap::new(TileSize::square(16), 4, 4));
+            // A frame that overflows the new (shorter) canvas must be clamped.
+            if s.sequence().len() == 0 {
+                s.sequence_mut().push(Frame::new(
+                    Region::new(Rect2i::new(0, 0, 16, 16), "f"),
+                    100,
+                ));
+            }
+            s.sequence_mut().frame_mut(0).unwrap().region.rect =
+                Rect2i::new(48, 48, 32, 32);
+            s.mark_saved();
+        }
+        app.resize_canvas_host
+            .events
+            .borrow_mut()
+            .push(dock_resize_canvas_panel::ResizeCanvasEvent::ResizeCounts {
+                w: 8,
+                h: 4,
+                pivot: Pivot::TopLeft,
+            });
+        app.drain_resize_canvas_events();
+
+        let s = app.projects.current();
+        assert_eq!((s.layers.width(), s.layers.height()), (128, 64));
+        assert_eq!(s.tile_size, TileSize::square(16), "ResizeCounts keeps the tile size");
+        assert_eq!(
+            s.layers.active_layer().buffer.get_pixel(0, 0),
+            Some(RED),
+            "TopLeft pivot keeps the old pixel in place"
+        );
+        let tm = s.layers.active_layer().tilemap.as_ref().unwrap();
+        assert_eq!((tm.cols, tm.rows), (8, 4), "ceil(128/16) x ceil(64/16)");
+        // The frame's bottom (80) exceeds the new height (64) -> clamped to 64.
+        assert_eq!(s.sequence().frame(0).unwrap().region().rect(), Rect2i::new(48, 48, 32, 16));
+        assert!(s.is_dirty(), "a canvas resize marks the project dirty");
+    }
+
+    #[test]
+    fn resize_regions_without_resample_scales_tile_size_and_places_pixels_1to1() {
+        use crate::core::canvas_resize::Pivot;
+        let mut app = App::default();
+        {
+            let s = app.projects.current_mut();
+            s.tile_size = TileSize::square(16);
+            // 4x2 regions of 16px -> 64x32 canvas.
+            s.layers.resize_canvas(64, 32, Pivot::TopLeft, false);
+            s.layers
+                .active_layer_mut()
+                .buffer
+                .set_pixel(1, 1, RED);
+            if s.sequence().len() == 0 {
+                s.sequence_mut().push(Frame::new(
+                    Region::new(Rect2i::new(0, 0, 16, 16), "scale-me"),
+                    100,
+                ));
+            }
+            s.sequence_mut().frame_mut(0).unwrap().region.rect =
+                Rect2i::new(0, 0, 16, 16);
+            s.sequence_mut().frame_mut(0).unwrap().region.set_name("scale-me");
+            s.mark_saved();
+        }
+        app.resize_canvas_host
+            .events
+            .borrow_mut()
+            .push(dock_resize_canvas_panel::ResizeCanvasEvent::ResizeRegions {
+                w: 32,
+                h: 32,
+                pivot: Pivot::TopLeft,
+                resample: false,
+            });
+        app.drain_resize_canvas_events();
+
+        let s = app.projects.current();
+        assert_eq!(s.tile_size, TileSize::square(32), "new tile_size = region side");
+        // count 4x2 kept -> 32*4 x 32*2.
+        assert_eq!((s.layers.width(), s.layers.height()), (128, 64));
+        let buf = &s.layers.active_layer().buffer;
+        assert_eq!(buf.get_pixel(1, 1), Some(RED), "1:1 placement, not scaled");
+        assert_eq!(
+            buf.get_pixel(2, 2),
+            Some(Color::TRANSPARENT),
+            "resample=false must NOT scale the pixels"
+        );
+        // The frame region scaled by the 16 -> 32 ratio (x2).
+        let frame = s
+            .sequence()
+            .iter()
+            .find(|f| f.region().name() == "scale-me")
+            .expect("the scaled frame");
+        assert_eq!(frame.region().rect(), Rect2i::new(0, 0, 32, 32));
+        assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn resize_regions_with_resample_scales_pixels() {
+        use crate::core::canvas_resize::Pivot;
+        let mut app = App::default();
+        {
+            let s = app.projects.current_mut();
+            s.tile_size = TileSize::square(16);
+            s.layers.resize_canvas(64, 32, Pivot::TopLeft, false);
+            s.layers
+                .active_layer_mut()
+                .buffer
+                .set_pixel(0, 0, RED);
+        }
+        app.resize_canvas_host
+            .events
+            .borrow_mut()
+            .push(dock_resize_canvas_panel::ResizeCanvasEvent::ResizeRegions {
+                w: 32,
+                h: 32,
+                pivot: Pivot::TopLeft,
+                resample: true,
+            });
+        app.drain_resize_canvas_events();
+        let s = app.projects.current();
+        let buf = &s.layers.active_layer().buffer;
+        // NN 2x: the single source pixel fills a 2x2 block.
+        assert_eq!(buf.get_pixel(0, 0), Some(RED));
+        assert_eq!(buf.get_pixel(1, 1), Some(RED));
+    }
+
+    #[test]
+    fn menu_file_actions_route_to_the_right_file_op() {
+        assert_eq!(
+            file_op_for(top_bar::MenuAction::SaveProject),
+            Some(FileOp::Save)
+        );
+        assert_eq!(
+            file_op_for(top_bar::MenuAction::SaveProjectAs),
+            Some(FileOp::SaveAs)
+        );
+        assert_eq!(
+            file_op_for(top_bar::MenuAction::OpenProject),
+            Some(FileOp::Open)
+        );
+        assert_eq!(file_op_for(top_bar::MenuAction::NewProject), None);
+        assert_eq!(file_op_for(top_bar::MenuAction::ResizeCanvas), None);
+        assert_eq!(file_op_for(top_bar::MenuAction::ImportImages), None);
+        assert_eq!(file_op_for(top_bar::MenuAction::ImportGif), None);
+    }
+
+    #[test]
+    fn last_dir_round_trips_through_the_persistence_helpers() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "pyxross-lastdir-{}-{nanos}",
+            std::process::id()
+        ));
+        // Missing -> None.
+        assert_eq!(load_last_dir(&base), None);
+        let dir = std::path::PathBuf::from("/tmp/pyxross/example");
+        save_last_dir(&base, &dir);
+        assert_eq!(load_last_dir(&base), Some(dir));
+        // An empty file reads back as None.
+        std::fs::write(base.join("last_dir"), b"   \n").unwrap();
+        assert_eq!(load_last_dir(&base), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn close_project_event_closes_a_clean_project() {
+        let mut app = App::default();
+        let first = app.projects.active_id().expect("one project");
+        let second = app.projects.new_project("Second", 8, 8).project();
+        assert_eq!(app.projects.tabs().len(), 2);
+        // `second` is a fresh (clean) project -> the close is immediate.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::CloseProject(second)]);
+        assert_eq!(app.projects.tabs().len(), 1, "a clean project closes at once");
+        assert_eq!(app.projects.active_id(), Some(first));
+    }
+
+    #[test]
+    fn close_project_event_on_dirty_active_project_sets_pending_guard() {
+        let mut app = App::default();
+        let active = app.projects.active_id().expect("one project");
+        app.projects.current_mut().mark_dirty();
+        let before = app.projects.tabs().len();
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::CloseProject(active)]);
+        assert_eq!(
+            app.projects.tabs().len(),
+            before,
+            "a dirty project must be guarded, not closed outright"
+        );
+        assert!(
+            app.projects.current().pending_action.is_some(),
+            "the dirty close must raise the unsaved-changes guard"
+        );
+    }
+
+    /// A press inside the top-bar band must not leak to the canvas: the bar is
+    /// a separate fixed rect and the canvas runs inside the body below it. This
+    /// uses the REAL (non-offset) frame, so the bar actually occupies the top
+    /// `TOP_BAR_HEIGHT` points.
+    #[test]
+    fn top_bar_band_does_not_leak_clicks_to_the_canvas() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        // Without the bar, screen (10,10) would be canvas pixel (10,10).
+        let in_bar = egui::pos2(10.0, 10.0);
+        assert!(in_bar.y < top_bar::TOP_BAR_HEIGHT, "point is inside the bar band");
+        let run = |app: &mut App, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| app.ui_frame(ui));
+            });
+            output.textures_delta.clear();
+        };
+        run(&mut app, vec![move_to(in_bar)]);
+        run(&mut app, vec![press(in_bar)]);
+        run(&mut app, vec![release(in_bar)]);
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .get_pixel(10, 10),
+            Some(Color::TRANSPARENT),
+            "a click in the top-bar band must not paint the canvas"
+        );
+    }
+
+    #[test]
+    fn top_bar_host_set_menus_is_the_documented_seam() {
+        let mut host = top_bar::TopBarHost::new();
+        assert!(host.menus().is_empty(), "no menu items ship yet");
+        host.set_menus(vec![
+            top_bar::MenuLabel::new("File"),
+            top_bar::MenuLabel::new("Edit"),
+        ]);
+        assert_eq!(host.menus().len(), 2);
+        assert_eq!(host.menus()[0].label, "File");
+        assert!(host.menus()[0].enabled);
     }
 
     #[test]
@@ -8399,13 +10852,13 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct ImportState {
         document: String,
         id: ProjectId,
         name: String,
         path: Option<PathBuf>,
-        tile_size: u32,
+        tile_size: TileSize,
         layer_active: LayerId,
         layer_changed: bool,
         layer_count: usize,
@@ -8459,7 +10912,7 @@ mod tests {
                 width,
                 height,
                 tile,
-            }) => format!("new:{}:{width}:{height}:{tile}", project.raw()),
+            }) => format!("new:{}:{width}:{height}:{}x{}", project.raw(), tile.w, tile.h),
             Some(PendingAction::Open { project, path }) => {
                 format!("open:{}:{path:?}", project.raw())
             }
@@ -8487,8 +10940,8 @@ mod tests {
         })
     }
 
-    fn import_state(app: &App) -> ImportState {
-        let session = app.projects.current();
+    fn import_state_of(app: &App, id: project::ProjectId) -> ImportState {
+        let session = app.projects.session(id).expect("import session exists");
         ImportState {
             document: format!("{:?}", session.to_document()),
             id: session.id,
@@ -8523,7 +10976,7 @@ mod tests {
                 )
             }),
             transform: transform_state(session.transform.as_ref()),
-            sequence: format!("{:?}", &session.sequence),
+            sequence: format!("{:?}", session.sequence()),
             animation: format!("{:?}", &session.animation),
             palettes: format!("{:?}", &session.palettes),
             active_palette: session.active_palette,
@@ -8550,8 +11003,39 @@ mod tests {
         }
     }
 
+    fn import_state(app: &App) -> ImportState {
+        import_state_of(app, app.projects.current().id)
+    }
+
     fn assert_import_state_unchanged(app: &App, before: &ImportState) {
         assert_eq!(import_state(app), *before);
+    }
+
+    fn assert_import_state_of_unchanged(app: &App, id: project::ProjectId, before: &ImportState) {
+        assert_eq!(import_state_of(app, id), *before);
+    }
+
+    /// Compares a session ignoring the app-level canvas-cache flags
+    /// (`cache_token`/`texture_dirty`): importing a NEW document refreshes
+    /// those globally, so the pre-existing session is asserted content-equal
+    /// without them.
+    fn assert_import_session_unchanged(app: &App, id: project::ProjectId, before: &ImportState) {
+        let mut now = import_state_of(app, id);
+        let mut before = before.clone();
+        now.cache_token = None;
+        now.texture_dirty = false;
+        before.cache_token = None;
+        before.texture_dirty = false;
+        assert_eq!(now, before);
+    }
+
+    /// `(id, name)` of every open document, in tab order.
+    fn project_names(app: &App) -> Vec<(project::ProjectId, String)> {
+        app.projects
+            .tabs()
+            .into_iter()
+            .map(|tab| (tab.id, tab.name))
+            .collect()
     }
 
     fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
@@ -8901,8 +11385,11 @@ mod tests {
     }
 
     #[test]
-    fn live_transform_refresh_uses_bounded_preview_texture() {
+    fn live_transform_preview_has_full_commit_resolution() {
         let mut app = App::default();
+        // A 65x65 lift: under the OLD 64px cap the preview texture was
+        // downscaled to 64x64 — "giant pixels" when scaled back up to the
+        // canvas bbox. It must now be the FULL commit resolution.
         app.lift_transform(Rect2i::new(0, 0, 65, 65));
         app.refresh_transform_preview();
         let size = app
@@ -8911,7 +11398,49 @@ mod tests {
             .map(egui::TextureHandle::size);
         assert_eq!(
             size,
-            Some([TRANSFORM_PREVIEW_MAX_DIM, TRANSFORM_PREVIEW_MAX_DIM])
+            Some([65, 65]),
+            "the preview texture must be full commit resolution, not capped at 64"
+        );
+
+        // A rotated 100x100 lift: the rotated bbox (~141x141) far exceeds any
+        // cap, so the preview dimension must equal the `render(None)` (commit)
+        // result exactly.
+        app.lift_transform(Rect2i::new(0, 0, 100, 100));
+        {
+            let t = app
+                .projects
+                .current_mut()
+                .transform
+                .as_mut()
+                .unwrap()
+                .expect_selection_mut();
+            t.object.set_angle(45.0);
+        }
+        app.refresh_transform_preview();
+        let expected: [usize; 2] = {
+            let t = app
+                .projects
+                .current()
+                .transform
+                .as_ref()
+                .unwrap()
+                .expect_selection();
+            let r = t.object.render(None).into_iter().next().expect("rendered");
+            [r.w, r.h]
+        };
+        let size = app
+            .transform_preview
+            .as_ref()
+            .map(egui::TextureHandle::size)
+            .expect("preview texture");
+        assert_eq!(
+            size,
+            expected,
+            "preview resolution must match the commit render exactly"
+        );
+        assert!(
+            size[0] > 64 && size[1] > 64,
+            "a rotated 100x100 preview must exceed the old 64px cap"
         );
     }
 
@@ -9152,7 +11681,7 @@ mod tests {
         });
         let top = app.projects.current_mut().layers.add_layer("tiles");
         {
-            let mut tm = TileMap::new(4, 8, 8);
+            let mut tm = TileMap::new(TileSize::square(4), 8, 8);
             tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
             app.projects
                 .current_mut()
@@ -9266,7 +11795,7 @@ mod tests {
         app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fill)]);
         app.handle_interactions(CanvasInteractions {
-            clicked: Some((8, 8)),
+            raw_pressed_over_canvas: Some((8, 8)),
             ..Default::default()
         });
         assert_eq!(
@@ -10103,7 +12632,7 @@ mod tests {
         let mut output = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| app.ui_frame(ui));
+                .show(ui, |ui| ui_frame_with_top_bar(ui, &mut app));
             edge = app.paste_cursor_canvas();
         });
         output.textures_delta.clear();
@@ -11303,7 +13832,7 @@ mod tests {
             let mut output = ctx.run_ui(raw, |ui| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ui, |ui| app.ui_frame(ui));
+                    .show(ui, |ui| ui_frame_with_top_bar(ui, app));
             });
             output.textures_delta.clear();
         };
@@ -13172,7 +15701,10 @@ mod tests {
             Some(panel_dock::PanelPlacement::DockedRight),
             "Palette docks right"
         );
-        // The demo panels (A/B/C/D) are still present alongside the new ones.
+        // The dummy demo panels B/C/D were removed; only the id-1 "Preview"
+        // demo panel remains alongside the new ones: 1 demo + Toolbox + Layers +
+        // Palette + Tile Palette + Tool Properties + Animations + Frame Edit +
+        // Preview = 9.
         assert_eq!(dock.panel_count(), 9);
         assert_eq!(
             dock.placement(panel_dock::PanelId::new(
@@ -13183,11 +15715,23 @@ mod tests {
         );
         assert_eq!(
             dock.placement(panel_dock::PanelId::new(1)),
-            Some(panel_dock::PanelPlacement::DockedRight)
+            Some(panel_dock::PanelPlacement::DockedRight),
+            "the id-1 demo Preview panel is the only demo panel kept"
+        );
+        assert_eq!(
+            dock.placement(panel_dock::PanelId::new(2)),
+            None,
+            "Panel B (id 2) was removed"
         );
         assert_eq!(
             dock.placement(panel_dock::PanelId::new(3)),
-            Some(panel_dock::PanelPlacement::DockedBottom)
+            None,
+            "Panel C (id 3) was removed"
+        );
+        assert_eq!(
+            dock.placement(panel_dock::PanelId::new(4)),
+            None,
+            "Panel D (id 4) was removed"
         );
     }
 
@@ -13410,7 +15954,7 @@ mod tests {
         let mut output = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| app.ui_frame(ui));
+                .show(ui, |ui| ui_frame_with_top_bar(ui, app));
         });
         output.textures_delta.clear();
         output
@@ -14971,21 +17515,18 @@ mod tests {
     /// Y2-B: the preview algorithm choice is fast while dragging (regardless
     /// of the selected algorithm) and the selected one when idle.
     #[test]
-    fn transform_preview_algorithm_is_fast_while_dragging_and_selected_when_idle() {
-        assert_eq!(
-            TRANSFORM_DRAG_PREVIEW_ALGORITHM,
-            TransformAlgorithm::Rotxel,
-            "the fast drag path is Rotxel"
-        );
+    fn transform_preview_algorithm_is_always_the_selected_one() {
         for selected in [
             TransformAlgorithm::RotSprite,
             TransformAlgorithm::CleanEdge,
             TransformAlgorithm::Rotxel,
         ] {
+            // ALWAYS the selected algorithm, whether dragging or idle — no
+            // fast/approximate swap, so the preview is pixel-perfect exact.
             assert_eq!(
                 transform_preview_algorithm(true, selected),
-                TransformAlgorithm::Rotxel,
-                "dragging must force the fast algorithm over {selected:?}"
+                selected,
+                "dragging must use the selected algorithm {selected:?}"
             );
             assert_eq!(
                 transform_preview_algorithm(false, selected),
@@ -15195,122 +17736,6 @@ mod tests {
             "tail -10 at base 16 must shrink to 6 px over 100 px of travel"
         );
         assert!(end < start, "the app-wired tail must thin the stroke");
-    }
-
-    // ------------------------------------------------------------------
-    // U13: timeline + playback (R3 wave, feature F3)
-    // ------------------------------------------------------------------
-
-    /// The default App starts with one frame covering the whole canvas.
-    #[test]
-    fn timeline_ui_defaults() {
-        let mut app = App::default();
-        assert_eq!(app.projects.current().sequence.len(), 1);
-        assert_eq!(app.projects.current().animation.frame_count(), 1);
-        assert_eq!(app.projects.current().animation.current_index(), 0);
-        assert!(app.projects.current_mut().sequence.looping());
-        assert!(app.projects.current().animation.looping());
-        let frame = app.projects.current().sequence.frame(0).unwrap();
-        assert_eq!(frame.region().rect(), Rect2i::new(0, 0, 128, 128));
-        assert_eq!(frame.delay_ms(), 100);
-    }
-
-    /// SelectFrame jumps the controller to the requested frame.
-    #[test]
-    fn select_frame_jumps_controller() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::AddFrame]);
-        app.apply_timeline_events(vec![TimelineEvent::SelectFrame(1)]);
-        assert_eq!(app.projects.current().animation.current_index(), 1);
-    }
-
-    /// SetDuration edits the frame's delay and mirrors it into the controller.
-    #[test]
-    fn set_duration_updates_frame_and_controller() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::SetDuration { index: 0, ms: 250 }]);
-        assert_eq!(
-            app.projects.current().sequence.frame(0).unwrap().delay_ms(),
-            250
-        );
-        assert_eq!(app.projects.current().animation.delay_ms(0), 250);
-    }
-
-    /// Reorder moves the frame and keeps the controller in sync.
-    #[test]
-    fn reorder_moves_frames() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::AddFrame]);
-        app.apply_timeline_events(vec![TimelineEvent::AddFrame]);
-        app.apply_timeline_events(vec![TimelineEvent::SetDuration { index: 2, ms: 300 }]);
-        app.apply_timeline_events(vec![TimelineEvent::Reorder { from: 2, to: 0 }]);
-        assert_eq!(app.projects.current().sequence.len(), 3);
-        assert_eq!(
-            app.projects.current().sequence.frame(0).unwrap().delay_ms(),
-            300
-        );
-        assert_eq!(app.projects.current().animation.frame_count(), 3);
-    }
-
-    /// AddFrame clones the current frame's region and selects the new frame.
-    #[test]
-    fn add_frame_clones_current_region() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::AddFrame]);
-        assert_eq!(app.projects.current().sequence.len(), 2);
-        assert_eq!(app.projects.current().animation.frame_count(), 2);
-        assert_eq!(app.projects.current().animation.current_index(), 1);
-        let f0 = app.projects.current().sequence.frame(0).unwrap();
-        let f1 = app.projects.current().sequence.frame(1).unwrap();
-        assert_eq!(f0.region().rect(), f1.region().rect());
-    }
-
-    /// RemoveFrame deletes the frame and keeps at least one frame.
-    #[test]
-    fn remove_frame_deletes_and_keeps_one() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::AddFrame]);
-        app.apply_timeline_events(vec![TimelineEvent::RemoveFrame(0)]);
-        assert_eq!(app.projects.current().sequence.len(), 1);
-        assert_eq!(app.projects.current().animation.frame_count(), 1);
-        // Removing the last remaining frame is a no-op.
-        app.apply_timeline_events(vec![TimelineEvent::RemoveFrame(0)]);
-        assert_eq!(app.projects.current().sequence.len(), 1);
-    }
-
-    /// ToggleLoop flips the loop flag on both the sequence and the controller.
-    #[test]
-    fn toggle_loop_flips_both_flags() {
-        let mut app = App::default();
-        assert!(app.projects.current_mut().sequence.looping());
-        app.apply_timeline_events(vec![TimelineEvent::ToggleLoop]);
-        assert!(!app.projects.current_mut().sequence.looping());
-        assert!(!app.projects.current().animation.looping());
-    }
-
-    /// Play/Stop/Restart drive the controller transport.
-    #[test]
-    fn transport_controls_drive_controller() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::Play]);
-        assert!(app.projects.current().animation.is_playing());
-        app.apply_timeline_events(vec![TimelineEvent::Stop]);
-        assert!(!app.projects.current().animation.is_playing());
-        app.apply_timeline_events(vec![TimelineEvent::Restart]);
-        assert_eq!(app.projects.current().animation.current_index(), 0);
-    }
-
-    /// tick_animation advances the controller by the frame delta.
-    #[test]
-    fn tick_advances_playback() {
-        let mut app = App::default();
-        app.apply_timeline_events(vec![TimelineEvent::AddFrame]);
-        app.apply_timeline_events(vec![TimelineEvent::SelectFrame(0)]);
-        app.apply_timeline_events(vec![TimelineEvent::Play]);
-        app.tick_animation(100); // frame 0 (100 ms) -> frame 1
-        assert_eq!(app.projects.current().animation.current_index(), 1);
-        app.tick_animation(100); // frame 1 (100 ms) -> wraps to frame 0
-        assert_eq!(app.projects.current().animation.current_index(), 0); // loops back
     }
 
     // -----------------------------------------------------------------------
@@ -18503,7 +20928,7 @@ mod tests {
     fn document_roundtrip_preserves_layers_and_frames() {
         let mut app = App::default();
         seed_red_rect(&mut app, Rect2i::new(4, 4, 2, 2));
-        app.projects.current_mut().sequence.push(Frame::new(
+        app.projects.current_mut().sequence_mut().push(Frame::new(
             Region::new(Rect2i::new(0, 0, 8, 8), "Frame 2"),
             250,
         ));
@@ -18522,12 +20947,12 @@ mod tests {
             restored.projects.current().layers.height(),
             app.projects.current_mut().layers.height()
         );
-        assert_eq!(restored.projects.current().sequence.len(), 2);
+        assert_eq!(restored.projects.current().sequence().len(), 2);
         assert_eq!(
             restored
                 .projects
                 .current()
-                .sequence
+                .sequence()
                 .iter()
                 .nth(1)
                 .unwrap()
@@ -18641,6 +21066,54 @@ mod tests {
         };
         let mut output = ctx.run_ui(raw_input, |_ui| app.handle_shortcuts());
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn focused_text_input_suppresses_all_global_hotkeys() {
+        // A TextEdit holds keyboard focus on a previous frame; egui's memory
+        // keeps that focus, so `ctx.wants_keyboard_input()` must silence the
+        // T tool hotkey through the real `handle_shortcuts` path.
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+        {
+            let ctx = app.ctx.clone();
+            let mut text = String::new();
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text))
+                    .request_focus();
+            });
+            output.textures_delta.clear();
+            assert!(
+                ctx.memory(|m| m.focused().is_some()),
+                "the focused TextEdit must own the keyboard"
+            );
+        }
+        // T while typing: the tool must NOT change.
+        send_key(&mut app, egui::Key::T, egui::Modifiers::NONE);
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Pencil,
+            "a focused text input must suppress the T tool hotkey"
+        );
+        // Positive control: without a focused text input the same key selects
+        // the Tile tool (untouched behavior).
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+        send_key(&mut app, egui::Key::T, egui::Modifiers::NONE);
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Tile,
+            "without a focused input the T hotkey selects the Tile tool"
+        );
     }
 
     /// Commit a square selection over `rect` (assuming the pixels are already
@@ -19043,15 +21516,15 @@ mod tests {
         let mut app = App::default();
         seed_red_rect(&mut app, Rect2i::new(0, 0, 5, 5));
         app.projects.current_mut().mark_dirty();
-        app.create_new_canvas(24, 32, 8);
+        app.create_new_canvas(24, 32, TileSize::square(8));
         assert_eq!(app.projects.current_mut().layers.width(), 24);
         assert_eq!(app.projects.current_mut().layers.height(), 32);
         assert_eq!(app.projects.current_mut().layers.len(), 1);
-        assert_eq!(app.projects.current().sequence.len(), 1);
+        assert_eq!(app.projects.current().sequence().len(), 1);
         assert!(app.projects.current_mut().undo.can_undo() == false);
         assert_eq!(app.projects.current().name, "Untitled");
         assert!(!app.projects.current().is_dirty());
-        assert_eq!(app.projects.current().tile_size, 8);
+        assert_eq!(app.projects.current().tile_size, TileSize::square(8));
     }
 
     #[test]
@@ -19187,7 +21660,7 @@ mod tests {
             project: app.projects.current().id,
             width: 10,
             height: 10,
-            tile: 2,
+            tile: TileSize::square(2),
         });
         app.guard_cancel();
         assert!(app.projects.current_mut().pending_action.is_none());
@@ -19358,7 +21831,7 @@ mod tests {
             project: app.projects.current().id,
             width: 8,
             height: 8,
-            tile: 1,
+            tile: TileSize::square(1),
         });
 
         let path = TempDir::new("f3_save_to");
@@ -19524,6 +21997,529 @@ mod tests {
     }
 
     #[test]
+    fn save_to_extensionless_creates_directory_project_roundtrip() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        let base = TempDir::new("d80_save_dir");
+        let path = base.path().join("project");
+        assert!(app.save_to(path.clone()));
+        // Extensionless save-as = directory project contract:
+        assert!(path.is_dir());
+        assert!(path.join("manifest.json").is_file());
+        assert!(path.join("layers").is_dir());
+        // ... and it reloads equal via `load_project`.
+        let mut loaded = App::default();
+        loaded.load_project(path);
+        assert_eq!(
+            loaded.app_to_document().canvas_width,
+            app.app_to_document().canvas_width
+        );
+        assert_eq!(
+            loaded.app_to_document().canvas_height,
+            app.app_to_document().canvas_height
+        );
+        assert_eq!(
+            loaded
+                .projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .as_bytes(),
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .as_bytes()
+        );
+    }
+
+    #[test]
+    fn save_to_pyxross_creates_archive_file_roundtrip() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        let base = TempDir::new("d80_save_file");
+        let path = base.path().join("doc.pyxross");
+        assert!(app.save_to(path.clone()));
+        // `.pyxross` extension = archive file, not a directory:
+        assert!(path.is_file());
+        assert!(!path.join("manifest.json").exists());
+        // ... and it reloads equal via `load_project`.
+        let mut loaded = App::default();
+        loaded.load_project(path);
+        assert_eq!(
+            loaded.app_to_document().canvas_width,
+            app.app_to_document().canvas_width
+        );
+        assert_eq!(
+            loaded.app_to_document().canvas_height,
+            app.app_to_document().canvas_height
+        );
+        assert_eq!(
+            loaded
+                .projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .as_bytes(),
+            app.projects
+                .current()
+                .layers
+                .active_layer()
+                .buffer
+                .as_bytes()
+        );
+    }
+
+    #[test]
+    fn save_to_overwrites_existing_archive_file() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        let base = TempDir::new("d80_save_twice");
+        let path = base.path().join("doc.pyxross");
+        // In-place save on a `.pyxross` archive path must overwrite it.
+        assert!(app.save_to(path.clone()));
+        assert!(app.save_to(path.clone()));
+        let mut loaded = App::default();
+        loaded.load_project(path);
+        assert_eq!(
+            loaded.app_to_document().canvas_width,
+            app.app_to_document().canvas_width
+        );
+    }
+
+    #[test]
+    fn load_project_manifest_file_loads_parent_directory() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        let base = TempDir::new("d80_manifest");
+        let dir = base.path().join("proj");
+        assert!(app.save_to(dir.clone()));
+        // Picking a native project's `manifest.json` loads its parent dir.
+        let mut loaded = App::default();
+        loaded.load_project(dir.join("manifest.json"));
+        assert_eq!(loaded.projects.current().name, "proj");
+        assert_eq!(
+            loaded.app_to_document().canvas_width,
+            app.app_to_document().canvas_width
+        );
+    }
+
+    #[test]
+    fn load_project_garbage_file_reports_not_pyxross() {
+        let mut app = App::default();
+        let garbage = TempFile::new("d80_garbage", b"this is not a pyxross archive");
+        app.load_project(garbage.path().to_path_buf());
+        let err = app.projects.current().last_error.clone();
+        assert!(
+            err.as_deref().is_some_and(|m| m.contains("not a pyxross")),
+            "expected a meaningful 'not a pyxross' message, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_save_as_panel_defaults_the_draft() {
+        let mut app = App::default();
+        app.last_dir = Some(PathBuf::from("/tmp/save_as_defaults"));
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        let view = app.save_as_host.view.borrow();
+        assert_eq!(view.kind, dock_save_as_panel::SaveAsKind::Project);
+        assert_eq!(view.location, PathBuf::from("/tmp/save_as_defaults"));
+        assert!(view.focus_requested);
+        assert!(view.error.is_none());
+        drop(view);
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_some());
+    }
+
+    #[test]
+    fn save_as_modal_project_writes_a_single_pyxross_archive() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        app.projects.current_mut().mark_dirty();
+        let base = TempDir::new("modal_file");
+        let target = base.path().join("doc.pyxross");
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        app.save_as_host
+            .view
+            .borrow_mut()
+            .location = base.path().to_path_buf();
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Save {
+                path: target.clone(),
+                name: "doc.pyxross".to_owned(),
+            });
+        app.drain_save_as_events();
+        assert!(
+            target.is_file(),
+            "Save As ALWAYS writes a single archive file"
+        );
+        assert_eq!(
+            target.extension().and_then(|e| e.to_str()),
+            Some("pyxross"),
+            "the project save target is a .pyxross file"
+        );
+        let session = app.projects.current();
+        assert_eq!(session.path.as_deref(), Some(target.as_path()));
+        assert!(!session.is_dirty(), "successful save marks the session saved");
+        // The modal closes after a successful save.
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_none());
+    }
+
+    #[test]
+    fn save_as_modal_export_selection_writes_png_on_save() {
+        let mut app = App::default();
+        let base = TempDir::new("modal_sel");
+        let target = base.path().join("out.png");
+        app.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::SelectionPng,
+            Some(dock_save_as_panel::SavePayload::SelectionPng {
+                w: 2,
+                h: 2,
+                rgba: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255],
+            }),
+        );
+        std::fs::create_dir_all(base.path()).unwrap();
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Save {
+                path: target.clone(),
+                name: "out.png".to_owned(),
+            });
+        app.drain_save_as_events();
+        let bytes = std::fs::read(&target).expect("png written");
+        assert_eq!(&bytes[..4], b"\x89PNG", "a real PNG was written");
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_none(), "closed after success");
+    }
+
+    #[test]
+    fn save_as_modal_cancel_closes_the_panel() {
+        let mut app = App::default();
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_some());
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Cancel);
+        app.drain_save_as_events();
+        assert!(app.panel_dock.placement(panel_id).is_none());
+    }
+
+    #[test]
+    fn save_as_target_failure_keeps_panel_open_with_inline_error() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        // The write target's parent is a FILE, so `create_dir_all` fails.
+        let base = TempDir::new("modal_fail");
+        std::fs::create_dir_all(base.path()).unwrap();
+        let blocker = base.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Save {
+                path: blocker.join("proj.pyxross"),
+                name: "proj.pyxross".to_owned(),
+            });
+        app.drain_save_as_events();
+        let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(
+            app.panel_dock.placement(panel_id).is_some(),
+            "a failed save keeps the modal open"
+        );
+        let view = app.save_as_host.view.borrow();
+        assert!(
+            view.error.as_deref().is_some_and(|m| m.starts_with("Failed to save:")),
+            "inline error expected, got: {:?}",
+            view.error
+        );
+    }
+
+    #[test]
+    fn open_file_chooser_seeds_draft_and_registers_panel() {
+        let mut app = App::default();
+        let base = TempDir::new("chooser_seed");
+        std::fs::create_dir_all(base.path()).unwrap();
+        app.last_dir = Some(base.path().to_path_buf());
+        app.file_open();
+        let view = app.file_chooser_host.view.borrow();
+        assert_eq!(view.mode, dock_file_chooser_panel::FileChooserMode::OpenProject);
+        assert_eq!(view.cwd, base.path());
+        assert!(view.focus_requested);
+        assert!(view.error.is_none(), "a real directory lists cleanly");
+        drop(view);
+        let panel_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_some());
+    }
+
+    #[test]
+    fn file_chooser_open_project_confirms_and_loads_a_dir_project() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        let base = TempDir::new("chooser_dir");
+        let dir = base.path().join("proj");
+        assert!(app.save_to(dir.clone()));
+        // A fresh app picks the saved native directory project.
+        let mut picker = App::default();
+        picker.open_file_chooser(dock_file_chooser_panel::FileChooserMode::OpenProject, dir.clone());
+        picker
+            .file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(dir.clone()));
+        picker.drain_file_chooser_events();
+        assert_eq!(picker.projects.current().name, "proj");
+        assert_eq!(picker.last_dir.as_deref(), Some(dir.as_path()));
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(
+            picker.panel_dock.placement(chooser_id).is_none(),
+            "the chooser closes after a confirm"
+        );
+    }
+
+    #[test]
+    fn file_chooser_open_project_dirty_defers_via_pending_action() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        app.projects.current_mut().mark_dirty();
+        let base = TempDir::new("chooser_dirty");
+        std::fs::create_dir_all(base.path()).unwrap();
+        let target = base.path().join("doc.pyxross");
+        std::fs::write(&target, b"x").unwrap();
+        app.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::OpenProject,
+            base.path().to_path_buf(),
+        );
+        app.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(target.clone()));
+        app.drain_file_chooser_events();
+        let pending = app.projects.current_mut().pending_action.take();
+        assert!(
+            matches!(pending, Some(PendingAction::Open { path, .. }) if path == target),
+            "a dirty project defers the open through the existing dirty gate"
+        );
+        assert_eq!(app.last_dir.as_deref(), Some(base.path()), "parent remembered");
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_none());
+    }
+
+    #[test]
+    fn file_chooser_open_project_file_form_loads_an_archive() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        let base = TempDir::new("chooser_file");
+        let target = base.path().join("doc.pyxross");
+        assert!(app.save_to(target.clone()));
+        let mut picker = App::default();
+        picker.file_open();
+        picker.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(target.clone()));
+        picker.drain_file_chooser_events();
+        let session = picker.projects.current();
+        assert_eq!(session.name, "doc.pyxross");
+        assert_eq!(session.path.as_deref(), Some(target.as_path()));
+    }
+
+    #[test]
+    fn file_chooser_import_png_pick_stages_the_import_panel() {
+        let mut app = App::default();
+        let base = TempDir::new("chooser_png");
+        std::fs::create_dir_all(base.path()).unwrap();
+        let png: Vec<u8> = crate::io::encode_png(1, 1, &[255, 0, 0, 255]).unwrap();
+        let file = base.path().join("red.png");
+        std::fs::write(&file, &png).unwrap();
+        app.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportPng,
+            base.path().to_path_buf(),
+        );
+        app.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(file.clone()));
+        app.drain_file_chooser_events();
+        assert!(
+            app.projects.current().last_error.is_none(),
+            "a valid PNG stages without error"
+        );
+        assert_eq!(app.last_dir.as_deref(), Some(base.path()));
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_none());
+        // The pick stages the Import Image panel (id 210) seeded with the
+        // decoded image instead of importing directly.
+        let image_panel = panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
+        assert!(app.panel_dock.placement(image_panel).is_some());
+        assert!(app.pending_image_import.is_some());
+        let view = app.import_image_host.view.borrow();
+        assert_eq!(view.path, file);
+        assert_eq!((view.img_w, view.img_h), (1, 1));
+        assert_eq!(view.pixels_text, "1x1");
+    }
+
+    #[test]
+    fn file_chooser_import_gif_pick_stages_the_import_panel() {
+        let mut app = App::default();
+        let base = TempDir::new("chooser_gif");
+        std::fs::create_dir_all(base.path()).unwrap();
+        let gif = encode_gif(&[GifFrameInput {
+            width: 2,
+            height: 2,
+            rgba: [0, 255, 0, 255].repeat(4),
+            delay_ms: 100,
+        }])
+        .unwrap();
+        let file = base.path().join("shiny.gif");
+        std::fs::write(&file, &gif).unwrap();
+        app.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportGif,
+            base.path().to_path_buf(),
+        );
+        app.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(file.clone()));
+        app.drain_file_chooser_events();
+        assert!(
+            app.projects.current().last_error.is_none(),
+            "a valid GIF stages without error"
+        );
+        assert_eq!(app.last_dir.as_deref(), Some(base.path()));
+        // The pick stages the Import GIF panel (id 209) seeded with the
+        // decoded animation instead of importing directly.
+        let gif_panel = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        assert!(app.panel_dock.placement(gif_panel).is_some());
+        assert!(app.pending_gif_import.is_some());
+        {
+            let view = app.import_gif_host.view.borrow();
+            assert_eq!(view.path, file);
+            assert_eq!(view.frame_count, 1);
+            assert_eq!((view.frame_w, view.frame_h), (2, 2));
+            assert_eq!(view.line_length_text, "1");
+        }
+        // And the chooser itself closed.
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_none());
+    }
+
+    #[test]
+    fn menu_import_actions_open_the_chooser_in_the_right_mode() {
+        let mut app = App::default();
+        app.apply_menu_action(top_bar::MenuAction::ImportImages);
+        assert_eq!(
+            app.file_chooser_host.view.borrow().mode,
+            dock_file_chooser_panel::FileChooserMode::ImportPng
+        );
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_some());
+        app.close_file_chooser();
+        app.apply_menu_action(top_bar::MenuAction::ImportGif);
+        assert_eq!(
+            app.file_chooser_host.view.borrow().mode,
+            dock_file_chooser_panel::FileChooserMode::ImportGif
+        );
+        assert!(app.panel_dock.placement(chooser_id).is_some());
+    }
+
+    #[test]
+    fn file_chooser_cancel_closes_the_panel() {
+        let mut app = App::default();
+        app.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportPng,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_some());
+        app.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Cancelled);
+        app.drain_file_chooser_events();
+        assert!(app.panel_dock.placement(chooser_id).is_none());
+    }
+
+    #[test]
+    fn browse_location_opens_the_chooser_in_folder_mode() {
+        let mut app = App::default();
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::BrowseLocation);
+        app.drain_save_as_events();
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_some());
+        assert_eq!(
+            app.file_chooser_host.view.borrow().mode,
+            dock_file_chooser_panel::FileChooserMode::ChooseFolder
+        );
+        // The save-as modal itself stays open underneath.
+        let save_panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(save_panel_id).is_some());
+    }
+
+    #[test]
+    fn choose_folder_updates_save_location_closes_chooser_and_reopens_modal() {
+        let mut app = App::default();
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::BrowseLocation);
+        app.drain_save_as_events();
+        let base = TempDir::new("chooser_folder");
+        let chosen = base.path().join("target");
+        std::fs::create_dir_all(&chosen).unwrap();
+        app.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(chosen.clone()));
+        app.drain_file_chooser_events();
+        assert_eq!(app.save_as_host.view.borrow().location, chosen);
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        let save_panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(chooser_id).is_none());
+        assert!(
+            app.panel_dock.placement(save_panel_id).is_some(),
+            "the save-as modal is raised back above the closed chooser"
+        );
+    }
+
+    #[test]
+    fn save_as_cancel_while_chooser_open_closes_both_panels() {
+        let mut app = App::default();
+        app.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::BrowseLocation);
+        app.drain_save_as_events();
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Cancel);
+        app.drain_save_as_events();
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        let save_panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(
+            app.panel_dock.placement(chooser_id).is_none(),
+            "closing the modal also closes its ChooseFolder chooser"
+        );
+        assert!(app.panel_dock.placement(save_panel_id).is_none());
+    }
+
+    #[test]
     fn closing_last_project_leaves_main_frame_safe_to_redraw() {
         let mut app = App::default();
         let project = app.projects.current().id;
@@ -19594,7 +22590,7 @@ mod tests {
         app.projects.current_mut().autosave_generation = 5;
         app.projects.current_mut().dialog_open = true;
 
-        app.create_new_canvas(16, 16, 8);
+        app.create_new_canvas(16, 16, TileSize::square(8));
         assert!(!journal_base.join("recovery.json").exists());
         assert!(app.projects.current().recovery.is_none());
         assert!(!app.projects.current().recovery_pending);
@@ -19629,55 +22625,276 @@ mod tests {
     }
 
     #[test]
-    fn file_import_png_creates_layer_region_frame() {
-        let mut app = App::default();
-        let layers_before = app.projects.current_mut().layers.len();
-        let frames_before = app.projects.current().sequence.len();
-        let path = TempFile::new(
-            "png_success",
-            &encode_png(8, 8, &vec![255u8; 8 * 8 * 4]).unwrap(),
-        );
-        app.file_import_png_path(path.path());
-        assert!(app.projects.current().last_error.is_none());
-        assert_eq!(app.projects.current_mut().layers.len(), layers_before + 1);
-        assert_eq!(app.projects.current().sequence.len(), frames_before + 1);
-        let layer = app.projects.current_mut().layers.active_layer();
-        assert_eq!(layer.name, "Imported");
-        assert_eq!(
-            layer.buffer.get_pixel(0, 0),
-            Some(Color::rgb(255, 255, 255))
-        );
-        assert_eq!(
-            layer.buffer.get_pixel(7, 7),
-            Some(Color::rgb(255, 255, 255))
-        );
-        let frame = app
-            .projects
-            .current()
-            .sequence
-            .frame(app.projects.current().sequence.len() - 1)
-            .unwrap();
-        assert_eq!(frame.region().rect(), Rect2i::new(0, 0, 8, 8));
-        assert_eq!(frame.delay_ms(), 100);
-        assert_eq!(
-            app.projects
-                .current_mut()
-                .selection
-                .as_ref()
-                .unwrap()
-                .rect(),
-            Rect2i::new(0, 0, 8, 8)
-        );
-        assert!(
-            app.projects.current().is_dirty(),
-            "import must mark the document modified"
-        );
-        assert!(app.texture_dirty);
-        assert_eq!(app.canvas_cache_token, None);
+    fn import_document_name_uses_the_file_stem_and_falls_back_to_untitled() {
+        assert_eq!(import_document_name(std::path::Path::new("benny.gif")), "benny");
+        assert_eq!(import_document_name(std::path::Path::new("/a/b/arcade.png")), "arcade");
+        assert_eq!(import_document_name(std::path::Path::new("noext")), "noext");
+        // A path with no file name at all → the create-document default.
+        assert_eq!(import_document_name(std::path::Path::new("/")), "Untitled");
     }
 
     #[test]
-    fn file_import_png_boundary_decode_failures_preserve_session() {
+    fn import_png_opens_a_new_document_with_regions_and_frames() {
+        let mut app = App::default();
+        app.new_project("small", 16, 16);
+        let old_id = app.projects.current().id;
+        // 64x64 gradient: pixel (x, y) = rgba(x % 256, y % 256, 0, 255).
+        let mut rgba = Vec::with_capacity(64 * 64 * 4);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                rgba.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+        let path = TempFile::new("benny.png", &encode_png(64, 64, &rgba).unwrap());
+
+        app.file_import_png_pick(path.path());
+
+        // The Import Image panel (id 210) opens seeded with the whole image.
+        let image_panel = panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
+        assert!(app.panel_dock.placement(image_panel).is_some());
+        assert!(app.pending_image_import.is_some());
+        {
+            let view = app.import_image_host.view.borrow();
+            assert_eq!(view.path, path.path());
+            assert_eq!((view.img_w, view.img_h), (64, 64));
+            assert_eq!(view.pixels_text, "64x64");
+            assert_eq!(view.regions_text, "1x1");
+        }
+        // Staging leaves the pre-existing project untouched.
+        let old_before = import_state_of(&app, old_id);
+        let project_names_before = project_names(&app).len();
+        let stem = path.path().file_stem().unwrap().to_str().unwrap().to_owned();
+
+        // Confirmed with a 4x4 grid of 16x16-cell regions.
+        app.import_image_host
+            .events
+            .borrow_mut()
+            .push(dock_import_image_panel::ImportImageEvent::Ok {
+                px_w: 16,
+                px_h: 16,
+                regions_w: 4,
+                regions_h: 4,
+            });
+        app.drain_import_image_events();
+
+        assert!(
+            app.panel_dock.placement(image_panel).is_none(),
+            "the panel closes on OK"
+        );
+        assert!(app.pending_image_import.is_none(), "OK consumes the pending import");
+        assert!(app.projects.current().last_error.is_none());
+        // A NEW document — named after the file's stem — becomes active;
+        // the pre-existing "small" project is never written into.
+        let project = app.projects.current();
+        assert_ne!(project.id, old_id, "import opens a new document");
+        assert_eq!(project.name, stem, "the document is named after the file stem");
+        assert_eq!(
+            project.tile_size,
+            TileSize::new(16, 16),
+            "the tile grid follows the region cell size (not the 16x16 default)"
+        );
+        assert_eq!(
+            (project.layers.width(), project.layers.height()),
+            (64, 64),
+            "the new canvas is exactly the image size"
+        );
+        let layer = project.layers.active_layer();
+        assert_eq!(
+            layer.name,
+            "Layer 1",
+            "content lands in the fresh session's first layer"
+        );
+        assert_eq!(layer.buffer.get_pixel(0, 0), Some(Color::rgba(0, 0, 0, 255)));
+        assert_eq!(layer.buffer.get_pixel(63, 63), Some(Color::rgba(63, 63, 0, 255)));
+        let sequence = project.sequence();
+        assert_eq!(sequence.len(), 16, "one frame per grid region");
+        assert_eq!(sequence.frame(0).unwrap().region().rect(), Rect2i::new(0, 0, 16, 16));
+        assert_eq!(
+            sequence.frame(15).unwrap().region().rect(),
+            Rect2i::new(48, 48, 16, 16),
+            "row-major grid: the last cell is bottom-right"
+        );
+        assert_eq!(sequence.frame(0).unwrap().region().name(), "Frame 1");
+        assert_eq!(sequence.frame(0).unwrap().delay_ms(), 100);
+        assert_eq!(
+            project.selection.as_ref().unwrap().rect(),
+            Rect2i::new(0, 0, 64, 64)
+        );
+        assert!(
+            !project.is_dirty(),
+            "create-document parity: a fresh session starts clean"
+        );
+        assert!(app.texture_dirty);
+        assert_eq!(app.canvas_cache_token, None);
+        // The pre-existing session is content-for-content untouched...
+        assert_import_session_unchanged(&app, old_id, &old_before);
+        // ...and still open (the document set grows by exactly one).
+        let docs_after = project_names(&app);
+        assert_eq!(docs_after.len(), project_names_before + 1);
+        assert!(docs_after.iter().any(|(id, _)| *id == old_id), "old document stays open");
+    }
+
+    #[test]
+    fn import_gif_opens_a_new_document_with_regions_frames_and_delays() {
+        let mut app = App::default();
+        app.new_project("tiny", 1, 1);
+        let old_id = app.projects.current().id;
+        let gif = encode_gif(&[
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: [255, 0, 0, 255].repeat(4),
+                delay_ms: 100,
+            },
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: [0, 255, 0, 255].repeat(4),
+                delay_ms: 150,
+            },
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: [0, 0, 255, 255].repeat(4),
+                delay_ms: 200,
+            },
+        ])
+        .unwrap();
+        let path = TempFile::new("benny.gif", &gif);
+
+        app.file_import_gif_pick(path.path());
+
+        // The Import GIF panel (id 209) opens seeded with the animation.
+        let gif_panel = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        assert!(app.panel_dock.placement(gif_panel).is_some());
+        assert!(app.pending_gif_import.is_some());
+        {
+            let view = app.import_gif_host.view.borrow();
+            assert_eq!(view.path, path.path());
+            assert_eq!(view.frame_count, 3);
+            assert_eq!((view.frame_w, view.frame_h), (2, 2));
+            assert_eq!(view.line_length_text, "1");
+            assert!(view.error.is_none());
+        }
+        let old_before = import_state_of(&app, old_id);
+        let stem = path.path().file_stem().unwrap().to_str().unwrap().to_owned();
+
+        // Confirmed with 2 frames per line → a 2x2 sheet of 2x2 cells.
+        app.import_gif_host
+            .events
+            .borrow_mut()
+            .push(dock_import_gif_panel::ImportGifEvent::Ok { line_length: 2 });
+        app.drain_import_gif_events();
+
+        assert!(app.panel_dock.placement(gif_panel).is_none());
+        assert!(app.pending_gif_import.is_none());
+        assert!(app.projects.current().last_error.is_none());
+        // A NEW document — named after the file's stem — becomes active; the
+        // 2x2-cell sheet is exactly its canvas.
+        let project = app.projects.current();
+        assert_ne!(project.id, old_id, "import opens a new document");
+        assert_eq!(project.name, stem, "the document is named after the file stem");
+        assert_eq!(
+            project.tile_size,
+            TileSize::new(2, 2),
+            "the tile grid follows the GIF frame size"
+        );
+        assert_eq!(
+            (project.layers.width(), project.layers.height()),
+            (4, 4),
+            "the new canvas is exactly the 2x2-cell sheet"
+        );
+        let layer = project.layers.active_layer();
+        assert_eq!(
+            layer.name,
+            "Layer 1",
+            "content lands in the fresh session's first layer"
+        );
+        assert_eq!(layer.buffer.get_pixel(0, 0), Some(Color::rgba(255, 0, 0, 255)));
+        assert_eq!(layer.buffer.get_pixel(1, 1), Some(Color::rgba(255, 0, 0, 255)));
+        assert_eq!(layer.buffer.get_pixel(2, 0), Some(Color::rgba(0, 255, 0, 255)));
+        assert_eq!(layer.buffer.get_pixel(0, 2), Some(Color::rgba(0, 0, 255, 255)));
+        // The fourth cell (2,2)-(4,4) holds no frame: it stays transparent.
+        assert_eq!(layer.buffer.get_pixel(3, 3), Some(Color::rgba(0, 0, 0, 0)));
+        let sequence = project.sequence();
+        assert_eq!(sequence.len(), 3, "one frame per animation frame");
+        assert_eq!(sequence.frame(0).unwrap().region().rect(), Rect2i::new(0, 0, 2, 2));
+        assert_eq!(sequence.frame(1).unwrap().region().rect(), Rect2i::new(2, 0, 2, 2));
+        assert_eq!(sequence.frame(2).unwrap().region().rect(), Rect2i::new(0, 2, 2, 2));
+        assert_eq!(sequence.frame(0).unwrap().delay_ms(), 100);
+        assert_eq!(sequence.frame(1).unwrap().delay_ms(), 150);
+        assert_eq!(sequence.frame(2).unwrap().delay_ms(), 200);
+        assert_eq!(project.animation.delay_ms(0), 100);
+        assert_eq!(project.animation.delay_ms(1), 150);
+        assert_eq!(project.animation.delay_ms(2), 200);
+        assert_eq!(
+            project.selection.as_ref().unwrap().rect(),
+            Rect2i::new(0, 0, 4, 4)
+        );
+        assert!(
+            !project.is_dirty(),
+            "create-document parity: a fresh session starts clean"
+        );
+        // The pre-existing "tiny" project is untouched.
+        assert_import_session_unchanged(&app, old_id, &old_before);
+    }
+
+    #[test]
+    fn import_image_region_driven_split_opens_a_new_document() {
+        let mut app = App::default();
+        app.new_project("small", 16, 16);
+        let old_id = app.projects.current().id;
+        let path = TempFile::new(
+            "sheet.png",
+            &encode_png(64, 64, &vec![255u8; 64 * 64 * 4]).unwrap(),
+        );
+        app.file_import_png_pick(path.path());
+        let old_before = import_state_of(&app, old_id);
+        let stem = path.path().file_stem().unwrap().to_str().unwrap().to_owned();
+        app.import_image_host
+            .events
+            .borrow_mut()
+            .push(dock_import_image_panel::ImportImageEvent::Ok {
+                px_w: 22,
+                px_h: 22,
+                regions_w: 3,
+                regions_h: 3,
+            });
+        app.drain_import_image_events();
+
+        assert!(app.projects.current().last_error.is_none());
+        let project = app.projects.current();
+        assert_ne!(project.id, old_id, "import opens a new document");
+        assert_eq!(project.name, stem, "the document is named after the file stem");
+        assert_eq!(
+            project.tile_size,
+            TileSize::new(22, 22),
+            "the tile grid follows the requested split cell size"
+        );
+        // ceil(64 / 22) = 3 regions per axis → the grid is 66x66: the new
+        // canvas is exactly the GRID size, never a multiple of the image size.
+        assert_eq!((project.layers.width(), project.layers.height()), (66, 66));
+        let sequence = project.sequence();
+        assert_eq!(sequence.len(), 9);
+        assert_eq!(
+            sequence.frame(8).unwrap().region().rect(),
+            Rect2i::new(44, 44, 22, 22),
+            "the last region is the truncated tail cell"
+        );
+        let layer = project.layers.active_layer();
+        assert_eq!(layer.buffer.get_pixel(63, 63), Some(Color::rgb(255, 255, 255)));
+        // (64,64) sits inside the last region but past the image edge.
+        assert_eq!(layer.buffer.get_pixel(64, 64), Some(Color::rgba(0, 0, 0, 0)));
+        assert_eq!(
+            project.selection.as_ref().unwrap().rect(),
+            Rect2i::new(0, 0, 66, 66)
+        );
+        // The pre-existing "small" project is untouched.
+        assert_import_session_unchanged(&app, old_id, &old_before);
+    }
+
+    #[test]
+    fn import_png_boundary_decode_failures_preserve_session() {
         let valid = encode_png(1, 1, &[255, 255, 255, 255]).unwrap();
         let mut truncated = valid.clone();
         truncated.truncate(truncated.len() / 2);
@@ -19696,11 +22913,17 @@ mod tests {
             app.canvas_cache_token = app.projects.activation_token();
             app.projects.current_mut().last_error = Some("previous error".to_string());
             let before = import_state(&app);
+            let docs_before = project_names(&app);
             let path = TempFile::new(&format!("png_{name}"), &bytes);
 
-            app.file_import_png_path(path.path());
+            app.file_import_png_pick(path.path());
 
             assert_import_state_unchanged(&app, &before);
+            assert_eq!(
+                project_names(&app),
+                docs_before,
+                "a decode failure opens no new document"
+            );
             assert!(app
                 .projects
                 .current()
@@ -19708,43 +22931,34 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .starts_with("Failed to import PNG:"));
+            let image_panel =
+                panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
+            assert!(
+                app.panel_dock.placement(image_panel).is_none(),
+                "no panel opens on a decode failure"
+            );
+            assert!(app.pending_image_import.is_none());
         }
     }
 
     #[test]
-    fn file_import_png_boundary_empty_dimensions_preserve_session() {
+    fn import_png_boundary_overflow_dimensions_preserve_session() {
         let mut app = App::default();
-        app.new_project("empty canvas", 0, 0);
         app.texture_dirty = false;
         app.canvas_cache_token = app.projects.activation_token();
         app.projects.current_mut().last_error = Some("previous error".to_string());
         let before = import_state(&app);
-        let path = TempFile::new(
-            "png_empty",
-            &encode_png(1, 1, &[255, 255, 255, 255]).unwrap(),
-        );
+        let docs_before = project_names(&app);
+        let path = TempFile::new("png_overflow", &png_with_dimensions(u32::MAX, 2));
 
-        app.file_import_png_path(path.path());
+        app.file_import_png_pick(path.path());
 
         assert_import_state_unchanged(&app, &before);
         assert_eq!(
-            app.projects.current().last_error.as_deref(),
-            Some("Imported image is empty")
+            project_names(&app),
+            docs_before,
+            "a decode failure opens no new document"
         );
-    }
-
-    #[test]
-    fn file_import_png_boundary_overflow_dimensions_preserve_session() {
-        let mut app = App::default();
-        app.texture_dirty = false;
-        app.canvas_cache_token = app.projects.activation_token();
-        app.projects.current_mut().last_error = Some("previous error".to_string());
-        let before = import_state(&app);
-        let path = TempFile::new("png_overflow", &png_with_dimensions(u32::MAX, 2));
-
-        app.file_import_png_path(path.path());
-
-        assert_import_state_unchanged(&app, &before);
         assert!(app
             .projects
             .current()
@@ -19755,30 +22969,284 @@ mod tests {
     }
 
     #[test]
-    fn file_import_png_boundary_frame_limit_preserves_session() {
+    fn import_image_boundary_empty_split_preserves_session() {
         let mut app = App::default();
-        while app.projects.current().sequence.len() < MAX_FRAMES {
-            assert!(app.projects.current_mut().sequence.push(Frame::new(
-                Region::new(Rect2i::new(0, 0, 1, 1), "Limit"),
-                100,
-            )));
-        }
+        let path = TempFile::new(
+            "png_empty_split",
+            &encode_png(8, 8, &vec![255u8; 8 * 8 * 4]).unwrap(),
+        );
+        app.file_import_png_pick(path.path());
         app.texture_dirty = false;
         app.canvas_cache_token = app.projects.activation_token();
         app.projects.current_mut().last_error = Some("previous error".to_string());
         let before = import_state(&app);
-        let path = TempFile::new(
-            "png_frame_limit",
-            &encode_png(1, 1, &[255, 255, 255, 255]).unwrap(),
-        );
+        let docs_before = project_names(&app);
 
-        app.file_import_png_path(path.path());
+        app.import_image_host
+            .events
+            .borrow_mut()
+            .push(dock_import_image_panel::ImportImageEvent::Ok {
+                px_w: 0,
+                px_h: 0,
+                regions_w: 0,
+                regions_h: 0,
+            });
+        app.drain_import_image_events();
 
         assert_import_state_unchanged(&app, &before);
         assert_eq!(
-            app.projects.current().last_error.as_deref(),
-            Some("Project frame limit reached")
+            project_names(&app),
+            docs_before,
+            "an empty split opens no new document"
         );
+        assert_eq!(
+            app.projects.current().last_error.as_deref(),
+            Some("Split size is empty")
+        );
+    }
+
+    #[test]
+    fn import_gif_boundary_cell_limit_preserves_session() {
+        let mut app = App::default();
+        app.new_project("tiny", 1, 1);
+        let gif = encode_gif(&[GifFrameInput {
+            width: 2,
+            height: 2,
+            rgba: vec![255u8; 2 * 2 * 4],
+            delay_ms: 100,
+        }])
+        .unwrap();
+        let path = TempFile::new("gif_cell_limit", &gif);
+        app.file_import_gif_pick(path.path());
+        app.texture_dirty = false;
+        app.canvas_cache_token = app.projects.activation_token();
+        app.projects.current_mut().last_error = Some("previous error".to_string());
+        let before = import_state(&app);
+        let docs_before = project_names(&app);
+
+        app.import_gif_host
+            .events
+            .borrow_mut()
+            .push(dock_import_gif_panel::ImportGifEvent::Ok { line_length: 5000 });
+        app.drain_import_gif_events();
+
+        assert_import_state_unchanged(&app, &before);
+        assert_eq!(
+            project_names(&app),
+            docs_before,
+            "an over-limit sheet opens no new document"
+        );
+        assert!(app
+            .projects
+            .current()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("5000 cells exceed the 4096 cell limit"));
+    }
+
+    #[test]
+    fn import_image_boundary_region_limit_preserves_session() {
+        let mut app = App::default();
+        let path = TempFile::new(
+            "png_region_limit",
+            &encode_png(128, 128, &vec![255u8; 128 * 128 * 4]).unwrap(),
+        );
+        app.file_import_png_pick(path.path());
+        app.texture_dirty = false;
+        app.canvas_cache_token = app.projects.activation_token();
+        app.projects.current_mut().last_error = Some("previous error".to_string());
+        let before = import_state(&app);
+        let docs_before = project_names(&app);
+
+        app.import_image_host
+            .events
+            .borrow_mut()
+            .push(dock_import_image_panel::ImportImageEvent::Ok {
+                px_w: 1,
+                px_h: 1,
+                regions_w: 128,
+                regions_h: 128,
+            });
+        app.drain_import_image_events();
+
+        assert_import_state_unchanged(&app, &before);
+        assert_eq!(
+            project_names(&app),
+            docs_before,
+            "an over-limit grid opens no new document"
+        );
+        assert!(app
+            .projects
+            .current()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("16384 regions exceed the 4096 region limit"));
+    }
+
+    #[test]
+    fn import_gif_cancel_closes_the_panel_and_drops_the_pending() {
+        let mut app = App::default();
+        let gif = encode_gif(&[GifFrameInput {
+            width: 2,
+            height: 2,
+            rgba: vec![255u8; 2 * 2 * 4],
+            delay_ms: 100,
+        }])
+        .unwrap();
+        let path = TempFile::new("gif_cancel", &gif);
+        app.file_import_gif_pick(path.path());
+        let before = import_state(&app);
+        let docs_before = project_names(&app);
+        let gif_panel = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        assert!(app.panel_dock.placement(gif_panel).is_some());
+        assert!(app.pending_gif_import.is_some());
+
+        app.import_gif_host
+            .events
+            .borrow_mut()
+            .push(dock_import_gif_panel::ImportGifEvent::Cancel);
+        app.drain_import_gif_events();
+
+        assert!(app.panel_dock.placement(gif_panel).is_none());
+        assert!(app.pending_gif_import.is_none());
+        assert!(app.projects.current().last_error.is_none());
+        assert_import_state_unchanged(&app, &before);
+        assert_eq!(project_names(&app), docs_before, "Cancel opens no new document");
+    }
+
+    #[test]
+    fn import_image_cancel_closes_the_panel_and_drops_the_pending() {
+        let mut app = App::default();
+        let path = TempFile::new(
+            "png_cancel",
+            &encode_png(8, 8, &vec![255u8; 8 * 8 * 4]).unwrap(),
+        );
+        app.file_import_png_pick(path.path());
+        let before = import_state(&app);
+        let docs_before = project_names(&app);
+        let image_panel = panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
+        assert!(app.panel_dock.placement(image_panel).is_some());
+        assert!(app.pending_image_import.is_some());
+
+        app.import_image_host
+            .events
+            .borrow_mut()
+            .push(dock_import_image_panel::ImportImageEvent::Cancel);
+        app.drain_import_image_events();
+
+        assert!(app.panel_dock.placement(image_panel).is_none());
+        assert!(app.pending_image_import.is_none());
+        assert!(app.projects.current().last_error.is_none());
+        assert_import_state_unchanged(&app, &before);
+        assert_eq!(project_names(&app), docs_before, "Cancel opens no new document");
+    }
+
+    #[test]
+    fn import_gif_enter_confirms_with_the_edited_line_length() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.new_project("tiny", 1, 1);
+        let old_id = app.projects.current().id;
+        let empty = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
+        app.canvas_texture = Some(
+            ctx.load_texture("canvas-import-enter", empty, egui::TextureOptions::NEAREST),
+        );
+        app.texture_dirty = false;
+        let gif = encode_gif(&[GifFrameInput {
+            width: 2,
+            height: 2,
+            rgba: vec![255u8; 2 * 2 * 4],
+            delay_ms: 100,
+        }])
+        .unwrap();
+        let path = TempFile::new("benny.gif", &gif);
+        app.file_import_gif_pick(path.path());
+        app.import_gif_host.view.borrow_mut().line_length_text = "2".to_owned();
+        let old_before = import_state_of(&app, old_id);
+        let docs_before = project_names(&app);
+        let stem = path.path().file_stem().unwrap().to_str().unwrap().to_owned();
+
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert!(
+            app.pending_gif_import.is_none(),
+            "Enter consumes the pending import"
+        );
+        let gif_panel = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        assert!(app.panel_dock.placement(gif_panel).is_none(), "Enter closes the panel");
+        assert!(app.projects.current().last_error.is_none());
+        let project = app.projects.current();
+        // Enter confirms the edited line length in a NEW document named after
+        // the file's stem: one frame × line length 2 → one row of two 2x2
+        // cells → a 4x2 sheet.
+        assert_ne!(project.id, old_id, "Enter opens a new document");
+        assert_eq!(project.name, stem);
+        assert_eq!(project.tile_size, TileSize::new(2, 2), "tile grid = GIF frame size");
+        assert_eq!((project.layers.width(), project.layers.height()), (4, 2));
+        assert_eq!(project.sequence().len(), 1);
+        assert_eq!(
+            project.selection.as_ref().unwrap().rect(),
+            Rect2i::new(0, 0, 4, 2)
+        );
+        // The pre-existing "tiny" project is untouched.
+        assert_import_session_unchanged(&app, old_id, &old_before);
+        let docs_after = project_names(&app);
+        assert_eq!(docs_after.len(), docs_before.len() + 1, "one new document opened");
+        assert!(docs_after.iter().any(|(_, name)| *name == stem));
+    }
+
+    #[test]
+    fn import_gif_escape_cancels_and_closes_the_panel() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.new_project("tiny", 1, 1);
+        let empty = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
+        app.canvas_texture = Some(
+            ctx.load_texture("canvas-import-escape", empty, egui::TextureOptions::NEAREST),
+        );
+        app.texture_dirty = false;
+        let gif = encode_gif(&[GifFrameInput {
+            width: 2,
+            height: 2,
+            rgba: vec![255u8; 2 * 2 * 4],
+            delay_ms: 100,
+        }])
+        .unwrap();
+        let path = TempFile::new("gif_escape", &gif);
+        app.file_import_gif_pick(path.path());
+        let before = import_state(&app);
+        let docs_before = project_names(&app);
+
+        run_app_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        let gif_panel = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
+        assert!(app.panel_dock.placement(gif_panel).is_none(), "Esc closes the panel");
+        assert!(app.pending_gif_import.is_none(), "Esc drops the pending import");
+        assert!(app.projects.current().last_error.is_none());
+        assert_import_state_unchanged(&app, &before);
+        assert_eq!(project_names(&app), docs_before, "Esc opens no new document");
     }
 
     // -----------------------------------------------------------------------
@@ -19819,7 +23287,7 @@ mod tests {
         let mut output = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| app.ui_frame(ui));
+                .show(ui, |ui| ui_frame_with_top_bar(ui, app));
         });
         output.textures_delta.clear();
     }
@@ -20266,7 +23734,7 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| {
-                        app.ui_frame(ui);
+                        ui_frame_with_top_bar(ui, app);
                         ui.put(button_rect, egui::Button::new("Test"));
                     });
             });
@@ -20283,8 +23751,7 @@ mod tests {
 
     #[test]
     fn fill_and_eyedropper_act_once_per_canvas_entry() {
-        let ctx = egui::Context::default();
-        let mut app = app_with_canvas(&ctx);
+        let mut app = App::default();
         // A WHITE barrier at x=16 splits the canvas so the two fills target
         // distinct regions and both produce an undo step.
         for y in 0..CANVAS_HEIGHT {
@@ -20297,19 +23764,49 @@ mod tests {
         }
         app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fill)]);
-        let outside = egui::pos2(300.0, 200.0);
-        run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
-        run_app_frame(&mut app, &ctx, vec![press(outside)]);
-        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(8.0, 8.0))]);
-        run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
-        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(20.0, 20.0))]);
-        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(20.0, 20.0))]);
-        let buf = &app.projects.current().layers.active_layer().buffer;
-        assert_eq!(buf.get_pixel(8, 8), Some(RED));
-        assert_eq!(buf.get_pixel(20, 20), Some(RED));
+        // Fill applies ONCE on the raw press: holding the button, sweeping and
+        // releasing afterwards must NOT re-fill.
+        app.handle_interactions(CanvasInteractions {
+            raw_pressed_over_canvas: Some((8, 8)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((20, 20)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_point: Some((30, 30)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        {
+            let buf = &app.projects.current().layers.active_layer().buffer;
+            assert_eq!(buf.get_pixel(8, 8), Some(RED));
+            assert_eq!(
+                buf.get_pixel(20, 20),
+                Some(Color::TRANSPARENT),
+                "a hold + release must NOT re-fill: fill applies once per press"
+            );
+        }
+        assert_eq!(app.projects.current().undo.undo_len(), 1);
+
+        // A NEW press on the other side of the barrier fills the second region.
+        app.handle_interactions(CanvasInteractions {
+            raw_pressed_over_canvas: Some((20, 20)),
+            ..Default::default()
+        });
+        {
+            let buf = &app.projects.current().layers.active_layer().buffer;
+            assert_eq!(buf.get_pixel(20, 20), Some(RED));
+        }
         assert_eq!(app.projects.current().undo.undo_len(), 2);
 
-        // Eyedropper: samples once per canvas entry.
+        // Eyedropper: samples from the pointer stream, once per sampled point;
+        // the release adds nothing.
         app.projects
             .current_mut()
             .layers
@@ -20324,12 +23821,20 @@ mod tests {
             .set_pixel(40, 40, Color::rgb(0, 255, 0));
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Eyedropper)]);
         app.projects.current_mut().color = Color::WHITE;
-        run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
-        run_app_frame(&mut app, &ctx, vec![press(outside)]);
-        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(30.0, 30.0))]);
-        run_app_frame(&mut app, &ctx, vec![move_to(outside)]);
-        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(40.0, 40.0))]);
-        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(40.0, 40.0))]);
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((30, 30)),
+            ..Default::default()
+        });
+        assert_eq!(app.projects.current().color, RED);
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_point: Some((40, 40)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_ended: true,
+            ..Default::default()
+        });
         assert_eq!(app.projects.current().color, Color::rgb(0, 255, 0));
     }
 
@@ -21134,7 +24639,7 @@ mod tests {
         let mut output = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| app.ui_frame(ui));
+                .show(ui, |ui| ui_frame_with_top_bar(ui, app));
         });
         output.textures_delta.clear();
     }
@@ -21636,7 +25141,7 @@ mod tests {
     fn tile_tool_single_click_stamps_selected_tile_at_snapped_cell() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Click at (5,3) snaps to grid cell (1,0).
@@ -21652,7 +25157,7 @@ mod tests {
             .tilemap
             .as_ref()
             .expect("a tilemap is created on first placement");
-        assert_eq!(tm.tile_size, 4);
+        assert_eq!(tm.tile_size, TileSize::square(4));
         assert_eq!(tm.cell((1, 0)).map(|c| c.tile_id), Some(tile_id));
         assert_eq!(tm.cell((1, 0)).map(|c| c.rotation), Some(0));
         assert!(!tm.cell((1, 0)).unwrap().flip_x);
@@ -21665,7 +25170,7 @@ mod tests {
     fn tile_tool_drag_stamps_multiple_cells_in_one_undo() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // One drag over two cells.
@@ -21726,7 +25231,7 @@ mod tests {
     fn tile_tool_right_click_is_a_tile_eyedropper_not_a_clear() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
             clicked: Some((5, 3)),
@@ -21784,7 +25289,7 @@ mod tests {
     fn tile_tool_placement_transforms_x_z_r_q() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Each modifier is PRESSED once and the sticky transform is reset to
@@ -21860,7 +25365,7 @@ mod tests {
     fn tile_placement_transform_accumulates_across_presses() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Two R presses -> 180°.
@@ -21918,7 +25423,7 @@ mod tests {
     fn tile_placement_transform_does_not_repeat_while_held() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // R held down (one press) while several further frames run: a held key
@@ -21954,7 +25459,7 @@ mod tests {
     fn tile_placement_transform_sticks_on_key_release() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // X held -> the sticky transform gets flip_x.
@@ -22012,7 +25517,7 @@ mod tests {
             session.tile_palette.select(id);
             id
         };
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         // Stamp one cell so the index labels have something to report.
         app.handle_interactions(CanvasInteractions {
@@ -22072,7 +25577,7 @@ mod tests {
     fn tile_placement_rotation_persists_after_placement() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // R pressed -> sticky 90° CW.
@@ -22118,7 +25623,7 @@ mod tests {
     fn tile_placement_rotation_does_not_accumulate_on_re_stamp() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // R pressed once (sticky 90° CW), then stamp the SAME cell twice.
@@ -22153,7 +25658,7 @@ mod tests {
     fn tile_drag_with_x_held_flips_every_stamped_cell() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // X pressed once -> sticky flip_x; the drag's stamps all inherit it.
@@ -22191,7 +25696,7 @@ mod tests {
     fn tile_placer_transform_resets_on_tool_deactivation() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // R pressed -> sticky 90° CW.
@@ -22242,7 +25747,7 @@ mod tests {
     fn tile_held_same_cell_placement_undoes_and_redoes() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Press frame: stamp cell (1,0) at (5,3).
@@ -22327,7 +25832,7 @@ mod tests {
     fn tile_eraser_delete_undoes_cell_and_pixels() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Place a tile at cell (1,0).
@@ -22438,7 +25943,7 @@ mod tests {
     #[test]
     fn tile_alt_toggles_eraser_once_per_press_and_only_when_active() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         assert!(!app.tile_placer_transform.eraser);
 
@@ -22482,7 +25987,7 @@ mod tests {
     fn ctrl_z_does_not_toggle_flip_y_while_tile_tool_active() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Place a tile so there is something to undo.
@@ -22534,7 +26039,7 @@ mod tests {
     fn tile_shift_drag_rect_is_one_undo_and_deletes_when_erasing() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Shift label; anchor cell (1,0) -> current cell (2,1) covers a 2x2
@@ -22628,7 +26133,7 @@ mod tests {
     fn tile_right_click_selects_or_ghosts_and_real_selection_clears_ghost() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Stamp a cell, then rotate the sticky transform and stamp a second cell
@@ -22702,7 +26207,7 @@ mod tests {
     #[test]
     fn tile_ghost_placement_writes_pixels_no_cell_and_undoes() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Paint a green block into the layer buffer so the empty-cell composite
@@ -22790,7 +26295,7 @@ mod tests {
             session.tile_palette.select(id);
             id
         };
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Press on cell (1,0) — canvas (4,0) spans tile_size 4; footprint 4x4
@@ -22860,7 +26365,7 @@ mod tests {
     fn tile_eraser_toggled_mid_hold_undo_restores_cells_and_pixels() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 4, 4, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Pre-place the tile with a SEPARATE gesture so the held gesture starts
@@ -22958,7 +26463,7 @@ mod tests {
     fn tile_ghost_over_tiled_cell_does_not_touch_root_or_instances() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Two instances of the tile: cell (0,0) and cell (2,0).
@@ -23078,7 +26583,7 @@ mod tests {
     #[test]
     fn tile_ghost_cleared_on_new_and_load_project() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         // Capture a ghost from an empty cell.
         app.handle_interactions(CanvasInteractions {
@@ -23147,7 +26652,7 @@ mod tests {
     #[test]
     fn tile_ghost_placement_applies_sticky_rotation() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.ghost_tile = Some(four_color_ghost());
         app.projects.current_mut().tile_palette.selected = None;
@@ -23184,7 +26689,7 @@ mod tests {
     #[test]
     fn tile_ghost_placement_applies_sticky_flip() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.ghost_tile = Some(four_color_ghost());
         app.projects.current_mut().tile_palette.selected = None;
@@ -23210,7 +26715,7 @@ mod tests {
     #[test]
     fn tile_ghost_shift_rect_previews_ghost_and_outlines() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.ghost_tile = Some(four_color_ghost());
         app.projects.current_mut().tile_palette.selected = None;
@@ -23242,7 +26747,7 @@ mod tests {
     #[test]
     fn tile_non_square_ghost_rotated_uses_swapped_dims_and_undoes() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         // A 2w × 4h ghost, solid blue.
         let mut g = vec![0u8; 2 * 4 * 4];
@@ -23287,7 +26792,7 @@ mod tests {
     #[test]
     fn tile_ghost_placement_follows_later_rotation_change() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.ghost_tile = Some(four_color_ghost());
         app.projects.current_mut().tile_palette.selected = None;
@@ -23314,7 +26819,7 @@ mod tests {
     fn tile_shift_rect_delete_undo_and_redo_restore_pixels() {
         let mut app = App::default();
         set_selected_tile(&mut app, 4, 4, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Stamp a 2x2 rect of cells (1,0)-(2,1) via a Shift drag.
@@ -23419,7 +26924,7 @@ mod tests {
     fn tile_preview_agrees_with_eraser_and_ghost() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         let camera = crate::core::camera::Camera::new();
         move_pointer(&app, egui::pos2(4.0, 0.0));
@@ -23476,7 +26981,7 @@ mod tests {
     #[test]
     fn tile_alt_scroll_does_not_toggle_eraser() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         assert!(!app.tile_placer_transform.eraser);
 
@@ -23559,7 +27064,7 @@ mod tests {
     fn tile_panel_rotation_edit_changes_the_next_stamp() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // The user types 180° into the panel's rotation box.
@@ -23623,7 +27128,7 @@ mod tests {
     fn tile_panel_rotation_rounds_and_wraps_to_quarter_turns() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // 45° snaps DOWN to 0 (the panel rounds 45 → 0; only exact 90 multiples
@@ -23661,7 +27166,7 @@ mod tests {
     fn tile_panel_flips_share_the_key_state_and_stack_with_it() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Panel sets the horizontal flip; the stamp honours it.
@@ -23724,7 +27229,7 @@ mod tests {
     fn tile_panel_edit_activates_the_transform() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // No key has been pressed: the transform is still inactive, so a stamp
@@ -23757,7 +27262,7 @@ mod tests {
     fn tile_panel_view_mirrors_the_single_transform() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         app.write_dock_snapshots();
@@ -23820,7 +27325,7 @@ mod tests {
     fn tile_tool_locked_layer_blocks_writes() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.projects.current_mut().layers.active_layer_mut().locked = true;
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
@@ -23848,7 +27353,7 @@ mod tests {
     fn tile_tool_creates_tilemap_sized_to_canvas() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 16;
+        app.projects.current_mut().tile_size = TileSize::square(16);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         assert!(app
             .projects
@@ -23870,7 +27375,7 @@ mod tests {
             .tilemap
             .as_ref()
             .unwrap();
-        assert_eq!(tm.tile_size, 16);
+        assert_eq!(tm.tile_size, TileSize::square(16));
         assert_eq!((tm.cols, tm.rows), (8, 8), "128x128 canvas / 16px cells");
         assert!(tm.cell((0, 0)).is_some());
     }
@@ -23878,7 +27383,7 @@ mod tests {
     #[test]
     fn tile_tool_placement_without_selected_tile_is_a_noop() {
         let mut app = App::default();
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         app.handle_interactions(CanvasInteractions {
@@ -23906,10 +27411,10 @@ mod tests {
     }
 
     #[test]
-    /// Honest feedback: stamping a fully-transparent tile (the EMPTY tile
-    /// "+ Empty" creates) must surface a status message — placing it renders
-    /// nothing, so the user must be told the tile is empty.
-    fn transparent_tile_stamp_gives_feedback() {
+    /// Silent placement: stamping a fully-transparent tile (the EMPTY tile
+    /// "+ Empty" creates) is a valid, quiet operation — the cell is written
+    /// and NO bottom-band status message is surfaced.
+    fn transparent_tile_stamp_is_silent() {
         let mut app = App::default();
         // An EMPTY (fully transparent) tile added directly + selected.
         let session = app.projects.current_mut();
@@ -23920,20 +27425,26 @@ mod tests {
             pixels: vec![0u8; 16], // all transparent
         });
         session.tile_palette.select(id);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
             clicked: Some((2, 2)),
             ..Default::default()
         });
         assert!(
-            app.projects
-                .current()
-                .last_error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("empty")),
-            "stamping a transparent tile must warn the user"
+            app.projects.current().last_error.is_none(),
+            "stamping a transparent tile must not raise a status message"
         );
+        // The stamp still lands: cell (0,0) now holds the empty tile.
+        let cell = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .and_then(|tm| tm.cell((0, 0)));
+        assert!(cell.is_some(), "the empty-tile stamp still writes the cell");
     }
 
     #[test]
@@ -23953,11 +27464,11 @@ mod tests {
             pixels: vec![0u8, 0, 255, 255].repeat(4), // solid blue 2x2
         });
         app.projects.current_mut().tile_palette = palette;
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         // The ACTIVE layer has a tilemap with a blue tile at cell (0,0) AND a
         // pixel buffer (the same layer the Pencil draws on).
         {
-            let mut tm = TileMap::new(4, 8, 8);
+            let mut tm = TileMap::new(TileSize::square(4), 8, 8);
             tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
             app.projects.current_mut().layers.active_layer_mut().tilemap = Some(tm);
         }
@@ -24043,9 +27554,9 @@ mod tests {
             pixels: vec![0u8, 0, 255, 255].repeat(4),
         });
         app.projects.current_mut().tile_palette = palette;
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         {
-            let mut tm = TileMap::new(4, 8, 8);
+            let mut tm = TileMap::new(TileSize::square(4), 8, 8);
             tm.set_cell((0, 0), Some(TileCell::new(TileId(1))));
             app.projects.current_mut().layers.active_layer_mut().tilemap = Some(tm);
         }
@@ -24080,7 +27591,7 @@ mod tests {
     fn tile_placer_release_does_not_block_next_stroke() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [0, 0, 255, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         // Place a tile at cell (0,0) via a real click.
         app.handle_interactions(CanvasInteractions {
@@ -24147,7 +27658,7 @@ mod tests {
         let mut app = App::default();
         // A solid red 2x2 CONTENT tile added directly to the palette + selected.
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         // Simulate pre-existing opaque pixels (the user painted a base first).
         app.projects
             .current_mut()
@@ -24195,7 +27706,7 @@ mod tests {
         let mut app = App::default();
         // A 2x2 tile, placed twice (cells (0,0) and (1,0)).
         let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
             clicked: Some((2, 2)),
@@ -24283,7 +27794,7 @@ mod tests {
     fn integrated_tile_stroke_preview_is_live_and_commits_once() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         let layer_a = app.projects.current().layers.active_layer_id();
 
         // Two references on A; the second is both flipped and rotated.
@@ -24579,7 +28090,7 @@ mod tests {
     fn integrated_tile_pencil_rebakes_other_layers() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
             clicked: Some((2, 2)),
@@ -24625,7 +28136,7 @@ mod tests {
     fn integrated_tile_fill_write_back_and_undo() {
         let mut app = App::default();
         let tile_id = set_selected_tile(&mut app, 2, 2, [10, 20, 30, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
             clicked: Some((2, 2)),
@@ -24640,7 +28151,7 @@ mod tests {
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Fill)]);
         app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
         app.handle_interactions(CanvasInteractions {
-            clicked: Some((0, 0)),
+            raw_pressed_over_canvas: Some((0, 0)),
             ..Default::default()
         });
 
@@ -24676,7 +28187,7 @@ mod tests {
         // A content tile (solid red 2x2) + pre-existing green pixels, so both
         // the pixel buffer and the tilemap contribute to the composite.
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.projects
             .current_mut()
             .layers
@@ -24772,7 +28283,7 @@ mod tests {
         let mut app = app_with_canvas(&ctx);
         // A content tile + selected (the user confirmed the palette is fine).
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         assert_eq!(app.projects.current().tool_state.tool(), Tool::Tile);
 
@@ -24822,7 +28333,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = app_with_canvas(&ctx);
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         let undo_len = app.projects.current().undo.undo_len();
 
@@ -24899,10 +28410,10 @@ mod tests {
         // 8x8 cell grid for a 128x128 canvas), while the CURRENT tile_size is 4
         // (a 32x32 cell grid). A click at cell (20,20) is inside the 32x32 grid
         // but far outside the old 8x8 grid — it must still place a tile.
-        let mut old = TileMap::new(16, 8, 8);
+        let mut old = TileMap::new(TileSize::square(16), 8, 8);
         old.set_cell((0, 0), Some(TileCell::new(tile_id)));
         app.projects.current_mut().layers.active_layer_mut().tilemap = Some(old);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         app.handle_interactions(CanvasInteractions {
             clicked: Some((82, 82)), // cell (20,20) with tile_size 4
@@ -24926,7 +28437,7 @@ mod tests {
         );
         assert_eq!(tm.cols, 32);
         assert_eq!(tm.rows, 32);
-        assert_eq!(tm.tile_size, 4);
+        assert_eq!(tm.tile_size, TileSize::square(4));
     }
 
     #[test]
@@ -24943,7 +28454,7 @@ mod tests {
         let mut app = app_with_own_canvas();
         // The user selects a tile in the palette panel (model selection set).
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         // Switch to Pencil first, then press T — exactly like the user flow.
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
         assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
@@ -25009,7 +28520,7 @@ mod tests {
         let mut output = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| app.ui_frame(ui));
+                .show(ui, |ui| ui_frame_with_top_bar(ui, app));
         });
         output.textures_delta.clear();
     }
@@ -25023,7 +28534,7 @@ mod tests {
     fn tile_click_via_real_frame_at_real_window_size() {
         let mut app = app_with_own_canvas();
         let tile_id = set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Click a canvas point that is NOT covered by any dock panel: the left
@@ -25068,7 +28579,7 @@ mod tests {
     fn tile_click_under_the_dock_header_band_places_nothing() {
         let mut app = app_with_own_canvas();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // 100% zoom: the canvas draw rect is (0,0)-(128,128), and the left
@@ -25099,7 +28610,7 @@ mod tests {
     fn tile_click_under_the_dock_panel_body_does_not_place() {
         let mut app = app_with_own_canvas();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // 100% zoom: canvas draw rect (0,0)-(128,128); the left toolbox dock
@@ -25129,7 +28640,7 @@ mod tests {
     fn tile_drag_starting_on_a_panel_body_places_nothing() {
         let mut app = app_with_own_canvas();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // Press at (2,50) (Toolbox BODY), then sweep to (2,60) and release:
@@ -25359,7 +28870,7 @@ mod tests {
     fn tile_placer_hover_preview_is_hidden_over_a_panel() {
         let mut app = app_with_own_canvas();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
 
         // (2,50) is over the Toolbox panel body and over canvas cell (0,12).
@@ -25490,7 +29001,7 @@ mod tests {
     fn placing_on_a_group_layer_reports_an_error() {
         let mut app = App::default();
         set_selected_tile(&mut app, 2, 2, [255, 0, 0, 255]);
-        app.projects.current_mut().tile_size = 4;
+        app.projects.current_mut().tile_size = TileSize::square(4);
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
         // Turn the ACTIVE layer into a group.
         let layer_id = app.projects.current().layers.active_layer_id();
@@ -26291,5 +29802,1146 @@ mod tests {
             "a hole must be written transparent"
         );
         assert_eq!(clip.get_pixel(3, 3), Some(RED));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2A: animation panels integration
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn animation_placer_tool_selectable_via_a_hotkey() {
+        let mut app = App::default();
+        assert_ne!(app.projects.current().tool_state.tool(), Tool::AnimationPlacer);
+        run_shortcuts(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::AnimationPlacer,
+            "the A hotkey must select the animation placer tool"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3: Animation Placer gesture
+    // ------------------------------------------------------------------
+
+    /// Select the Animation Placer tool through the toolbar event path.
+    fn select_animation_placer(app: &mut App) {
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::AnimationPlacer)]);
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::AnimationPlacer
+        );
+    }
+
+    /// Drive the Animation Placer rectangle gesture through the direct test
+    /// seam (`handle_interactions`), bypassing egui's interaction routing:
+    /// press at `from`, cross the drag threshold to `to`, then release.
+    fn animation_placer_drag(app: &mut App, from: (i32, i32), to: (i32, i32)) {
+        app.handle_interactions(CanvasInteractions {
+            raw_pressed_over_canvas: Some(from),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some(to),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn animation_placer_drag_indexes_frames_row_major() {
+        let mut app = App::default();
+        select_animation_placer(&mut app);
+        // The grid cell size is the project tile_size (matching the tile placer).
+        assert_eq!(app.projects.current().tile_size, TileSize::square(16));
+        // The default animation has ONE full-canvas frame; the drag replaces it.
+        assert_eq!(app.projects.current().sequence().len(), 1);
+
+        // Screen (10,10) → cell (0,0); (30,30) → cell (1,1): a 2x2 rectangle.
+        animation_placer_drag(&mut app, (10, 10), (30, 30));
+
+        let expected = [
+            Rect2i::new(0, 0, 16, 16),
+            Rect2i::new(16, 0, 16, 16),
+            Rect2i::new(0, 16, 16, 16),
+            Rect2i::new(16, 16, 16, 16),
+        ];
+        {
+            let session = app.projects.current();
+            let sequence = session.sequence();
+            assert_eq!(sequence.len(), 4, "a 2x2 rect indexes exactly 4 frames");
+            for (i, rect) in expected.iter().enumerate() {
+                let frame = sequence.frame(i).expect("frame exists");
+                assert_eq!(frame.region().rect(), *rect, "frame {i} region");
+                assert_eq!(frame.region().name(), format!("Frame {}", i + 1));
+                assert_eq!(frame.delay_ms(), 100);
+            }
+        }
+        // The controller was rebuilt for the new frame count + delays.
+        assert_eq!(app.projects.current().animation.frame_count(), 4);
+        for i in 0..4 {
+            assert_eq!(app.projects.current().animation.delay_ms(i), 100);
+        }
+        assert_eq!(
+            app.projects.current().effective_frame_delays(),
+            vec![100, 100, 100, 100]
+        );
+    }
+
+    #[test]
+    fn animation_placer_refuses_rects_over_max_frames() {
+        let mut app = App::default();
+        select_animation_placer(&mut app);
+        // A 1px grid over the 128x128 canvas yields 16384 cells, far over
+        // MAX_FRAMES (4096); the whole operation must be refused, not truncated.
+        app.projects.current_mut().tile_size = TileSize::square(1);
+        let before = app.projects.current().sequence().len();
+        app.apply_animation_rect((0, 0), (127, 127));
+        assert_eq!(
+            app.projects.current().sequence().len(),
+            before,
+            "an oversized rectangle is refused wholesale"
+        );
+    }
+
+    #[test]
+    fn animation_placer_overlay_highlights_first_last_and_area() {
+        let mut app = App::default();
+        select_animation_placer(&mut app);
+        animation_placer_drag(&mut app, (10, 10), (30, 30));
+
+        assert_eq!(
+            app.current_overlay(),
+            CanvasOverlay::AnimationPlacer {
+                first: Rect2i::new(0, 0, 16, 16),
+                last: Rect2i::new(16, 16, 16, 16),
+                area: Rect2i::new(0, 0, 32, 32),
+                in_flight: None,
+            }
+        );
+
+        // Mid-drag the live rectangle is carried so it can be painted.
+        app.handle_interactions(CanvasInteractions {
+            raw_pressed_over_canvas: Some((0, 0)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((40, 20)),
+            ..Default::default()
+        });
+        match app.current_overlay() {
+            CanvasOverlay::AnimationPlacer { in_flight, .. } => {
+                // cells (0,0)..=(2,1): a 3x2 cell rectangle.
+                assert_eq!(in_flight, Some(Rect2i::new(0, 0, 48, 32)));
+            }
+            other => panic!("expected AnimationPlacer overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animation_placer_does_not_touch_camera_pixels_or_undo() {
+        let mut app = App::default();
+        select_animation_placer(&mut app);
+        let camera_before = app.projects.current().camera;
+        let undo_before = app.projects.current().undo.undo_len();
+        let pixels_before = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .buffer
+            .as_bytes()
+            .to_vec();
+
+        animation_placer_drag(&mut app, (10, 10), (30, 30));
+
+        assert_eq!(app.projects.current().camera, camera_before);
+        assert_eq!(app.projects.current().undo.undo_len(), undo_before);
+        assert_eq!(
+            app.projects.current().layers.active_layer().buffer.as_bytes(),
+            pixels_before.as_slice(),
+            "indexing frames must not edit any pixels"
+        );
+    }
+
+    #[test]
+    fn animation_placer_click_and_out_of_bounds_do_not_panic() {
+        let mut app = App::default();
+        select_animation_placer(&mut app);
+
+        // A bare click (press then release, no drag) is a documented NO-OP.
+        let before = app.projects.current().sequence().len();
+        app.handle_interactions(CanvasInteractions {
+            raw_pressed_over_canvas: Some((10, 10)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects.current().sequence().len(),
+            before,
+            "a bare click must not replace the animation"
+        );
+
+        // A drag far outside the canvas clamps to the grid without panicking.
+        animation_placer_drag(&mut app, (-100, -100), (100_000, 100_000));
+        assert!(app.projects.current().sequence().len() >= 1);
+
+        // An empty sequence yields a safe (None) overlay and can be rebuilt.
+        {
+            let sequence = app.projects.current_mut().sequence_mut();
+            while sequence.len() > 0 {
+                let _ = sequence.remove(0);
+            }
+        }
+        assert_eq!(app.current_overlay(), CanvasOverlay::None);
+        app.apply_animation_rect((0, 0), (0, 0));
+        assert_eq!(app.projects.current().sequence().len(), 1);
+    }
+
+    #[test]
+    fn default_app_registers_animation_panels_in_the_bottom_dock() {
+        let app = App::default();
+        let dock = &app.panel_dock;
+        let animations_id = panel_dock::PanelId::new(dock_animations_panel::ANIMATIONS_PANEL_ID);
+        let preview_id = panel_dock::PanelId::new(
+            dock_animation_preview_panel::ANIMATION_PREVIEW_PANEL_ID,
+        );
+        let settings_id =
+            panel_dock::PanelId::new(dock_animation_settings::ANIMATION_SETTINGS_PANEL_ID);
+        assert_eq!(
+            dock.placement(animations_id),
+            Some(panel_dock::PanelPlacement::DockedBottom),
+            "the Animations panel (201) docks bottom"
+        );
+        assert_eq!(
+            dock.placement(preview_id),
+            Some(panel_dock::PanelPlacement::DockedBottom),
+            "the Preview panel (204) docks bottom"
+        );
+        assert_eq!(
+            dock.placement(settings_id),
+            None,
+            "the settings panel (202) is NOT registered until its gear opens it"
+        );
+        // Animations is registered before Preview, so it sits to its LEFT.
+        let order = dock.dock_order(panel_dock::DockSide::Bottom);
+        let animations_pos = order.iter().position(|&id| id == animations_id);
+        let preview_pos = order.iter().position(|&id| id == preview_id);
+        assert!(
+            animations_pos.is_some() && preview_pos.is_some(),
+            "both animation panels must be in the bottom dock"
+        );
+        assert!(
+            animations_pos < preview_pos,
+            "Animations must come before Preview (Preview to its right)"
+        );
+    }
+
+    #[test]
+    fn animation_snapshot_has_rows_active_and_remove_gate() {
+        let mut app = App::default();
+        app.write_dock_snapshots();
+        {
+            let view = app.animation_host.list.borrow();
+            assert_eq!(view.animations.len(), 1);
+            assert_eq!(view.animations[0].index, 0);
+            assert_eq!(view.animations[0].frame_count, 1);
+            assert!(view.animations[0].active);
+            assert!(
+                !view.remove_enabled,
+                "with one animation the remove button is disabled"
+            );
+        }
+        // Add a second animation directly; the snapshot must show two rows with
+        // the second one active, and the remove gate enabled.
+        app.projects
+            .current_mut()
+            .animations
+            .add("Walk");
+        app.write_dock_snapshots();
+        let view = app.animation_host.list.borrow();
+        assert_eq!(view.animations.len(), 2);
+        assert_eq!(view.animations[1].name, "Walk");
+        assert!(view.animations[1].active);
+        assert!(!view.animations[0].active);
+        assert!(view.remove_enabled);
+    }
+
+    #[test]
+    fn animation_events_mutate_the_set_and_rebuild_the_controller() {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut app = App::default();
+        // Add: a second animation, active, controller rebuilt for its frames.
+        app.animation_host.events.borrow_mut().push(Ev::Add);
+        app.drain_dock_events();
+        assert_eq!(app.projects.current().animations.len(), 2);
+        assert_eq!(app.projects.current().animations.active(), 1);
+        assert_eq!(app.projects.current().animation.frame_count(), 0);
+
+        // Select: back to the first animation (1 frame, controller matches).
+        app.animation_host.events.borrow_mut().push(Ev::Select(0));
+        app.drain_dock_events();
+        assert_eq!(app.projects.current().animations.active(), 0);
+        assert_eq!(app.projects.current().animation.frame_count(), 1);
+
+        // Remove: the (now empty) second animation goes away; active clamps.
+        app.animation_host.events.borrow_mut().push(Ev::Remove(1));
+        app.drain_dock_events();
+        assert_eq!(app.projects.current().animations.len(), 1);
+
+        // Remove the last: refused, the never-empty invariant holds.
+        app.animation_host.events.borrow_mut().push(Ev::Remove(0));
+        app.drain_dock_events();
+        assert_eq!(app.projects.current().animations.len(), 1);
+    }
+
+    #[test]
+    fn animation_set_delay_multiplier_changes_effective_playback_delays() {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut app = App::default();
+        // The seeded frame is 100 ms; a 2.00x multiplier must make playback use
+        // 200 ms (matching `effective_frame_delays`).
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetDelayMultiplier {
+                index: 0,
+                mult: 2.0,
+            });
+        app.drain_dock_events();
+        assert_eq!(app.projects.current().sequence().delay_multiplier_centi(), 200);
+        assert_eq!(app.projects.current().animation.delay_ms(0), 200);
+        assert_eq!(app.projects.current().effective_frame_delays(), vec![200]);
+    }
+
+    #[test]
+    fn animation_set_loop_toggles_sequence_and_controller() {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut app = App::default();
+        // The seeded animation loops; turn it off.
+        assert!(app.projects.current().sequence().looping());
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetLoop { index: 0, on: false });
+        app.drain_dock_events();
+        assert!(!app.projects.current().sequence().looping());
+        assert!(!app.projects.current().animation.looping());
+        // Turn it back on.
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetLoop { index: 0, on: true });
+        app.drain_dock_events();
+        assert!(app.projects.current().sequence().looping());
+        assert!(app.projects.current().animation.looping());
+    }
+
+    #[test]
+    fn set_delay_multiplier_preserves_a_non_looping_flag_across_load() {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut app = App::default();
+        // Make the active sequence non-looping, then round-trip it through the
+        // document load path (`document_to_app`).
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetLoop { index: 0, on: false });
+        app.drain_dock_events();
+        assert!(!app.projects.current().animation.looping());
+
+        let doc = app.app_to_document();
+        app.document_to_app(&doc);
+        assert!(
+            !app.projects.current().sequence().looping(),
+            "load keeps the non-looping flag"
+        );
+        assert!(
+            !app.projects.current().animation.looping(),
+            "B2: the loaded controller re-applies the loop flag"
+        );
+
+        // Editing the active delay multiplier must NOT re-enable looping.
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetDelayMultiplier { index: 0, mult: 2.0 });
+        app.drain_dock_events();
+        assert!(
+            !app.projects.current().animation.looping(),
+            "B2: sync preserves the loop flag"
+        );
+        assert_eq!(app.projects.current().animation.delay_ms(0), 200);
+
+        // Switching to a NON-looping animation must apply ITS loop flag, and a
+        // subsequent active multiplier edit must not flip it back on.
+        app.projects.current_mut().animations.add("B");
+        app.projects.current_mut().animations.set_active(0);
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetLoop { index: 1, on: false });
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::Select(1));
+        app.drain_dock_events();
+        assert!(
+            !app.projects.current().animation.looping(),
+            "B2: selecting a non-looping animation applies its loop flag"
+        );
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetDelayMultiplier { index: 1, mult: 3.0 });
+        app.drain_dock_events();
+        assert!(
+            !app.projects.current().animation.looping(),
+            "B2: editing the now-active multiplier preserves looping"
+        );
+    }
+
+    #[test]
+    fn load_document_rebuilds_playback_from_effective_delays() {
+        let mut app = App::default();
+        // 2.50x multiplier + a second 200 ms frame.
+        app.projects.current_mut().sequence_mut().set_delay_multiplier_centi(250);
+        app.projects.current_mut().sequence_mut().push(Frame::new(
+            Region::new(Rect2i::new(2, 2, 4, 4), "Frame 2"),
+            200,
+        ));
+        app.sync_anim_delays();
+
+        let doc = app.app_to_document();
+        app.document_to_app(&doc);
+
+        let frame_count = app.projects.current().sequence().len();
+        for index in 0..frame_count {
+            assert_eq!(
+                app.projects.current().animation.delay_ms(index),
+                app.projects.current().sequence().effective_delay_ms(index),
+                "B1: frame {index} playback delay must equal the effective delay"
+            );
+        }
+        assert_eq!(app.projects.current().animation.delay_ms(0), 250); // 100 × 2.5
+        assert_eq!(app.projects.current().animation.delay_ms(1), 500); // 200 × 2.5
+    }
+
+    #[test]
+    fn import_opens_a_new_document_whose_playback_uses_exact_delays() {
+        // Import now opens a NEW document (create-document parity), so the
+        // pre-existing session's delay multiplier is irrelevant: the fresh
+        // sequence uses the default 1.0x multiplier and every PNG frame lands
+        // at exactly 100 ms.
+        let mut app = App::default();
+        app.projects.current_mut().sequence_mut().set_delay_multiplier_centi(250);
+        app.sync_anim_delays();
+        let old_id = app.projects.current().id;
+
+        let bytes = vec![255u8; 8 * 8 * 4];
+        let path = TempFile::new("benny.png", &encode_png(8, 8, &bytes).unwrap());
+        app.pending_image_import = Some(PendingImageImport {
+            path: path.path().to_path_buf(),
+            image: crate::core::png_codec::PngImage {
+                width: 8,
+                height: 8,
+                rgba: bytes,
+            },
+        });
+        app.apply_import_image(8, 8).expect("import succeeds");
+
+        let project = app.projects.current();
+        assert_ne!(project.id, old_id, "import opens a NEW document");
+        let stem = path.path().file_stem().unwrap().to_str().unwrap().to_owned();
+        assert_eq!(project.name, stem, "the document is named after the file stem");
+        assert_eq!(
+            project.tile_size,
+            TileSize::new(8, 8),
+            "the tile grid follows the requested split cell size"
+        );
+        let frame_count = project.sequence().len();
+        assert_eq!(frame_count, 1, "one region frame");
+        for index in 0..frame_count {
+            assert_eq!(
+                project.animation.delay_ms(index),
+                project.sequence().effective_delay_ms(index),
+                "imported frame {index} playback delay must be effective"
+            );
+        }
+        assert_eq!(
+            project.animation.delay_ms(0),
+            100,
+            "the default 1.0x multiplier keeps 100 ms exact"
+        );
+        // The pre-existing session keeps its own 2.5x multiplier untouched.
+        assert_eq!(
+            app.projects.session(old_id).unwrap().sequence().delay_multiplier_centi(),
+            250
+        );
+    }
+
+    #[test]
+    fn set_delay_multiplier_on_non_active_leaves_active_playback_untouched() {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut app = App::default();
+        // Two animations; make index 0 active and give it 3 frames.
+        app.projects.current_mut().animations.add("B");
+        app.projects.current_mut().animations.set_active(0);
+        {
+            let sequence = app.projects.current_mut().sequence_mut();
+            sequence.push(Frame::new(Region::new(Rect2i::new(4, 4, 4, 4), "F2"), 100));
+            sequence.push(Frame::new(Region::new(Rect2i::new(8, 8, 4, 4), "F3"), 100));
+        }
+        app.sync_anim_delays();
+        app.projects.current_mut().animation.goto(2);
+        app.projects.current_mut().animation.play();
+        let current_before = app.projects.current().animation.current_index();
+        let playing_before = app.projects.current().animation.is_playing();
+
+        // Edit the NON-active animation's multiplier.
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetDelayMultiplier { index: 1, mult: 3.0 });
+        app.drain_dock_events();
+
+        assert_eq!(app.projects.current().animations.active(), 0);
+        assert_eq!(
+            app.projects.current().animation.current_index(),
+            current_before,
+            "B2: editing a non-active animation must not rewind the active one"
+        );
+        assert_eq!(
+            app.projects.current().animation.is_playing(),
+            playing_before,
+            "B2: editing a non-active animation must not stop the active one"
+        );
+        // The active sequence's own multiplier is untouched.
+        assert_eq!(app.projects.current().sequence().delay_multiplier_centi(), 100);
+        assert_eq!(app.projects.current().animations.get(1).unwrap().delay_multiplier_centi(), 300);
+    }
+
+    #[test]
+    fn project_activation_resets_frame_edit_and_onion_state() {
+        let mut app = App::default();
+        let first = app.projects.current().id;
+        // Give the first project two frames so index 1 is valid, then dirty the
+        // frame-edit/onion state.
+        app.projects
+            .current_mut()
+            .sequence_mut()
+            .push(Frame::new(Region::new(Rect2i::new(4, 4, 4, 4), "F2"), 100));
+        app.set_frame_edit_index(1);
+        app.projects.current_mut().onion_prev = true;
+        app.projects.current_mut().onion_next = true;
+        {
+            let mut camera = app.frame_edit_host.camera.get();
+            camera.set_pan(50, 60);
+            app.frame_edit_host.camera.set(camera);
+        }
+
+        // New project: activation must reset the App-global view state.
+        let second = app.new_project("Two", 128, 128);
+        assert_ne!(second, first);
+        assert_eq!(app.frame_edit_index, 0, "cursor resets to 0");
+        assert!(!app.projects.current().onion_prev);
+        assert!(!app.projects.current().onion_next);
+        assert_eq!(
+            app.frame_edit_host.camera.get().pan(),
+            (0, 0),
+            "frame-edit camera is recentred on the new project's first frame"
+        );
+
+        // Dirty the state again, then SWITCH back to the first project.
+        app.projects.current_mut().onion_prev = true;
+        app.set_frame_edit_index(0);
+        {
+            let mut camera = app.frame_edit_host.camera.get();
+            camera.set_pan(7, 8);
+            app.frame_edit_host.camera.set(camera);
+        }
+        app.activate_project(first).expect("switch back");
+        assert_eq!(app.frame_edit_index, 0);
+        assert!(!app.projects.current().onion_prev);
+        assert!(!app.projects.current().onion_next);
+        assert_eq!(app.frame_edit_host.camera.get().pan(), (0, 0));
+    }
+
+    #[test]
+    fn animation_set_name_renames_and_marks_dirty() {
+        use animation_hosts::AnimationPanelEvent as Ev;
+        let mut app = App::default();
+        app.projects.current_mut().mark_saved();
+        app.animation_host
+            .events
+            .borrow_mut()
+            .push(Ev::SetName {
+                index: 0,
+                name: "Idle".to_string(),
+            });
+        app.drain_dock_events();
+        assert_eq!(app.projects.current().sequence().name(), "Idle");
+        assert!(app.projects.current().is_dirty());
+    }
+
+    #[test]
+    fn frame_preview_feed_uses_the_active_frame_region() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        // A non-full-canvas frame region becomes the preview region.
+        app.projects.current_mut().sequence_mut().frame_mut(0).unwrap().region =
+            Region::new(Rect2i::new(4, 4, 8, 8), "Frame 1");
+        let (texture, sheet_size, region) = app
+            .active_frame_preview()
+            .expect("a canvas texture and an active frame must yield a preview");
+        assert_eq!(region, Rect2i::new(4, 4, 8, 8));
+        assert_eq!(sheet_size, egui::vec2(128.0, 128.0));
+        assert_eq!(texture, app.canvas_texture.as_ref().unwrap().id());
+        // The App publishes it into the feed each frame.
+        app.frame_preview_feed.set(Some((texture, sheet_size, region)));
+        assert_eq!(app.frame_preview_feed.get(), Some((texture, sheet_size, region)));
+    }
+
+    #[test]
+    fn playback_feed_publishes_only_the_active_frame_region() {
+        // Fix 2: the Preview panel feed must carry the ACTIVE frame's region
+        // (not the full canvas), and follow the playback index.
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.projects
+            .current_mut()
+            .sequence_mut()
+            .frame_mut(0)
+            .unwrap()
+            .region = Region::new(Rect2i::new(4, 4, 8, 8), "Frame 1");
+        app.projects
+            .current_mut()
+            .sequence_mut()
+            .push(Frame::new(Region::new(Rect2i::new(40, 24, 8, 8), "Frame 2"), 100));
+        app.rebuild_animation_controller();
+        app.projects.current_mut().animation.goto(1);
+
+        run_app_frame(&mut app, &ctx, vec![]);
+
+        let (_, sheet_size, region) = app
+            .frame_preview_feed
+            .get()
+            .expect("the frame preview feed is published each frame");
+        assert_eq!(region, Rect2i::new(40, 24, 8, 8), "only the active frame region");
+        assert_eq!(sheet_size, egui::vec2(128.0, 128.0), "full sheet size for UVs");
+    }
+
+    #[test]
+    fn frame_edit_viewport_scopes_to_the_cursor_frame_region() {
+        // Fix 1: the App publishes the frame-edit cursor frame's region into the
+        // host, and the panel's widget is scoped to it.
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.projects
+            .current_mut()
+            .sequence_mut()
+            .frame_mut(0)
+            .unwrap()
+            .region = Region::new(Rect2i::new(8, 16, 12, 20), "Frame 1");
+
+        app.publish_frame_edit_view();
+
+        assert_eq!(
+            app.frame_edit_host.region.get(),
+            Some(Rect2i::new(8, 16, 12, 20)),
+            "the frame-edit viewport region is the cursor frame's rect"
+        );
+        assert_eq!(
+            app.active_frame_edit_preview().map(|(_, _, region)| region),
+            Some(Rect2i::new(8, 16, 12, 20))
+        );
+    }
+
+    #[test]
+    fn animation_panel_titles_are_frame_editor_and_playback() {
+        // Fix 3: dock header titles.
+        let app = App::default();
+        let frame_edit_id =
+            panel_dock::PanelId::new(dock_frame_edit_panel::FRAME_EDIT_PANEL_ID);
+        let preview_id =
+            panel_dock::PanelId::new(dock_animation_preview_panel::ANIMATION_PREVIEW_PANEL_ID);
+        assert_eq!(
+            app.panel_dock.metadata(frame_edit_id).unwrap().title,
+            "frame editor"
+        );
+        assert_eq!(
+            app.panel_dock.metadata(preview_id).unwrap().title,
+            "playback"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Frame Edit panel (Phase 2B, id 203)
+    // ------------------------------------------------------------------
+
+    /// Push `n` extra frames with distinct, identifiable regions onto the
+    /// active animation so the frame-edit cursor has room to move.
+    fn push_frame_edit_frames(app: &mut App, n: usize) {
+        let seq = app.projects.current_mut().sequence_mut();
+        for i in 0..n {
+            let offset = 4 + i as i32 * 4;
+            seq.push(Frame::new(
+                Region::new(Rect2i::new(offset, offset, 4, 4), &format!("F{}", i + 2)),
+                100,
+            ));
+        }
+    }
+
+    #[test]
+    fn frame_edit_panel_sits_between_animations_and_preview() {
+        let app = App::default();
+        let dock = &app.panel_dock;
+        let frame_edit_id = panel_dock::PanelId::new(dock_frame_edit_panel::FRAME_EDIT_PANEL_ID);
+        assert_eq!(
+            dock.placement(frame_edit_id),
+            Some(panel_dock::PanelPlacement::DockedBottom),
+            "the Frame Edit panel (203) is registered in the bottom dock"
+        );
+        assert!(
+            dock.metadata(frame_edit_id)
+                .expect("the panel has metadata")
+                .can_pop_out,
+            "the Frame Edit panel is dockable AND floatable"
+        );
+        let order = dock.dock_order(panel_dock::DockSide::Bottom);
+        let position = |raw: u64| order.iter().position(|id| id.raw() == raw);
+        let animations = position(dock_animations_panel::ANIMATIONS_PANEL_ID);
+        let frame_edit = position(dock_frame_edit_panel::FRAME_EDIT_PANEL_ID);
+        let preview = position(dock_animation_preview_panel::ANIMATION_PREVIEW_PANEL_ID);
+        assert!(
+            animations < frame_edit && frame_edit < preview,
+            "Frame Edit must sit between Animations (left) and Preview (right): {order:?}"
+        );
+    }
+
+    #[test]
+    fn frame_edit_index_is_independent_of_playback() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        push_frame_edit_frames(&mut app, 2);
+        app.rebuild_animation_controller();
+        assert_eq!(app.projects.current().animation.frame_count(), 3);
+
+        app.set_frame_edit_index(1);
+        // Playback advances to the LAST frame; the edit cursor must not move.
+        app.projects.current_mut().animation.goto(2);
+        assert_eq!(app.projects.current().animation.current_index(), 2);
+        assert_eq!(
+            app.frame_edit_index, 1,
+            "advancing playback must not move the frame-edit cursor"
+        );
+
+        // The Preview feed tracks playback; the frame-edit preview tracks the
+        // edit cursor. Frame 1 has region (4,4,4,4), frame 2 has (8,8,4,4).
+        let (_, _, playback_region) = app
+            .active_frame_preview()
+            .expect("playback frame preview");
+        let (_, _, edit_region) = app
+            .active_frame_edit_preview()
+            .expect("frame-edit frame preview");
+        assert_eq!(playback_region, Rect2i::new(8, 8, 4, 4));
+        assert_eq!(edit_region, Rect2i::new(4, 4, 4, 4));
+    }
+
+    #[test]
+    fn frame_edit_prev_next_wrap_around_sequence_ends() {
+        let mut app = App::default();
+        push_frame_edit_frames(&mut app, 2);
+        app.set_frame_edit_index(0);
+
+        // Wrap-around (Fix 3): from 0, PREV goes to the LAST frame; from the
+        // last, NEXT goes back to 0. Never panics, never clamps at the ends.
+        app.step_frame_edit(-1);
+        assert_eq!(app.frame_edit_index, 2, "frame 0's previous wraps to the last");
+        app.step_frame_edit(1);
+        assert_eq!(app.frame_edit_index, 0, "the last frame's next wraps to 0");
+        // Arbitrary deltas wrap modulo the length.
+        app.step_frame_edit(5);
+        assert_eq!(app.frame_edit_index, 2);
+        app.step_frame_edit(-4);
+        assert_eq!(app.frame_edit_index, 1);
+
+        // The control-bar events drive the SAME cursor with the same wrap.
+        use dock_frame_edit_panel::FrameEditPanelEvent as FEv;
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::PrevFrame);
+        app.drain_dock_events();
+        assert_eq!(app.frame_edit_index, 0);
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::NextFrame);
+        app.drain_dock_events();
+        assert_eq!(app.frame_edit_index, 1);
+    }
+
+    #[test]
+    fn frame_edit_frame_change_preserves_camera() {
+        // Fix 2: changing the frame-edit cursor must NEVER recentre/reset the
+        // frame-edit camera.
+        let mut app = App::default();
+        push_frame_edit_frames(&mut app, 2);
+        {
+            let mut camera = app.frame_edit_host.camera.get();
+            camera.set_pan(42, -17);
+            camera.set_zoom_percent(300);
+            app.frame_edit_host.camera.set(camera);
+        }
+
+        app.set_frame_edit_index(2);
+        assert_eq!(app.frame_edit_host.camera.get().pan(), (42, -17), "set_frame_edit_index must not recentre");
+        assert_eq!(app.frame_edit_host.camera.get().zoom_percent(), 300, "set_frame_edit_index must not reset zoom");
+
+        app.step_frame_edit(1);
+        assert_eq!(app.frame_edit_host.camera.get().pan(), (42, -17), "step_frame_edit must not recentre");
+
+        app.clamp_frame_edit_index();
+        assert_eq!(app.frame_edit_host.camera.get().pan(), (42, -17), "clamp_frame_edit_index must not recentre");
+        assert_eq!(app.frame_edit_host.camera.get().zoom_percent(), 300, "clamp_frame_edit_index must not reset zoom");
+    }
+
+    #[test]
+    fn frame_edit_onion_toggle_sets_flags_and_overlay() {
+        use dock_frame_edit_panel::FrameEditPanelEvent as FEv;
+        let mut app = App::default();
+        push_frame_edit_frames(&mut app, 2);
+        app.frame_edit_index = 1;
+
+        let prev_region = app.projects.current().sequence().frame(0).unwrap().region().rect();
+        let next_region = app.projects.current().sequence().frame(2).unwrap().region().rect();
+
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::OnionPrev(true));
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::OnionNext(true));
+        app.drain_dock_events();
+
+        assert!(app.projects.current().onion_prev);
+        assert!(app.projects.current().onion_next);
+        match &*app.frame_edit_host.overlay.borrow() {
+            CanvasOverlay::OnionOverlay { prev, next } => {
+                assert_eq!(*prev, Some(prev_region), "prev is the previous frame's region");
+                assert_eq!(*next, Some(next_region), "next is the next frame's region");
+            }
+            other => panic!("expected an OnionOverlay, got {other:?}"),
+        }
+
+        // Turning them back off clears the overlay.
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::OnionPrev(false));
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::OnionNext(false));
+        app.drain_dock_events();
+        assert!(!app.projects.current().onion_prev);
+        assert!(!app.projects.current().onion_next);
+        assert!(matches!(
+            &*app.frame_edit_host.overlay.borrow(),
+            CanvasOverlay::None
+        ));
+    }
+
+    #[test]
+    fn frame_edit_onion_overlay_wraps_neighbours() {
+        let mut app = App::default();
+        push_frame_edit_frames(&mut app, 2);
+        app.projects.current_mut().onion_prev = true;
+        app.projects.current_mut().onion_next = true;
+        app.frame_edit_index = 0;
+        app.refresh_frame_edit_overlay();
+
+        let last = app.projects.current().sequence().frame(2).unwrap().region().rect();
+        let following = app.projects.current().sequence().frame(1).unwrap().region().rect();
+        match &*app.frame_edit_host.overlay.borrow() {
+            CanvasOverlay::OnionOverlay { prev, next } => {
+                assert_eq!(*prev, Some(last), "at frame 0 the previous wraps to the last frame");
+                assert_eq!(*next, Some(following), "next is the following frame's region");
+            }
+            other => panic!("expected an OnionOverlay, got {other:?}"),
+        };
+    }
+
+    #[test]
+    fn frame_edit_delay_input_writes_the_cursor_frame_and_resyncs() {
+        use dock_frame_edit_panel::FrameEditPanelEvent as FEv;
+        let mut app = App::default();
+        push_frame_edit_frames(&mut app, 2);
+        app.set_frame_edit_index(1);
+        assert_eq!(app.projects.current().sequence().frame(1).unwrap().delay_ms(), 100);
+
+        app.frame_edit_host
+            .events
+            .borrow_mut()
+            .push(FEv::SetFrameDelay { ms: 250 });
+        app.drain_dock_events();
+
+        assert_eq!(
+            app.projects.current().sequence().frame(1).unwrap().delay_ms(),
+            250,
+            "the frame-edit cursor frame's delay is written"
+        );
+        assert_eq!(
+            app.projects.current().animation.delay_ms(1),
+            250,
+            "the controller's delays are re-synced"
+        );
+    }
+
+    /// The Frame Edit panel's BODY rect in an 800x600 test viewport, computed
+    /// exactly like `DockManager::show_docks`.
+    fn frame_edit_panel_rect(app: &App) -> egui::Rect {
+        let viewport =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let left = app.panel_dock.dock_extent(panel_dock::DockSide::Left);
+        let right = app.panel_dock.dock_extent(panel_dock::DockSide::Right);
+        let bottom = app.panel_dock.dock_extent(panel_dock::DockSide::Bottom);
+        let dock = egui::Rect::from_min_max(
+            egui::pos2(left, viewport.bottom() - bottom),
+            egui::pos2(viewport.right() - right, viewport.bottom()),
+        );
+        app.panel_dock
+            .panel_rects(panel_dock::DockSide::Bottom, dock)
+            .into_iter()
+            .find(|(id, _)| id.raw() == dock_frame_edit_panel::FRAME_EDIT_PANEL_ID)
+            .map(|(_, rect)| rect)
+            .expect("the Frame Edit panel is docked bottom")
+    }
+
+    #[test]
+    fn frame_edit_drag_paints_and_keeps_the_main_camera() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        // Draw tool with an opaque color so a painted pixel is detectable.
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+
+        let main_camera_before = app.projects.current().camera;
+        // A press in the middle of the Frame Edit panel's body (above the
+        // pinned control bar).
+        let panel = frame_edit_panel_rect(&app);
+        // Below the 28pt dock header and above the 30pt pinned control bar.
+        let press_pos = egui::pos2(panel.center().x, panel.top() + 70.0);
+        let drag_pos = press_pos + egui::vec2(16.0, 0.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(press_pos)]);
+        run_app_frame(&mut app, &ctx, vec![press(press_pos)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(drag_pos)]);
+        run_app_frame(&mut app, &ctx, vec![release(drag_pos)]);
+
+        assert_eq!(
+            app.projects.current().camera, main_camera_before,
+            "a frame-edit drag must never move the main camera"
+        );
+        assert_eq!(
+            app.input_capture.owner(),
+            None,
+            "the primary gesture must not leave a latched canvas owner"
+        );
+        // The drag painted on the ACTIVE layer through the shared pipeline.
+        let layer = app.projects.current().layers.active_layer();
+        let painted = layer
+            .buffer
+            .as_bytes()
+            .chunks_exact(4)
+            .any(|px| px[3] != 0);
+        assert!(painted, "the frame-edit drag must paint on the active layer");
+        // Undo behaves exactly like a main-canvas edit: one stroke, one entry.
+        assert!(
+            app.projects.current().undo.undo_len() >= 1,
+            "a frame-edit edit must be undoable"
+        );
+    }
+
+    #[test]
+    fn frame_edit_region_drag_writes_absolute_canvas_pixels() {
+        // Fix 1 end-to-end: with a non-full region, a frame-edit drag must map
+        // to the region's ABSOLUTE canvas coordinates, so the painted pixels
+        // land inside the region rect rather than at the sheet origin.
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.projects
+            .current_mut()
+            .sequence_mut()
+            .frame_mut(0)
+            .unwrap()
+            .region = Region::new(Rect2i::new(64, 64, 16, 16), "Frame 1");
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
+        app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
+        app.publish_frame_edit_view();
+
+        let panel = frame_edit_panel_rect(&app);
+        // Just inside the region's draw rect: body top-left + a few points.
+        let start = egui::pos2(panel.left() + 4.0, panel.top() + 32.0);
+        let end = start + egui::vec2(6.0, 6.0);
+
+        run_app_frame(&mut app, &ctx, vec![move_to(start)]);
+        run_app_frame(&mut app, &ctx, vec![press(start)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(end)]);
+        run_app_frame(&mut app, &ctx, vec![release(end)]);
+
+        let (region, canvas_w) = {
+            let session = app.projects.current();
+            (
+                session.sequence().frame(0).unwrap().region().rect(),
+                session.layers.width() as i32,
+            )
+        };
+        let mut painted = 0;
+        for (index, px) in app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .buffer
+            .as_bytes()
+            .chunks_exact(4)
+            .enumerate()
+        {
+            if px[3] == 0 {
+                continue;
+            }
+            painted += 1;
+            let x = (index as i32) % canvas_w;
+            let y = (index as i32) / canvas_w;
+            assert!(
+                region.contains(x, y),
+                "pixel ({x},{y}) painted outside the region {region:?}"
+            );
+        }
+        assert!(painted > 0, "the region-scoped drag must paint");
+    }
+
+    // ------------------------------------------------------------------
+    // Animation integration: Set Frames tool + persistent frame-region
+    // overlays (LANE E items 3-5)
+    // ------------------------------------------------------------------
+
+    /// Creating a transform session arms the Fieldier/Rectangle selection tool
+    /// WITHOUT committing the live transform: the switch goes straight through
+    /// `tool_state`, never through the toolbar event path (`ToolSelected`
+    /// commits an in-flight session).
+    #[test]
+    fn transform_session_start_arms_fieldier_rectangle_without_committing() {
+        let mut app = App::default();
+        // Default tool is Pencil; the lift must arm Fieldier/Rectangle.
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Pencil);
+        seed_red_rect(&mut app, Rect2i::new(4, 4, 2, 2));
+        app.lift_transform(Rect2i::new(4, 4, 2, 2));
+
+        assert!(
+            app.projects.current().transform.is_some(),
+            "the lift must open a live transform session"
+        );
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::Fieldier,
+            "a live session must run under the Fieldier"
+        );
+        assert_eq!(
+            app.projects.current().tool_state.child(),
+            FieldierChild::Rectangle,
+            "a live session must run under the Rectangle child"
+        );
+    }
+
+    /// The Animations panel "Set Frames" event arms the Animation Placer tool.
+    /// Like the Fieldier arming, it is a pure tool switch: even with a live
+    /// transform session open the session must survive untouched.
+    #[test]
+    fn set_frames_tool_event_arms_animation_placer_without_committing() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(4, 4, 2, 2));
+        app.lift_transform(Rect2i::new(4, 4, 2, 2));
+        assert!(app.projects.current().transform.is_some());
+
+        app.apply_animation_events(vec![animation_hosts::AnimationPanelEvent::SetFramesTool]);
+
+        assert_eq!(
+            app.projects.current().tool_state.tool(),
+            Tool::AnimationPlacer,
+            "Set Frames must select the Animation Placer tool"
+        );
+        assert!(
+            app.projects.current().transform.is_some(),
+            "a pure tool switch must never commit a live transform"
+        );
+    }
+
+    /// When nothing else claims the canvas (no tool overlay, no transform, no
+    /// gesture, no committed selection), the ACTIVE animation's frame regions
+    /// are surfaced as the FrameRegions overlay — tool-independent. With an
+    /// empty sequence the overlay stays None.
+    #[test]
+    fn idle_overlay_highlights_the_active_animations_frame_regions() {
+        let mut app = App::default();
+        assert_eq!(app.projects.current().sequence().len(), 1);
+        let expected = app
+            .projects
+            .current()
+            .sequence()
+            .frame(0)
+            .unwrap()
+            .region()
+            .rect();
+        match app.current_overlay() {
+            CanvasOverlay::FrameRegions(regions) => {
+                assert_eq!(regions, vec![expected], "idle frame-region highlight");
+            }
+            other => panic!("expected FrameRegions, got {other:?}"),
+        }
+
+        // A live selection still wins: the accent is the selection, not the
+        // frame borders.
+        let mut app2 = App::default();
+        marquee(&mut app2, (2, 2), (6, 6));
+        assert!(
+            matches!(app2.current_overlay(), CanvasOverlay::AntsMask(_)),
+            "an active selection must outrank the frame-region highlight"
+        );
+
+        // An animation with no frames falls back to None rather than painting
+        // an empty region set.
+        {
+            let sequence = app.projects.current_mut().sequence_mut();
+            while sequence.len() > 0 {
+                let _ = sequence.remove(0);
+            }
+        }
+        assert_eq!(
+            app.current_overlay(),
+            CanvasOverlay::None,
+            "no frames -> no frame-region highlight"
+        );
     }
 }

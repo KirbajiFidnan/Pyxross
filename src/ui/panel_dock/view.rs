@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn drop_target_only_treats_the_actual_bottom_band_as_bottom_dock() {
-        let manager = DockManager::demo();
+        let manager = DockManager::demo_with_dummies();
         let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
 
         assert_eq!(manager.drop_target(pos2(100.0, 100.0), viewport), None);
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn drop_target_resolves_left_band() {
-        let mut manager = DockManager::demo();
+        let mut manager = DockManager::demo_with_dummies();
         manager
             .transition_panel(PanelId::new(3), PanelPlacement::DockedLeft)
             .unwrap();
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn surface_at_resolves_left_dock_panel() {
-        let mut manager = DockManager::demo();
+        let mut manager = DockManager::demo_with_dummies();
         manager
             .transition_panel(PanelId::new(3), PanelPlacement::DockedLeft)
             .unwrap();
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn bottom_dock_spans_between_left_and_right_docks() {
-        let mut manager = DockManager::demo();
+        let mut manager = DockManager::demo_with_dummies();
         manager
             .transition_panel(PanelId::new(3), PanelPlacement::DockedLeft)
             .unwrap();

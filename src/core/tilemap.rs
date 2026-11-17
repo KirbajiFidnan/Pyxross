@@ -35,6 +35,40 @@ where
     Ok(normalize_rotation(raw))
 }
 
+/// The size of one tilemap cell, in canvas pixels, PER AXIS.
+///
+/// Tiles need not be square: `w` and `h` are independent, so cell origins are
+/// `(cx * w, cy * h)` and grid snapping uses `w` for x and `h` for y. `new`
+/// clamps a zero axis to 1 so a malformed size can never divide by zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TileSize {
+    pub w: u32,
+    pub h: u32,
+}
+
+impl TileSize {
+    pub const fn new(w: u32, h: u32) -> Self {
+        Self {
+            w: if w == 0 { 1 } else { w },
+            h: if h == 0 { 1 } else { h },
+        }
+    }
+
+    pub const fn square(n: u32) -> Self {
+        Self::new(n, n)
+    }
+
+    pub const fn area(&self) -> u32 {
+        self.w * self.h
+    }
+}
+
+impl Default for TileSize {
+    fn default() -> Self {
+        Self { w: 16, h: 16 }
+    }
+}
+
 /// Stable identity of a palette tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TileId(pub u64);
@@ -76,12 +110,20 @@ impl TilePixelOverrides {
 
 /// A palette tile: self-contained pixel data.
 ///
-/// `pixels` is row-major straight RGBA8 with `len == w * h * 4`.
+/// `pixels` is row-major straight RGBA8 with `len == w * h * 4`. It is
+/// `#[serde(skip_serializing)]`ped so `manifest.json` carries metadata only;
+/// [`crate::io::save_document`] writes the pixels to a per-tile
+/// `tiles/<id>.png` and [`crate::io::load_document`] fills them back. The
+/// `#[serde(default)]` keeps PRE-v7 manifests (which embedded `pixels` as a
+/// JSON array) deserializing — those arrive non-empty and are used as-is, so
+/// old files still load losslessly. `pixels` participates in `PartialEq`/`Eq`,
+/// so a save→load→compare round-trip is byte-exact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tile {
     pub id: TileId,
     pub w: u16,
     pub h: u16,
+    #[serde(default, skip_serializing)]
     pub pixels: Vec<u8>,
 }
 
@@ -227,7 +269,7 @@ impl TileCell {
 /// A grid of tile cells over a layer's canvas.
 ///
 /// `cells` is row-major with `len == cols * rows`; the canvas origin of cell
-/// `(x, y)` is `(x * tile_size, y * tile_size)`. Out-of-bounds writes are
+/// `(x, y)` is `(x * tile_size.w, y * tile_size.h)`. Out-of-bounds writes are
 /// no-ops; every operation is deterministic and panic-free.
 ///
 /// `change_epoch` (bumped on every `set_cell`) and the accumulated
@@ -236,7 +278,7 @@ impl TileCell {
 /// detect edits cheaply. They are excluded from `PartialEq`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TileMap {
-    pub tile_size: u32,
+    pub tile_size: TileSize,
     pub cols: u32,
     pub rows: u32,
     /// Row-major cell list, private so the `len == cols * rows` invariant is
@@ -262,8 +304,12 @@ impl PartialEq for TileMap {
 
 impl TileMap {
     /// An empty (all cells `None`) map over `cols × rows` cells.
-    pub fn new(tile_size: u32, cols: u32, rows: u32) -> Self {
-        let tile_size = tile_size.max(1);
+    ///
+    /// `tile_size` is sanitized through [`TileSize::new`] so a hand-built
+    /// zero axis (a plain struct literal bypassing the constructor) can never
+    /// divide by zero.
+    pub fn new(tile_size: TileSize, cols: u32, rows: u32) -> Self {
+        let tile_size = TileSize::new(tile_size.w, tile_size.h);
         let len = (cols as usize).checked_mul(rows as usize).unwrap_or(0);
         Self {
             tile_size,
@@ -306,10 +352,15 @@ impl TileMap {
         self.dirty_cells = Some((0, 0, cols, rows));
     }
 
-    /// Snaps a canvas point to its grid-cell index (Euclidean floor division).
-    pub fn snap_cell(p: (i32, i32), ts: u32) -> (u32, u32) {
-        let ts = ts.max(1) as i32;
-        (p.0.div_euclid(ts) as u32, p.1.div_euclid(ts) as u32)
+    /// Snaps a canvas point to its grid-cell index (Euclidean floor division),
+    /// PER AXIS: x by `ts.w`, y by `ts.h`.
+    pub fn snap_cell(p: (i32, i32), ts: TileSize) -> (u32, u32) {
+        let tw = ts.w.max(1) as i32;
+        let th = ts.h.max(1) as i32;
+        (
+            p.0.div_euclid(tw) as u32,
+            p.1.div_euclid(th) as u32,
+        )
     }
 
     /// The flat index of `(x, y)`, or `None` when out of bounds.
@@ -358,28 +409,30 @@ impl TileMap {
     }
 
     /// Consumes and returns the changed-cells region as a CANVAS-space rect
-    /// (`dirty cell bbox × tile_size`, clipped to `canvas_w × canvas_h`), or
-    /// `None` when nothing changed.
+    /// (`dirty cell bbox × tile size`, PER AXIS, clipped to `canvas_w ×
+    /// canvas_h`), or `None` when nothing changed.
     pub fn take_dirty_canvas_region(&mut self, canvas_w: u32, canvas_h: u32) -> Option<Rect2i> {
         let (cx, cy, cw, ch) = self.dirty_cells.take()?;
-        let ts = u64::from(self.tile_size.max(1));
-        let x = ((u64::from(cx) * ts).min(u64::from(canvas_w))) as i32;
-        let y = ((u64::from(cy) * ts).min(u64::from(canvas_h))) as i32;
-        let right = ((u64::from(cx + cw) * ts).min(u64::from(canvas_w))) as i32;
-        let bottom = ((u64::from(cy + ch) * ts).min(u64::from(canvas_h))) as i32;
+        let tw = u64::from(self.tile_size.w.max(1));
+        let th = u64::from(self.tile_size.h.max(1));
+        let x = ((u64::from(cx) * tw).min(u64::from(canvas_w))) as i32;
+        let y = ((u64::from(cy) * th).min(u64::from(canvas_h))) as i32;
+        let right = ((u64::from(cx + cw) * tw).min(u64::from(canvas_w))) as i32;
+        let bottom = ((u64::from(cy + ch) * th).min(u64::from(canvas_h))) as i32;
         if right <= x || bottom <= y {
             return None;
         }
         Some(Rect2i::new(x, y, right - x, bottom - y))
     }
 
-    /// The full canvas area this map covers (`cols × rows × tile_size`),
-    /// clipped to the canvas — used for palette-driven re-uploads.
+    /// The full canvas area this map covers (`cols × tile_size.w` by
+    /// `rows × tile_size.h`), clipped to the canvas — used for palette-driven
+    /// re-uploads.
     pub fn full_canvas_region(&self, canvas_w: u32, canvas_h: u32) -> Rect2i {
-        let w = ((u64::from(self.cols) * u64::from(self.tile_size.max(1))).min(u64::from(canvas_w)))
-            as i32;
-        let h = ((u64::from(self.rows) * u64::from(self.tile_size.max(1))).min(u64::from(canvas_h)))
-            as i32;
+        let w = ((u64::from(self.cols) * u64::from(self.tile_size.w.max(1)))
+            .min(u64::from(canvas_w))) as i32;
+        let h = ((u64::from(self.rows) * u64::from(self.tile_size.h.max(1)))
+            .min(u64::from(canvas_h))) as i32;
         Rect2i::new(0, 0, w, h)
     }
 }
@@ -467,7 +520,8 @@ impl TileMap {
         let canvas_w = dst.width() as u32;
         let canvas_h = dst.height() as u32;
         let cols = self.cols.max(1) as usize;
-        let tile_size = self.tile_size.max(1);
+        let tile_w = self.tile_size.w.max(1);
+        let tile_h = self.tile_size.h.max(1);
         for (index, cell) in self.cells.iter().enumerate() {
             let Some(cell) = cell else {
                 continue;
@@ -482,10 +536,10 @@ impl TileMap {
                 (u32::from(tile.w), u32::from(tile.h))
             };
             let (cx, cy) = ((index % cols) as u32, (index / cols) as u32);
-            let Some(ox) = cx.checked_mul(tile_size) else {
+            let Some(ox) = cx.checked_mul(tile_w) else {
                 continue;
             };
-            let Some(oy) = cy.checked_mul(tile_size) else {
+            let Some(oy) = cy.checked_mul(tile_h) else {
                 continue;
             };
             if ox >= canvas_w || oy >= canvas_h {
@@ -548,7 +602,8 @@ impl TileMap {
         let canvas_w = dst.width() as u32;
         let canvas_h = dst.height() as u32;
         let cols = self.cols.max(1) as usize;
-        let tile_size = self.tile_size.max(1);
+        let tile_w = self.tile_size.w.max(1);
+        let tile_h = self.tile_size.h.max(1);
         for (index, cell) in self.cells.iter().enumerate() {
             let Some(cell) = cell else { continue };
             let Some(tile) = pal.get(cell.tile_id) else { continue };
@@ -556,8 +611,8 @@ impl TileMap {
                 continue;
             };
             let (cx, cy) = ((index % cols) as u32, (index / cols) as u32);
-            let Some(ox) = cx.checked_mul(tile_size) else { continue };
-            let Some(oy) = cy.checked_mul(tile_size) else { continue };
+            let Some(ox) = cx.checked_mul(tile_w) else { continue };
+            let Some(oy) = cy.checked_mul(tile_h) else { continue };
             for (&(root_y, root_x), &rgba) in pixels {
                 if root_x >= u32::from(tile.w) || root_y >= u32::from(tile.h) {
                     continue;
@@ -609,17 +664,18 @@ impl TileMap {
         };
         let canvas_w = dst.width() as u32;
         let canvas_h = dst.height() as u32;
-        let tile_size = self.tile_size.max(1);
+        let tile_w = self.tile_size.w.max(1);
+        let tile_h = self.tile_size.h.max(1);
         let rotated = cell.rotation % 2 == 1;
         let (ow, oh) = if rotated {
             (u32::from(tile.h), u32::from(tile.w))
         } else {
             (u32::from(tile.w), u32::from(tile.h))
         };
-        let Some(ox) = cx.checked_mul(tile_size) else {
+        let Some(ox) = cx.checked_mul(tile_w) else {
             return false;
         };
-        let Some(oy) = cy.checked_mul(tile_size) else {
+        let Some(oy) = cy.checked_mul(tile_h) else {
             return false;
         };
         if ox >= canvas_w || oy >= canvas_h {
@@ -744,18 +800,29 @@ mod tests {
         assert_eq!(palette.get(TileId(999)), None);
         let json = serde_json::to_string(&palette).unwrap();
         let restored: TilePalette = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, palette);
-        // JSON shape: tiles + selected (no stored next_id).
+        // `Tile.pixels` is `skip_serializing`: a bare serde round-trip keeps
+        // the metadata and leaves `pixels` empty. The io layer refills pixels
+        // from `tiles/<id>.png` on load, so this is the expected shape.
+        let mut expected = palette.clone();
+        for tile in &mut expected.tiles {
+            tile.pixels.clear();
+        }
+        assert_eq!(restored, expected);
+        // JSON shape: tiles + selected (no stored next_id), and no pixels.
         let value = serde_json::to_value(&palette).unwrap();
         assert_eq!(value["tiles"][0]["id"], serde_json::json!(a.0));
         assert_eq!(value["tiles"][0]["w"], serde_json::json!(2));
         assert_eq!(value["tiles"][0]["h"], serde_json::json!(3));
+        assert!(
+            value["tiles"][0].get("pixels").is_none(),
+            "tile pixels must not be serialized into the manifest"
+        );
         assert_eq!(value["selected"], serde_json::json!(b.0));
     }
 
     #[test]
     fn tile_map_new_and_out_of_bounds_cell_access() {
-        let map = TileMap::new(4, 3, 2);
+        let map = TileMap::new(TileSize::square(4), 3, 2);
         assert_eq!(map.cols, 3);
         assert_eq!(map.rows, 2);
         assert_eq!(map.cells().len(), 6);
@@ -772,7 +839,7 @@ mod tests {
 
     #[test]
     fn tile_map_set_cell_and_cell_round_trip() {
-        let mut map = TileMap::new(4, 3, 2);
+        let mut map = TileMap::new(TileSize::square(4), 3, 2);
         map.set_cell((1, 0), Some(TileCell::new(TileId(7))));
         map.set_cell((2, 1), None);
         assert_eq!(map.cell((1, 0)), Some(TileCell::new(TileId(7))));
@@ -801,9 +868,12 @@ mod tests {
 
     #[test]
     fn snap_cell_floors_with_euclidean_division() {
-        assert_eq!(TileMap::snap_cell((5, 3), 4), (1, 0));
-        assert_eq!(TileMap::snap_cell((-1, 16), 4), (u32::MAX, 4));
-        assert_eq!(TileMap::snap_cell((0, 0), 0), (0, 0));
+        assert_eq!(TileMap::snap_cell((5, 3), TileSize::square(4)), (1, 0));
+        assert_eq!(
+            TileMap::snap_cell((-1, 16), TileSize::square(4)),
+            (u32::MAX, 4)
+        );
+        assert_eq!(TileMap::snap_cell((0, 0), TileSize::square(0)), (0, 0));
     }
 
     fn solid_tile(id: u64, w: u16, h: u16, color: [u8; 4]) -> Tile {
@@ -820,7 +890,7 @@ mod tests {
         let mut palette = TilePalette::new();
         let red = [255u8, 0, 0, 255];
         palette.add(solid_tile(0, 2, 2, red));
-        let mut map = TileMap::new(4, 4, 4);
+        let mut map = TileMap::new(TileSize::square(4), 4, 4);
         map.set_cell((1, 1), Some(TileCell::new(TileId(1))));
         let mut dst = PixelBuffer::new(16, 16);
         map.rasterize(&palette, &mut dst);
@@ -860,7 +930,7 @@ mod tests {
             h: 1,
             pixels: [red, green].concat(),
         });
-        let mut map = TileMap::new(4, 4, 4);
+        let mut map = TileMap::new(TileSize::square(4), 4, 4);
 
         // Rotation 90° CW: the 2x1 becomes a 1x2 column [red; green].
         map.set_cell(
@@ -918,7 +988,7 @@ mod tests {
             h: 1,
             pixels: [red, green].concat(),
         });
-        let mut map = TileMap::new(4, 3, 1);
+        let mut map = TileMap::new(TileSize::square(4), 3, 1);
         map.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         let mut rotated = TileCell::new(TileId(1));
         rotated.set_rotation(1);
@@ -967,7 +1037,7 @@ mod tests {
         use crate::core::color::Color;
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
-        let mut map = TileMap::new(4, 4, 4);
+        let mut map = TileMap::new(TileSize::square(4), 4, 4);
         // A cell referencing a missing tile is skipped (empty).
         map.set_cell((0, 0), Some(TileCell::new(TileId(99))));
         // A cell that starts off-canvas is skipped entirely.
@@ -987,7 +1057,7 @@ mod tests {
         assert_eq!(dst.get_pixel(0, 12), Some(Color::rgba(255, 0, 0, 255)));
 
         // A fully off-canvas cell (origin beyond 14x14) paints nothing.
-        let mut map = TileMap::new(8, 4, 4);
+        let mut map = TileMap::new(TileSize::square(8), 4, 4);
         map.set_cell((3, 3), Some(TileCell::new(TileId(1)))); // origin (24,24)
         let mut dst = PixelBuffer::new(14, 14);
         map.rasterize(&palette, &mut dst);
@@ -998,7 +1068,7 @@ mod tests {
     fn rasterize_is_deterministic_and_palette_pure() {
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 3, 2, [10, 20, 30, 255]));
-        let mut map = TileMap::new(4, 3, 3);
+        let mut map = TileMap::new(TileSize::square(4), 3, 3);
         map.set_cell((0, 0), Some(TileCell::new(TileId(1))));
         map.set_cell(
             (2, 2),
@@ -1024,7 +1094,7 @@ mod tests {
 
     #[test]
     fn tile_map_serde_round_trip() {
-        let mut map = TileMap::new(16, 2, 2);
+        let mut map = TileMap::new(TileSize::square(16), 2, 2);
         map.set_cell(
             (1, 0),
             Some(TileCell {
@@ -1038,5 +1108,69 @@ mod tests {
         let restored: TileMap = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, map);
         assert_eq!(restored.cell((1, 0)), map.cell((1, 0)));
+    }
+
+    #[test]
+    fn tile_size_new_square_and_area() {
+        assert_eq!(TileSize::square(8), TileSize { w: 8, h: 8 });
+        assert_eq!(TileSize::new(16, 32), TileSize { w: 16, h: 32 });
+        // Zero axes clamp to 1 so a malformed size can never divide by zero.
+        assert_eq!(TileSize::new(0, 5), TileSize { w: 1, h: 5 });
+        assert_eq!(TileSize::square(0), TileSize { w: 1, h: 1 });
+        assert_eq!(TileSize::new(16, 32).area(), 512);
+        assert_eq!(TileSize::default(), TileSize { w: 16, h: 16 });
+    }
+
+    #[test]
+    fn snap_cell_is_per_axis() {
+        let ts = TileSize::new(16, 32);
+        // x steps by 16, y steps by 32.
+        assert_eq!(TileMap::snap_cell((0, 0), ts), (0, 0));
+        assert_eq!(TileMap::snap_cell((15, 31), ts), (0, 0));
+        assert_eq!(TileMap::snap_cell((16, 32), ts), (1, 1));
+        assert_eq!(TileMap::snap_cell((47, 95), ts), (2, 2));
+        // Euclidean floor division on negatives.
+        assert_eq!(TileMap::snap_cell((-1, -1), ts), (u32::MAX, u32::MAX));
+        assert_eq!(TileMap::snap_cell((-16, -32), ts), (u32::MAX, u32::MAX));
+        // Zero axes are treated as 1.
+        assert_eq!(TileMap::snap_cell((3, 5), TileSize::new(0, 0)), (3, 5));
+    }
+
+    #[test]
+    fn tile_origins_are_per_axis() {
+        // A 16×32 tile: cell (2,3) starts at (32, 96) — x by w, y by h.
+        let ts = TileSize::new(16, 32);
+        let map = TileMap::new(ts, 4, 4);
+        let out = map.full_canvas_region(256, 256);
+        assert_eq!(out, Rect2i::new(0, 0, 4 * 16, 4 * 32));
+
+        // A tile on a non-square grid must rasterize at (cx*w, cy*h).
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 1,
+            h: 1,
+            pixels: vec![9, 8, 7, 255],
+        });
+        let mut map = TileMap::new(ts, 4, 4);
+        map.set_cell((2, 3), Some(TileCell::new(TileId(1))));
+        let mut dst = PixelBuffer::new(128, 256);
+        map.rasterize(&palette, &mut dst);
+        assert_eq!(dst.get_pixel(32, 96), Some(crate::core::color::Color::rgba(9, 8, 7, 255)));
+        assert_eq!(dst.get_pixel(31, 96), Some(crate::core::color::Color::TRANSPARENT));
+        assert_eq!(dst.get_pixel(32, 95), Some(crate::core::color::Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn dirty_canvas_region_is_per_axis() {
+        let ts = TileSize::new(16, 32);
+        let mut map = TileMap::new(ts, 8, 8);
+        // Consume the constructor's dirty state if any.
+        let _ = map.take_dirty_canvas_region(256, 256);
+        map.set_cell((2, 3), Some(TileCell::new(TileId(1))));
+        assert_eq!(
+            map.take_dirty_canvas_region(256, 256),
+            Some(Rect2i::new(32, 96, 16, 32))
+        );
     }
 }

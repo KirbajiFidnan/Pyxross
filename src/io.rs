@@ -3,22 +3,27 @@
 //!
 //! [`save_document`] / [`load_document`] persist a [`Document`] as a project
 //! directory: `manifest.json` (metadata) plus one full-canvas RGBA PNG per
-//! layer under `layers/`. The PNG codec ([`encode_png`] / [`decode_png`] /
-//! [`PngImage`]) is defined in [`crate::core::png_codec`] (pure core, D51) and
-//! re-exported here for the persistence and import/export paths. R7 adds
-//! [`encode_gif`] (animation export), [`sprite_sheet_meta_json`] (atlas
-//! metadata), and [`read_png_file`] (PNG import).
+//! layer under `layers/`. D80 adds a single-file form: [`save_document_file`]
+//! packs the very same entries (layers + tiles + manifest) into a STORED ZIP
+//! via [`crate::core::archive`], and [`load_document`] accepts both forms — a
+//! directory and a `.pyxross` archive file. The PNG codec ([`encode_png`] /
+//! [`decode_png`] / [`PngImage`]) is defined in [`crate::core::png_codec`]
+//! (pure core, D51) and re-exported here for the persistence and
+//! import/export paths. R7 adds [`encode_gif`] (animation export),
+//! [`sprite_sheet_meta_json`] (atlas metadata), and [`read_png_file`] (PNG
+//! import).
 
 use std::fmt;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use image::{AnimationDecoder, ImageDecoder};
 use serde::{Deserialize, Serialize};
 
 use crate::core::document::{Document, FORMAT_VERSION};
 use crate::core::palette::Palette;
-use crate::core::tilemap::TilePalette;
+use crate::core::tilemap::{TilePalette, TileSize};
 use crate::input::Keymap;
 
 pub use crate::core::png_codec::{decode_png, encode_png, PngError, PngImage};
@@ -154,7 +159,7 @@ pub enum PersistenceError {
     Io(std::io::Error),
     /// JSON parse or serialize error.
     Json(String),
-    /// A layer's PNG file is missing.
+    /// A layer's or tile's PNG file is missing.
     MissingLayer(String),
     /// A pixel buffer or PNG dimension does not match the canvas.
     SizeMismatch(String),
@@ -162,6 +167,12 @@ pub enum PersistenceError {
     UnsupportedVersion { found: u32, supported: u32 },
     /// The manifest is structurally invalid.
     Manifest(String),
+    /// The single-file archive (D80) layer failed: truncated, CRC-corrupt or
+    /// otherwise malformed `.pyxross` archive, or a pack-side limit hit.
+    Archive(String),
+    /// The file is not a `.pyxross` archive at all (bad ZIP magic or a valid
+    /// archive without a `manifest.json` entry).
+    NotPyxrossFile(String),
 }
 
 impl fmt::Display for PersistenceError {
@@ -177,6 +188,8 @@ impl fmt::Display for PersistenceError {
                  (this build supports up to {supported})"
             ),
             PersistenceError::Manifest(msg) => write!(f, "manifest error: {msg}"),
+            PersistenceError::Archive(msg) => write!(f, "archive error: {msg}"),
+            PersistenceError::NotPyxrossFile(msg) => write!(f, "not a pyxross file: {msg}"),
         }
     }
 }
@@ -204,6 +217,25 @@ impl From<PngError> for PersistenceError {
     }
 }
 
+impl From<crate::core::archive::ArchiveError> for PersistenceError {
+    fn from(e: crate::core::archive::ArchiveError) -> Self {
+        match e {
+            // Not a ZIP at all — the user (or a dialog filter) picked a file
+            // that is not a `.pyxross` archive.
+            crate::core::archive::ArchiveError::BadMagic => {
+                PersistenceError::NotPyxrossFile("not a ZIP archive (bad magic)".to_string())
+            }
+            // A checksum failure is the definitive "corrupt file" signal.
+            crate::core::archive::ArchiveError::CrcMismatch(name) => PersistenceError::Archive(
+                format!("entry {name:?} failed its CRC-32 check (corrupt file)"),
+            ),
+            // Everything else (truncated, too large, too many entries, unsafe
+            // name, unsupported method) is an archive-level error.
+            other => PersistenceError::Archive(other.to_string()),
+        }
+    }
+}
+
 /// `width * height * 4` with overflow checking.
 fn canvas_byte_len(width: u32, height: u32) -> Result<usize, PersistenceError> {
     (width as usize)
@@ -216,24 +248,25 @@ fn canvas_byte_len(width: u32, height: u32) -> Result<usize, PersistenceError> {
         })
 }
 
-/// Saves `doc` as a `.pyxross` project directory.
+/// `w * h * 4` with overflow checking, for a tile's pixel buffer.
+fn tile_byte_len(w: u16, h: u16) -> Result<usize, PersistenceError> {
+    (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            PersistenceError::SizeMismatch(format!("tile {w}x{h} overflows the pixel byte count"))
+        })
+}
+
+/// The canonical on-disk file map of a document, in write order.
 ///
-/// Layout:
-/// ```text
-/// <dir>/
-/// ├── manifest.json   — metadata (layer pixels skipped)
-/// └── layers/
-///     └── <layer_id>.png
-/// ```
-///
-/// All layer PNGs are written first and `manifest.json` last, so a reader
-/// never observes a new manifest over old PNGs. On error the partially
-/// written directory is left in place and reported via the returned error.
-///
-/// Pixel buffers are validated against the canvas size before anything is
-/// written, so a wrong-length buffer fails without touching the directory.
-/// Group layers (`is_group == true`) carry no pixels and no PNG.
-pub fn save_document(doc: &Document, dir: &Path) -> Result<(), PersistenceError> {
+/// Shared by the directory form ([`save_document`]) and the single-file form
+/// ([`save_document_file`], D80): layer PNGs (`layers/<id>.png`, groups
+/// skipped), tile PNGs (`tiles/<id>.png`), and `manifest.json` LAST — a reader
+/// never observes a new manifest over old PNGs. Every pixel buffer is validated
+/// against its size before anything is produced, so a wrong-length buffer fails
+/// without touching disk or producing an archive.
+fn document_entries(doc: &Document) -> Result<Vec<(String, Vec<u8>)>, PersistenceError> {
     let expected = canvas_byte_len(doc.canvas_width, doc.canvas_height)?;
     for layer in &doc.layers {
         if layer.is_group {
@@ -250,10 +283,23 @@ pub fn save_document(doc: &Document, dir: &Path) -> Result<(), PersistenceError>
             )));
         }
     }
+    // Validate every tile's buffer before writing anything (mirrors layers).
+    for tile in &doc.tile_palette.tiles {
+        let expected_tile = tile_byte_len(tile.w, tile.h)?;
+        if tile.pixels.len() != expected_tile {
+            return Err(PersistenceError::SizeMismatch(format!(
+                "tile {} pixel buffer length {} does not match {}x{} ({} bytes)",
+                tile.id.0,
+                tile.pixels.len(),
+                tile.w,
+                tile.h,
+                expected_tile
+            )));
+        }
+    }
 
-    let layers_dir = dir.join("layers");
-    fs::create_dir_all(&layers_dir).map_err(PersistenceError::Io)?;
-
+    let mut entries: Vec<(String, Vec<u8>)> =
+        Vec::with_capacity(doc.layers.len() + doc.tile_palette.tiles.len() + 1);
     for layer in &doc.layers {
         if layer.is_group {
             continue;
@@ -263,33 +309,169 @@ pub fn save_document(doc: &Document, dir: &Path) -> Result<(), PersistenceError>
             doc.canvas_height as usize,
             &layer.pixels,
         )?;
-        fs::write(layers_dir.join(format!("{}.png", layer.id)), png)
-            .map_err(PersistenceError::Io)?;
+        entries.push((format!("layers/{}.png", layer.id), png));
+    }
+    // Tile pixels go to `tiles/<tile_id>.png`; the manifest carries metadata
+    // only (`Tile.pixels` is `skip_serializing`).
+    for tile in &doc.tile_palette.tiles {
+        let png = encode_png(tile.w as usize, tile.h as usize, &tile.pixels)?;
+        entries.push((format!("tiles/{}.png", tile.id.0), png));
     }
 
     let mut value = serde_json::to_value(doc).map_err(|e| PersistenceError::Json(e.to_string()))?;
     value["format_version"] = serde_json::json!(FORMAT_VERSION);
     let json =
         serde_json::to_string_pretty(&value).map_err(|e| PersistenceError::Json(e.to_string()))?;
-    fs::write(dir.join("manifest.json"), json).map_err(PersistenceError::Io)?;
+    entries.push(("manifest.json".to_string(), json.into_bytes()));
+    Ok(entries)
+}
+
+/// Saves `doc` as a `.pyxross` project directory.
+///
+/// Layout:
+/// ```text
+/// <dir>/
+/// ├── manifest.json   — metadata (layer and tile pixels skipped)
+/// ├── layers/
+/// │   └── <layer_id>.png
+/// └── tiles/
+///     └── <tile_id>.png
+/// ```
+///
+/// All layer and tile PNGs are written first and `manifest.json` last, so a
+/// reader never observes a new manifest over old PNGs. On error the partially
+/// written directory is left in place and reported via the returned error.
+///
+/// Pixel buffers (layer and tile) are validated against their sizes before
+/// anything is written, so a wrong-length buffer fails without touching the
+/// directory. Group layers (`is_group == true`) carry no pixels and no PNG.
+pub fn save_document(doc: &Document, dir: &Path) -> Result<(), PersistenceError> {
+    let entries = document_entries(doc)?;
+    fs::create_dir_all(dir.join("layers")).map_err(PersistenceError::Io)?;
+    fs::create_dir_all(dir.join("tiles")).map_err(PersistenceError::Io)?;
+    for (name, bytes) in &entries {
+        fs::write(dir.join(name), bytes).map_err(PersistenceError::Io)?;
+    }
     Ok(())
 }
 
-/// Loads a `.pyxross` project directory saved by [`save_document`].
+/// Saves `doc` as a single `.pyxross` file (D80) — the directory form's exact
+/// entry set packed into a STORED ZIP archive via [`crate::core::archive`].
 ///
-/// Reads `manifest.json`, migrates the format version forward if needed
-/// (rejecting manifests from a newer Pyxross), then fills each layer's
-/// `pixels` from its `layers/<id>.png`. The PNG must be exactly
-/// `canvas_width × canvas_height`; anything else is a
-/// [`PersistenceError::SizeMismatch`]. Group layers carry no PNG; their
-/// `pixels` stay empty. The layer parent graph is validated against the
-/// manifest before any PNG is read.
-pub fn load_document(dir: &Path) -> Result<Document, PersistenceError> {
+/// The write is atomic: the archive bytes land in a sibling `*.tmp` file first,
+/// then `rename` moves it over `path`, so a crash never leaves a truncated
+/// `.pyxross` file. On Windows the target is removed first (`rename` cannot
+/// overwrite an existing file there). A validation failure or pack error leaves
+/// `path` untouched.
+pub fn save_document_file(doc: &Document, path: &Path) -> Result<(), PersistenceError> {
+    let entries = document_entries(doc)?;
+    let slice: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let bytes = crate::core::archive::pack(&slice)?;
+
+    let parent = path.parent().map_or_else(|| Path::new("."), |value| value);
+    fs::create_dir_all(parent).map_err(PersistenceError::Io)?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).map_err(PersistenceError::Io)?;
+
+    #[cfg(windows)]
+    {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(PersistenceError::Io(e));
+            }
+        }
+    }
+
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PersistenceError::Io(e));
+    }
+    Ok(())
+}
+
+/// Loads a `.pyxross` project saved by [`save_document`] (directory) or
+/// [`save_document_file`] (single-file archive, D80).
+///
+/// A path that is a directory loads as the native directory form; any other
+/// path is read as an archive file (bad ZIP magic or a missing
+/// `manifest.json` entry yields [`PersistenceError::NotPyxrossFile`]).
+///
+/// Both forms share the same semantics: `manifest.json` is parsed and migrated
+/// forward if needed (manifests from a newer Pyxross are rejected), the layer
+/// parent graph is validated, then each layer's `pixels` is filled from
+/// `layers/<id>.png` and each tile's from `tiles/<id>.png`.
+pub fn load_document(path: &Path) -> Result<Document, PersistenceError> {
+    if path.is_dir() {
+        load_document_dir(path)
+    } else {
+        load_document_file(path)
+    }
+}
+
+/// Loads the native directory form. Reads `manifest.json` and fills pixels
+/// from the directory's `layers/` and `tiles/` PNG files; a missing PNG is a
+/// [`PersistenceError::MissingLayer`] naming the expected file path. Group
+/// layers carry no PNG; their `pixels` stay empty. Tile pixels that arrived
+/// already populated (a pre-v7 manifest embedding them as JSON) are left
+/// untouched, so old files load unchanged.
+fn load_document_dir(dir: &Path) -> Result<Document, PersistenceError> {
     let manifest_path = dir.join("manifest.json");
     let bytes = fs::read(&manifest_path).map_err(PersistenceError::Io)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| PersistenceError::Json(format!("manifest.json is not valid JSON: {e}")))?;
+    let value = parse_manifest(&bytes)?;
+    let doc = document_from_manifest(value)?;
+    fill_pixels(doc, |name| {
+        let path = dir.join(name);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(PersistenceError::MissingLayer(format!(
+                    "{}: PNG file not found at {}",
+                    entry_label(name),
+                    path.display()
+                )))
+            }
+            Err(e) => Err(PersistenceError::Io(e)),
+        }
+    })
+}
 
+/// Loads the single-file form (D80): unpacks the STORED ZIP archive, requires
+/// a `manifest.json` entry, and fills pixels from the in-archive entries.
+/// Entries other than the expected `layers/*.png` / `tiles/*.png` /
+/// `manifest.json` set are ignored.
+fn load_document_file(path: &Path) -> Result<Document, PersistenceError> {
+    let bytes = fs::read(path).map_err(PersistenceError::Io)?;
+    let entries = crate::core::archive::unpack(&bytes)?;
+    let manifest = find_entry(&entries, "manifest.json").ok_or_else(|| {
+        PersistenceError::NotPyxrossFile("missing manifest.json entry".to_string())
+    })?;
+    let value = parse_manifest(manifest)?;
+    let doc = document_from_manifest(value)?;
+    fill_pixels(doc, |name| match find_entry(&entries, name) {
+        Some(bytes) => Ok(bytes.to_vec()),
+        None => Err(PersistenceError::MissingLayer(format!(
+            "{}: PNG entry {name:?} not found in the archive",
+            entry_label(name)
+        ))),
+    })
+}
+
+/// Parses the manifest bytes with the historical `manifest.json` error text
+/// (shared by the directory and archive forms).
+fn parse_manifest(bytes: &[u8]) -> Result<serde_json::Value, PersistenceError> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| PersistenceError::Json(format!("manifest.json is not valid JSON: {e}")))
+}
+
+/// Version-gates, migrates and deserializes a parsed manifest, then validates
+/// the layer parent graph (shared by both load forms).
+fn document_from_manifest(value: serde_json::Value) -> Result<Document, PersistenceError> {
     let from = match value.get("format_version") {
         Some(v) => v
             .as_u64()
@@ -304,29 +486,33 @@ pub fn load_document(dir: &Path) -> Result<Document, PersistenceError> {
     };
     let value = migrate_document(value, from)?;
 
-    let mut doc: Document = serde_json::from_value(value).map_err(|e| {
+    let doc: Document = serde_json::from_value(value).map_err(|e| {
         PersistenceError::Manifest(format!(
             "manifest.json does not match format version {FORMAT_VERSION}: {e}"
         ))
     })?;
     validate_layer_tree(&doc)?;
+    Ok(doc)
+}
 
+/// Fills layer and tile `pixels` from their PNG byte sources.
+///
+/// `read_entry(name)` fetches the bytes for one entry
+/// (`layers/<id>.png` / `tiles/<id>.png`) and must already produce the final
+/// error for a missing entry (the two load forms phrase it differently).
+/// Mirrors the historical directory loader's validation and messages exactly:
+/// layer PNGs must be exactly the canvas size; tile PNGs exactly `tile.w ×
+/// tile.h`, with a pre-populated (inline, pre-v7) tile skipped.
+fn fill_pixels(
+    mut doc: Document,
+    mut read_entry: impl FnMut(&str) -> Result<Vec<u8>, PersistenceError>,
+) -> Result<Document, PersistenceError> {
     for layer in &mut doc.layers {
         if layer.is_group {
             continue;
         }
-        let path = dir.join("layers").join(format!("{}.png", layer.id));
-        let png_bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PersistenceError::MissingLayer(format!(
-                    "layer {}: PNG file not found at {}",
-                    layer.id,
-                    path.display()
-                )));
-            }
-            Err(e) => return Err(PersistenceError::Io(e)),
-        };
+        let name = format!("layers/{}.png", layer.id);
+        let png_bytes = read_entry(&name)?;
         let img = decode_png(&png_bytes)?;
         if img.width != doc.canvas_width as usize || img.height != doc.canvas_height as usize {
             return Err(PersistenceError::SizeMismatch(format!(
@@ -336,7 +522,67 @@ pub fn load_document(dir: &Path) -> Result<Document, PersistenceError> {
         }
         layer.pixels = img.rgba;
     }
+
+    // Fill each tile's pixels from `tiles/<id>.png`, unless the manifest
+    // already carried them (a pre-v7 manifest embeds `pixels` as JSON; those
+    // arrive non-empty and are used as-is, preserving old files losslessly).
+    for tile in &mut doc.tile_palette.tiles {
+        if !tile.pixels.is_empty() {
+            continue;
+        }
+        let expected = tile_byte_len(tile.w, tile.h)?;
+        // A zero-area tile legitimately has no pixels and no PNG.
+        if expected == 0 {
+            continue;
+        }
+        let name = format!("tiles/{}.png", tile.id.0);
+        let png_bytes = read_entry(&name)?;
+        let img = decode_png(&png_bytes).map_err(|e| match e {
+            PngError::Decode(msg) => PersistenceError::Manifest(format!(
+                "tile {} PNG decode error: {msg}",
+                tile.id.0
+            )),
+            other => PersistenceError::from(other),
+        })?;
+        if img.width != tile.w as usize || img.height != tile.h as usize {
+            return Err(PersistenceError::SizeMismatch(format!(
+                "tile {} PNG is {}x{} but the tile is {}x{}",
+                tile.id.0, img.width, img.height, tile.w, tile.h
+            )));
+        }
+        if img.rgba.len() != expected {
+            return Err(PersistenceError::SizeMismatch(format!(
+                "tile {} PNG has {} bytes but {}x{} needs {}",
+                tile.id.0,
+                img.rgba.len(),
+                tile.w,
+                tile.h,
+                expected
+            )));
+        }
+        tile.pixels = img.rgba;
+    }
     Ok(doc)
+}
+
+/// Looks up one unpacked archive entry by name.
+fn find_entry<'a>(entries: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+    entries
+        .iter()
+        .find(|(entry_name, _)| entry_name == name)
+        .map(|(_, data)| data.as_slice())
+}
+
+/// `layers/3.png` -> `layer 3`, `tiles/7.png` -> `tile 7` (for error
+/// messages shared with the directory loader).
+fn entry_label(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("layers/") {
+        format!("layer {}", rest.trim_end_matches(".png"))
+    } else if let Some(rest) = name.strip_prefix("tiles/") {
+        format!("tile {}", rest.trim_end_matches(".png"))
+    } else {
+        name.to_string()
+    }
 }
 
 /// Validates the layer parent graph of a deserialized manifest.
@@ -388,7 +634,11 @@ fn validate_layer_tree(doc: &Document) -> Result<(), PersistenceError> {
 /// (`tiles` / `tile_references` keys) with the new [`TilePalette`] under
 /// `tile_palette`, and gives every layer doc a `tilemap: null` / `locked:
 /// false`. **Documented data loss:** old tile data is dropped (the old model
-/// is incompatible with the tilemap model).
+/// is incompatible with the tilemap model). v6 → v7 is an identity step: tile
+/// pixels moved from inline JSON into `tiles/<id>.png` (a storage change with
+/// no data transformation), and `SequenceDoc.delay_multiplier` became a
+/// serde-defaulted field. v7 → v8 fans the numeric `tile_size` (document and
+/// each layer's tilemap) out to the per-axis `{ "w": n, "h": n }` object.
 pub fn migrate_document(
     mut value: serde_json::Value,
     from: u32,
@@ -445,6 +695,39 @@ pub fn migrate_document(
                                     layer_obj
                                         .insert("locked".to_string(), serde_json::json!(false));
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            // v6 -> v7: tile pixels moved out of `manifest.json` into
+            // `tiles/<id>.png`. This is a STORAGE change only — no data
+            // transformation is needed: a v6 manifest still carries its tile
+            // `pixels` inline (read back by `Tile.pixels`' `serde(default)`),
+            // and a v7 manifest omits them and loads them from the PNGs.
+            // (`SequenceDoc.delay_multiplier` also became a serde-defaulted
+            // field, so older manifests without it still deserialize.)
+            6 => {}
+            // v7 -> v8: `tile_size` became PER-AXIS (`TileSize { w, h }`). A v7
+            // manifest stores it as a single NUMBER on the document and on each
+            // layer's tilemap; fan the number out to `{ "w": n, "h": n }` so old
+            // square-tile files load losslessly.
+            7 => {
+                fn number_to_tile_size(v: &mut serde_json::Value) {
+                    if let Some(n) = v.as_u64() {
+                        let n = n.max(1);
+                        *v = serde_json::json!({ "w": n, "h": n });
+                    }
+                }
+                if let Some(obj) = value.as_object_mut() {
+                    if let Some(ts) = obj.get_mut("tile_size") {
+                        number_to_tile_size(ts);
+                    }
+                    if let Some(layers) = obj.get_mut("layers").and_then(|v| v.as_array_mut()) {
+                        for layer in layers {
+                            if let Some(ts) = layer.get_mut("tilemap").and_then(|tm| tm.get_mut("tile_size"))
+                            {
+                                number_to_tile_size(ts);
                             }
                         }
                     }
@@ -527,11 +810,14 @@ pub struct GifFrameInput {
     pub delay_ms: u32,
 }
 
-/// Errors produced by the GIF encoder.
+/// Errors produced by the GIF encoder ([`encode_gif`]) and decoder
+/// ([`decode_gif`]).
 #[derive(Debug)]
 pub enum GifError {
     Io(std::io::Error),
     Encode(String),
+    /// GIF decoding failed (malformed data, empty animation, zero frame size).
+    Decode(String),
     FrameMismatch(String),
 }
 
@@ -540,6 +826,7 @@ impl fmt::Display for GifError {
         match self {
             GifError::Io(e) => write!(f, "gif io error: {e}"),
             GifError::Encode(msg) => write!(f, "gif encode error: {msg}"),
+            GifError::Decode(msg) => write!(f, "gif decode error: {msg}"),
             GifError::FrameMismatch(msg) => write!(f, "gif frame mismatch: {msg}"),
         }
     }
@@ -626,13 +913,71 @@ pub fn encode_gif(frames: &[GifFrameInput]) -> Result<Vec<u8>, GifError> {
     Ok(out)
 }
 
+/// One decoded GIF animation frame (Import GIF, P1): full-canvas RGBA8 pixels
+/// plus the frame's display delay.
+pub struct GifFrameData {
+    pub rgba: Vec<u8>,
+    pub delay_ms: u32,
+}
+
+/// A decoded GIF animation (Import GIF, P1): the shared canvas size and every
+/// frame's composited pixels.
+pub struct GifDecode {
+    pub frame_w: u32,
+    pub frame_h: u32,
+    pub frames: Vec<GifFrameData>,
+}
+
+/// Decodes a GIF animation into full-canvas RGBA8 frames (Import GIF, P1).
+///
+/// Uses `image`'s GIF codec (`GifDecoder` + [`AnimationDecoder::into_frames`],
+/// the same codec family as the `gif`-based [`encode_gif`]). The library
+/// returns every frame fully COMPOSITED at the logical screen size — disposal
+/// and transparency included — so `frame.left()/top()` are ignored: each
+/// `rgba` is exactly `frame_w × frame_h × 4`. `delay` is converted from the
+/// GIF centisecond time unit to milliseconds. An empty animation (and a
+/// zero-sized canvas) is an error.
+pub fn decode_gif(bytes: &[u8]) -> Result<GifDecode, GifError> {
+    let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+        .map_err(|e| GifError::Decode(format!("gif decode error: {e}")))?;
+    let (frame_w, frame_h) = decoder.dimensions();
+    if frame_w == 0 || frame_h == 0 {
+        return Err(GifError::Decode("gif frame size is zero".to_string()));
+    }
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|e| GifError::Decode(format!("gif decode error: {e}")))?;
+    if frames.is_empty() {
+        return Err(GifError::Decode("gif contains no frames".to_string()));
+    }
+
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let buffer = frame.buffer();
+        debug_assert_eq!(buffer.width(), frame_w);
+        debug_assert_eq!(buffer.height(), frame_h);
+        debug_assert_eq!(buffer.len(), frame_w as usize * frame_h as usize * 4);
+        let duration: std::time::Duration = frame.delay().into();
+        out.push(GifFrameData {
+            rgba: buffer.as_raw().clone(),
+            delay_ms: duration.as_millis() as u32,
+        });
+    }
+    Ok(GifDecode {
+        frame_w,
+        frame_h,
+        frames: out,
+    })
+}
+
 /// JSON metadata for a sprite-sheet export, mirroring the document's
 /// regions/frames/sequences so a game engine can slice the atlas.
 #[derive(Serialize)]
 struct SpriteSheetMeta {
     canvas_width: u32,
     canvas_height: u32,
-    tile_size: u32,
+    tile_size: TileSize,
     regions: Vec<RegionMeta>,
     frames: Vec<FrameMeta>,
     sequences: Vec<SequenceMeta>,
@@ -660,6 +1005,10 @@ struct SequenceMeta {
     name: String,
     frame_ids: Vec<u64>,
     loop_flag: bool,
+    /// Delay multiplier in hundredths (`100` = 1.00×). Apply it to a referenced
+    /// frame's `delay_ms` to get the EFFECTIVE playback delay the editor and
+    /// GIF export use, so the atlas metadata agrees with them (S6).
+    delay_multiplier_centi: u32,
     tags: Vec<String>,
 }
 
@@ -699,6 +1048,7 @@ pub fn sprite_sheet_meta_json(doc: &Document) -> Result<Vec<u8>, serde_json::Err
                 name: s.name.clone(),
                 frame_ids: s.frame_ids.clone(),
                 loop_flag: s.loop_flag,
+                delay_multiplier_centi: s.delay_multiplier,
                 tags: s.tags.clone(),
             })
             .collect(),
@@ -730,7 +1080,7 @@ mod tests {
     use crate::core::document::{EditorSettings, FrameDoc, LayerDoc, RegionDoc, SequenceDoc};
     use crate::core::math::Rect2i;
     use crate::core::model::BlendMode;
-    use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette};
+    use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette, TileSize};
 
     struct TempDir(std::path::PathBuf);
 
@@ -771,7 +1121,7 @@ mod tests {
         Document {
             canvas_width: 4,
             canvas_height: 4,
-            tile_size: 16,
+            tile_size: TileSize::square(16),
             layers: vec![
                 LayerDoc {
                     id: 1,
@@ -840,6 +1190,7 @@ mod tests {
                 name: "walk".to_string(),
                 frame_ids: vec![0, 1],
                 loop_flag: true,
+                delay_multiplier: 100,
                 tags: vec!["loop".to_string()],
             }],
             palette: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
@@ -1186,7 +1537,7 @@ mod tests {
         doc.regions.clear();
         doc.frames.clear();
         doc.sequences.clear();
-        let mut map = TileMap::new(4, 2, 2);
+        let mut map = TileMap::new(TileSize::square(4), 2, 2);
         map.set_cell(
             (1, 0),
             Some(TileCell {
@@ -1203,6 +1554,209 @@ mod tests {
         assert_eq!(loaded.layers[0].tilemap, doc.layers[0].tilemap);
         assert!(loaded.layers[0].locked);
         assert_eq!(loaded, doc);
+    }
+
+    #[test]
+    fn save_writes_tile_pngs_and_keeps_manifest_small() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.truncate(1);
+        doc.regions.clear();
+        doc.frames.clear();
+        doc.sequences.clear();
+        // 100 tiles of 16x16 = 100 * 1024 bytes of raw pixels.
+        let mut palette = TilePalette::new();
+        for i in 1..=100u64 {
+            palette.add(Tile {
+                id: TileId(i),
+                w: 16,
+                h: 16,
+                pixels: vec![i as u8; 16 * 16 * 4],
+            });
+        }
+        doc.tile_palette = palette;
+        save_document(&doc, dir.path()).unwrap();
+
+        // Every tile got its own PNG under tiles/.
+        for i in 1..=100u64 {
+            let png = dir.path().join("tiles").join(format!("{i}.png"));
+            assert!(png.exists(), "tiles/{i}.png must be written");
+        }
+        // The manifest no longer embeds the tile pixel arrays and stays small.
+        let manifest = fs::read_to_string(dir.path().join("manifest.json")).unwrap();
+        assert!(
+            !manifest.contains("\"pixels\""),
+            "the manifest must not embed tile pixels"
+        );
+        let raw_tile_bytes = 100 * 16 * 16 * 4;
+        assert!(
+            manifest.len() < raw_tile_bytes / 10,
+            "manifest ({} bytes) must be far below the raw tile bytes ({raw_tile_bytes})",
+            manifest.len()
+        );
+
+        // Round-trip is byte-exact.
+        let loaded = load_document(dir.path()).unwrap();
+        assert_eq!(loaded.tile_palette, doc.tile_palette);
+    }
+
+    #[test]
+    fn legacy_v6_manifest_with_inline_tile_pixels_still_loads() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.truncate(1);
+        doc.regions.clear();
+        doc.frames.clear();
+        doc.sequences.clear();
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 1,
+            pixels: vec![7u8; 2 * 1 * 4],
+        });
+        doc.tile_palette = palette;
+
+        // Simulate a PRE-v7 manifest: format_version 6 AND the inline `pixels`
+        // array that `skip_serializing` now omits.
+        let mut value = serde_json::to_value(&doc).unwrap();
+        value["format_version"] = serde_json::json!(6);
+        value["tile_palette"]["tiles"][0]["pixels"] = serde_json::json!(vec![7u8; 2 * 1 * 4]);
+
+        fs::create_dir_all(dir.path().join("layers")).unwrap();
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("layers").join("1.png"),
+            encode_png(4, 4, &doc.layers[0].pixels).unwrap(),
+        )
+        .unwrap();
+        // NOTE: no `tiles/` directory — the pixels must come from the manifest.
+
+        let loaded = load_document(dir.path()).unwrap();
+        assert_eq!(
+            loaded.tile_palette.tiles[0].pixels,
+            vec![7u8; 2 * 1 * 4],
+            "embedded v6 pixels must be used as-is"
+        );
+        assert_eq!(loaded.tile_palette, doc.tile_palette);
+    }
+
+    #[test]
+    fn missing_tile_png_is_an_error() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.truncate(1);
+        doc.regions.clear();
+        doc.frames.clear();
+        doc.sequences.clear();
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 2,
+            pixels: vec![3u8; 2 * 2 * 4],
+        });
+        doc.tile_palette = palette;
+        save_document(&doc, dir.path()).unwrap();
+
+        fs::remove_file(dir.path().join("tiles").join("1.png")).unwrap();
+        let err = load_document(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::MissingLayer(ref m) if m.contains("tile 1")),
+            "a missing tile PNG must error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tile_png_size_mismatch_is_an_error() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.truncate(1);
+        doc.regions.clear();
+        doc.frames.clear();
+        doc.sequences.clear();
+        let mut palette = TilePalette::new();
+        palette.add(Tile {
+            id: TileId(1),
+            w: 2,
+            h: 2,
+            pixels: vec![3u8; 2 * 2 * 4],
+        });
+        doc.tile_palette = palette;
+        save_document(&doc, dir.path()).unwrap();
+
+        // Overwrite with a 3x3 PNG (wrong size for a 2x2 tile).
+        fs::write(
+            dir.path().join("tiles").join("1.png"),
+            encode_png(3, 3, &[0u8; 3 * 3 * 4]).unwrap(),
+        )
+        .unwrap();
+        let err = load_document(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::SizeMismatch(ref m) if m.contains("tile 1")),
+            "a tile PNG size mismatch must error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn format_version_is_eight() {
+        assert_eq!(FORMAT_VERSION, 8);
+    }
+
+    #[test]
+    fn migrate_document_v7_fans_tile_size_to_per_axis() {
+        // A v7 manifest stores `tile_size` as a single NUMBER, both on the
+        // document and on each layer's tilemap. v7 -> v8 must fan each number
+        // out to `{ "w": n, "h": n }` (lossless for the old square tiles).
+        let value = serde_json::json!({
+            "format_version": 7,
+            "canvas_width": 32,
+            "canvas_height": 32,
+            "tile_size": 16,
+            "layers": [
+                {"id": 1, "name": "base", "visible": true, "opacity": 1.0,
+                 "blend": "Normal", "is_group": false, "parent": null,
+                 "tilemap": {"tile_size": 8, "cols": 4, "rows": 4,
+                             "cells": [null, null, null, null, null, null, null, null,
+                                       null, null, null, null, null, null, null, null]}},
+                {"id": 2, "name": "no map", "visible": true, "opacity": 1.0,
+                 "blend": "Normal", "is_group": false, "parent": null,
+                 "tilemap": null}
+            ],
+            "regions": [], "frames": [], "sequences": [], "palette": [],
+            "tile_palette": {"tiles": [], "selected": null},
+            "editor": {"autosave_interval_min": 5}
+        });
+        let migrated = migrate_document(value, 7).unwrap();
+        assert_eq!(
+            migrated["tile_size"],
+            serde_json::json!({"w": 16, "h": 16})
+        );
+        assert_eq!(
+            migrated["layers"][0]["tilemap"]["tile_size"],
+            serde_json::json!({"w": 8, "h": 8})
+        );
+        // A null tilemap stays null.
+        assert!(migrated["layers"][1]["tilemap"].is_null());
+
+        // The fanned-out document `tile_size` deserializes into the per-axis
+        // type (the full disk-load path is covered by `v5_manifest_loads_end_to_end`,
+        // which now runs the v7 -> v8 step too).
+        let ts: TileSize = serde_json::from_value(migrated["tile_size"].clone()).unwrap();
+        assert_eq!(ts, TileSize::square(16));
+    }
+
+    #[test]
+    fn migrate_document_v6_is_identity() {
+        let mut value = serde_json::to_value(sample_document()).unwrap();
+        value["format_version"] = serde_json::json!(6);
+        let before = value.clone();
+        let migrated = migrate_document(value, 6).unwrap();
+        assert_eq!(migrated, before, "v6 -> v7 must not transform the data");
     }
 
     #[test]
@@ -1527,13 +2081,69 @@ mod tests {
     }
 
     #[test]
+    fn decode_gif_roundtrips_encoded_animation() {
+        // Encode a 2x2, 3-frame animation with the in-house encoder, then
+        // decode it back: the GIF centisecond delay unit converts to the
+        // original millisecond values, and every frame is full-canvas RGBA8.
+        let frames = vec![
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: rgba_fixture(2, 2, 1),
+                delay_ms: 100,
+            },
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: rgba_fixture(2, 2, 2),
+                delay_ms: 200,
+            },
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: rgba_fixture(2, 2, 3),
+                delay_ms: 300,
+            },
+        ];
+        let bytes = encode_gif(&frames).unwrap();
+        let decoded = decode_gif(&bytes).unwrap();
+
+        assert_eq!((decoded.frame_w, decoded.frame_h), (2, 2));
+        assert_eq!(decoded.frames.len(), 3);
+        for (index, frame) in decoded.frames.iter().enumerate() {
+            assert_eq!(frame.rgba.len(), 2 * 2 * 4, "frame {index} must be full canvas");
+            assert_eq!(frame.delay_ms, frames[index].delay_ms);
+        }
+    }
+
+    #[test]
+    fn decode_gif_rejects_garbage_and_empty_animations() {
+        // Not a GIF at all.
+        assert!(matches!(
+            decode_gif(b"this is not a gif"),
+            Err(GifError::Decode(_))
+        ));
+        // A single-frame GIF encodes, slices to zero frames -> empty decode
+        // must still error for the empty-frames case.
+        let gif = encode_gif(&[GifFrameInput {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 2 * 2 * 4],
+            delay_ms: 100,
+        }])
+        .unwrap();
+        assert!(decode_gif(&gif).is_ok());
+        assert!(decode_gif(&[]).is_err());
+    }
+
+    #[test]
     fn sprite_sheet_meta_json_roundtrip() {
         let doc = sample_document();
         let json = sprite_sheet_meta_json(&doc).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(value["canvas_width"], serde_json::json!(4));
         assert_eq!(value["canvas_height"], serde_json::json!(4));
-        assert_eq!(value["tile_size"], serde_json::json!(16));
+        assert_eq!(value["tile_size"], serde_json::json!({"w": 16, "h": 16}));
         let regions = value["regions"].as_array().unwrap();
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0]["id"], serde_json::json!(10));
@@ -1555,6 +2165,50 @@ mod tests {
         assert_eq!(sequences[0]["frame_ids"], serde_json::json!([0, 1]));
         assert_eq!(sequences[0]["loop_flag"], serde_json::json!(true));
         assert_eq!(sequences[0]["tags"], serde_json::json!(["loop"]));
+    }
+
+    #[test]
+    fn sprite_sheet_meta_exports_multiplier_matching_effective_delays() {
+        // S6: the atlas metadata must expose the sequence delay multiplier so a
+        // consumer can reproduce the SAME effective playback delay the runtime
+        // (`effective_delay_ms`) and GIF export use.
+        use crate::core::model::{AnimationSequence, Frame, Region};
+
+        let mut doc = sample_document();
+        doc.sequences[0].delay_multiplier = 250; // 2.50×
+        let json = sprite_sheet_meta_json(&doc).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+
+        let sequences = value["sequences"].as_array().unwrap();
+        let multiplier = sequences[0]["delay_multiplier_centi"].as_u64().unwrap();
+        assert_eq!(multiplier, 250, "the multiplier is exported");
+
+        // Rebuild the equivalent sequence from the exported raw delays and
+        // assert the metadata-derived effective delay equals the runtime's.
+        let raw: Vec<u32> = value["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|frame| frame["delay_ms"].as_u64().unwrap() as u32)
+            .collect();
+        let mut sequence = AnimationSequence::new("walk");
+        sequence.set_delay_multiplier_centi(multiplier as u32);
+        for (index, delay) in raw.iter().enumerate() {
+            sequence.push(Frame::new(
+                Region::new(Rect2i::new(0, 0, 1, 1), format!("f{index}")),
+                *delay,
+            ));
+        }
+        for (index, delay) in raw.iter().enumerate() {
+            let from_metadata = (u64::from(*delay) * multiplier + 50) / 100;
+            assert_eq!(
+                from_metadata.min(60_000) as u32,
+                sequence.effective_delay_ms(index),
+                "exported metadata must agree with effective_delay_ms for frame {index}"
+            );
+        }
+        assert_eq!(sequence.effective_delay_ms(0), 250); // 100 × 2.50
+        assert_eq!(sequence.effective_delay_ms(1), 500); // 200 × 2.50
     }
 
     #[test]
@@ -1653,5 +2307,278 @@ mod tests {
         let asset: crate::input::Keymap =
             serde_json::from_str(include_str!("../assets/keybindings.json")).unwrap();
         assert_eq!(crate::input::Keymap::defaults(), asset);
+    }
+
+    // -----------------------------------------------------------------------
+    // D80 single-file form
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn single_file_roundtrip_equals_directory_roundtrip() {
+        let dir = TempDir::new();
+        let doc = sample_document();
+        save_document(&doc, dir.path()).unwrap();
+        let from_dir = load_document(dir.path()).unwrap();
+        assert_eq!(from_dir, doc);
+
+        let file = dir.path().join("project.pyxross");
+        save_document_file(&doc, &file).unwrap();
+        let from_file = load_document(&file).unwrap();
+        assert_eq!(from_file, doc);
+        assert_eq!(from_file, from_dir, "both forms must load identically");
+    }
+
+    #[test]
+    fn single_file_empty_project_roundtrip() {
+        let dir = TempDir::new();
+        let doc = Document {
+            canvas_width: 0,
+            canvas_height: 0,
+            ..Document::default()
+        };
+        let file = dir.path().join("empty.pyxross");
+        save_document_file(&doc, &file).unwrap();
+        assert_eq!(load_document(&file).unwrap(), doc);
+    }
+
+    #[test]
+    fn single_file_group_layers_are_omitted() {
+        let dir = TempDir::new();
+        let mut doc = sample_document();
+        doc.layers.insert(
+            1,
+            LayerDoc {
+                id: 99,
+                name: "Group".to_string(),
+                visible: true,
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                parent: None,
+                is_group: true,
+                tilemap: None,
+                locked: false,
+                pixels: Vec::new(),
+            },
+        );
+        let file = dir.path().join("groups.pyxross");
+        save_document_file(&doc, &file).unwrap();
+        let entries = crate::core::archive::unpack(&fs::read(&file).unwrap()).unwrap();
+        assert!(
+            entries.iter().all(|(name, _)| name != "layers/99.png"),
+            "a group layer must not be packed"
+        );
+        assert_eq!(load_document(&file).unwrap(), doc);
+    }
+
+    #[test]
+    fn single_file_overwrite_existing_and_leaves_no_tmp() {
+        let dir = TempDir::new();
+        let file = dir.path().join("overwrite.pyxross");
+        fs::write(&file, b"old contents unrelated to pyxross").unwrap();
+        save_document_file(&sample_document(), &file).unwrap();
+        assert_eq!(load_document(&file).unwrap(), sample_document());
+        // The temp sibling must be gone after a successful save.
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp files may remain: {leftovers:?}");
+    }
+
+    #[test]
+    fn single_file_garbage_is_rejected_as_not_pyxross() {
+        let dir = TempDir::new();
+        let garbage = dir.path().join("garbage.pyxross");
+        fs::write(&garbage, b"this is not a zip file at all").unwrap();
+        assert!(matches!(
+            load_document(&garbage),
+            Err(PersistenceError::NotPyxrossFile(_))
+        ));
+
+        let empty = dir.path().join("empty.pyxross");
+        fs::write(&empty, b"").unwrap();
+        assert!(matches!(
+            load_document(&empty),
+            Err(PersistenceError::NotPyxrossFile(_))
+        ));
+    }
+
+    #[test]
+    fn single_file_truncated_archive_is_an_error() {
+        let dir = TempDir::new();
+        let file = dir.path().join("cut.pyxross");
+        save_document_file(&sample_document(), &file).unwrap();
+        let bytes = fs::read(&file).unwrap();
+        fs::write(&file, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(matches!(
+            load_document(&file),
+            Err(PersistenceError::Archive(_))
+        ));
+    }
+
+    #[test]
+    fn single_file_corrupt_manifest_reports_crc() {
+        let dir = TempDir::new();
+        let doc = sample_document();
+        let file = dir.path().join("crc.pyxross");
+        save_document_file(&doc, &file).unwrap();
+        let mut bytes = fs::read(&file).unwrap();
+
+        // Locate the manifest payload: entries are laid out back-to-back as
+        // LFH(30) + name + data and the manifest is the LAST entry.
+        let layout = document_entries(&doc).unwrap();
+        let mut offset = 0usize;
+        for (name, data) in &layout {
+            if name == "manifest.json" {
+                break; // `offset` now points at the manifest's local header
+            }
+            offset += 30 + name.len() + data.len();
+        }
+        let data_start = offset + 30 + "manifest.json".len();
+        bytes[data_start] ^= 0x01;
+        fs::write(&file, bytes).unwrap();
+
+        let err = load_document(&file).unwrap_err();
+        match err {
+            PersistenceError::Archive(msg) => {
+                assert!(msg.contains("CRC-32"), "message should identify the CRC: {msg}")
+            }
+            other => panic!("expected Archive error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_file_missing_manifest_is_not_pyxross() {
+        let dir = TempDir::new();
+        let file = dir.path().join("nomanifest.pyxross");
+        let png = encode_png(4, 4, &[0u8; 4 * 4 * 4]).unwrap();
+        let zip = crate::core::archive::pack(&[("layers/1.png", png.as_slice())]).unwrap();
+        fs::write(&file, zip).unwrap();
+        let err = load_document(&file).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::NotPyxrossFile(_)),
+            "a valid archive without a manifest is not a pyxross file, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn single_file_ignores_unknown_entries() {
+        let dir = TempDir::new();
+        let doc = sample_document();
+        let entries = document_entries(&doc).unwrap();
+        let mut slice: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        slice.push(("readme.txt", b"hello extra"));
+        slice.push(("thumbs/1.png", b"ignored"));
+        let zip = crate::core::archive::pack(&slice).unwrap();
+        let file = dir.path().join("extra.pyxross");
+        fs::write(&file, zip).unwrap();
+        assert_eq!(load_document(&file).unwrap(), doc);
+    }
+
+    #[test]
+    fn single_file_missing_layer_png_is_an_error() {
+        let dir = TempDir::new();
+        let doc = sample_document();
+        let mut entries = document_entries(&doc).unwrap();
+        entries.retain(|(name, _)| name != "layers/1.png");
+        let slice: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let zip = crate::core::archive::pack(&slice).unwrap();
+        let file = dir.path().join("missing-layer.pyxross");
+        fs::write(&file, zip).unwrap();
+        let err = load_document(&file).unwrap_err();
+        match err {
+            PersistenceError::MissingLayer(msg) => {
+                assert!(
+                    msg.contains("layer 1") && msg.contains("not found"),
+                    "message should name the layer and the missing entry: {msg}"
+                );
+            }
+            other => panic!("expected MissingLayer, got {other:?}"),
+        }
+    }
+
+    /// Hand-built single-entry STORED ZIP with the given raw name, bypassing
+    /// `pack`'s name validation (CRC left 0 — name checks run first).
+    fn raw_stored_zip(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Local file header (30 bytes).
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+        let cd_offset = out.len() as u32;
+        // Central directory header (46 bytes).
+        out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        out.extend_from_slice(name);
+        let cd_size = out.len() as u32 - cd_offset;
+        // End of central directory (22 bytes).
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn single_file_traversal_entry_names_are_rejected() {
+        let dir = TempDir::new();
+        let file = dir.path().join("evil.pyxross");
+        fs::write(&file, raw_stored_zip(b"../evil.png", b"payload")).unwrap();
+        let err = load_document(&file).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::Archive(_)),
+            "an unsafe entry name must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn save_document_file_wrong_buffer_fails_without_creating_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("bad.pyxross");
+        let mut doc = sample_document();
+        doc.layers[0].pixels.truncate(4 * 4 * 4 - 1);
+        let err = save_document_file(&doc, &file).unwrap_err();
+        assert!(matches!(err, PersistenceError::SizeMismatch(_)));
+        assert!(
+            !file.exists(),
+            "no file may be created when validation fails"
+        );
     }
 }

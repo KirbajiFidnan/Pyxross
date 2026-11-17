@@ -4,15 +4,18 @@
 //! winit, or any UI crate. Enforced by `scripts/check-core-purity.sh`.
 
 pub mod anim;
+pub mod archive;
 pub mod brush;
 pub mod buffer;
 pub mod camera;
+pub mod canvas_resize;
 pub mod clip;
 pub mod clipboard;
 pub mod color;
 pub mod document;
 pub mod fill;
 pub mod group_commands;
+pub mod import;
 pub mod layer_commands;
 pub mod math;
 pub mod merge;

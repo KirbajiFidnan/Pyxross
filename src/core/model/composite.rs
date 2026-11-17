@@ -323,7 +323,7 @@ mod tests {
     use super::*;
     use crate::core::color::Color;
     use crate::core::model::LayerId;
-    use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette};
+    use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette, TileSize};
 
     fn solid(width: usize, height: usize, color: Color) -> PixelBuffer {
         let mut buffer = PixelBuffer::new(width, height);
@@ -581,7 +581,7 @@ mod tests {
     fn tilemap_layer(
         stack: &mut LayerStack,
         name: &str,
-        tile_size: u32,
+        tile_size: TileSize,
         cells: &[(u32, u32, TileCell)],
     ) -> LayerId {
         let id = stack.add_layer(name);
@@ -606,7 +606,7 @@ mod tests {
             .fill(Color::rgb(0, 255, 0));
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
-        tilemap_layer(&mut stack, "tiles", 4, &[(0, 0, TileCell::new(TileId(1)))]);
+        tilemap_layer(&mut stack, "tiles", TileSize::square(4), &[(0, 0, TileCell::new(TileId(1)))]);
 
         let out = stack.composite_layers(&palette);
         // Cell (0,0) at (0,0): an opaque red 2x2 overwrites the green bottom.
@@ -629,7 +629,7 @@ mod tests {
             .fill(Color::rgb(0, 0, 255));
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
-        let id = tilemap_layer(&mut stack, "tiles", 4, &[(0, 0, TileCell::new(TileId(1)))]);
+        let id = tilemap_layer(&mut stack, "tiles", TileSize::square(4), &[(0, 0, TileCell::new(TileId(1)))]);
         stack.set_opacity(id, 0.5);
 
         let out = stack.composite_layers(&palette);
@@ -651,9 +651,9 @@ mod tests {
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
 
-        let hidden = tilemap_layer(&mut stack, "hidden", 4, &[(0, 0, TileCell::new(TileId(1)))]);
+        let hidden = tilemap_layer(&mut stack, "hidden", TileSize::square(4), &[(0, 0, TileCell::new(TileId(1)))]);
         stack.set_visible(hidden, false);
-        let locked = tilemap_layer(&mut stack, "locked", 4, &[(1, 0, TileCell::new(TileId(1)))]);
+        let locked = tilemap_layer(&mut stack, "locked", TileSize::square(4), &[(1, 0, TileCell::new(TileId(1)))]);
         stack.layer_mut(locked).unwrap().locked = true;
 
         let out = stack.composite_layers(&palette);
@@ -692,7 +692,7 @@ mod tests {
             flip_x: true,
             flip_y: false,
         };
-        tilemap_layer(&mut stack, "tiles", 4, &[(0, 0, rotated), (1, 0, flipped)]);
+        tilemap_layer(&mut stack, "tiles", TileSize::square(4), &[(0, 0, rotated), (1, 0, flipped)]);
 
         let out = stack.composite_layers(&palette);
         assert_eq!(out.get_pixel(0, 0), Some(Color::rgba(255, 0, 0, 255)));
@@ -708,7 +708,7 @@ mod tests {
         let mut stack = LayerStack::new(8, 8);
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
-        let id = tilemap_layer(&mut stack, "tiles", 4, &[(0, 0, TileCell::new(TileId(1)))]);
+        let id = tilemap_layer(&mut stack, "tiles", TileSize::square(4), &[(0, 0, TileCell::new(TileId(1)))]);
         let first = stack.composite_layers(&palette);
         assert_eq!(first.get_pixel(0, 0), Some(Color::rgba(255, 0, 0, 255)));
 
@@ -764,7 +764,7 @@ mod tests {
         let mut stack = LayerStack::new(8, 8);
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
-        let id = tilemap_layer(&mut stack, "tiles", 4, &[(0, 0, TileCell::new(TileId(1)))]);
+        let id = tilemap_layer(&mut stack, "tiles", TileSize::square(4), &[(0, 0, TileCell::new(TileId(1)))]);
         stack.composite_layers(&palette);
         assert!(stack.layer(id).unwrap().tilemap_cache.borrow().is_some());
 
@@ -801,7 +801,7 @@ mod tests {
         let first = tilemap_layer(
             &mut stack,
             "first instances",
-            4,
+            TileSize::square(4),
             &[
                 (0, 0, TileCell::new(TileId(1))),
                 (
@@ -818,7 +818,7 @@ mod tests {
         );
         let mut rotated = TileCell::new(TileId(1));
         rotated.set_rotation(1);
-        let second = tilemap_layer(&mut stack, "rotated instance", 4, &[(2, 0, rotated)]);
+        let second = tilemap_layer(&mut stack, "rotated instance", TileSize::square(4), &[(2, 0, rotated)]);
         let group = stack
             .create_group_around(&[first, second], "Tile preview group")
             .unwrap();
@@ -828,7 +828,7 @@ mod tests {
         let hidden = tilemap_layer(
             &mut stack,
             "hidden instance",
-            4,
+            TileSize::square(4),
             &[(3, 0, TileCell::new(TileId(1)))],
         );
         stack.set_visible(hidden, false);
@@ -898,11 +898,11 @@ mod tests {
             .fill(Color::rgb(0, 255, 0));
         let mut palette = TilePalette::new();
         palette.add(solid_tile(0, 2, 2, [255, 0, 0, 255]));
-        let id = tilemap_layer(&mut stack, "tiles", 4, &[(1, 1, TileCell::new(TileId(1)))]);
+        let id = tilemap_layer(&mut stack, "tiles", TileSize::square(4), &[(1, 1, TileCell::new(TileId(1)))]);
         stack.layer_mut(id).unwrap().tilemap = None;
         // Re-attach the tilemap AFTER the dirty cells accumulated so the
         // dirty region is observable on the layer's tilemap.
-        let mut tm = TileMap::new(4, 8, 8);
+        let mut tm = TileMap::new(TileSize::square(4), 8, 8);
         tm.set_cell((1, 1), Some(TileCell::new(TileId(1))));
         stack.layer_mut(id).unwrap().tilemap = Some(tm);
 

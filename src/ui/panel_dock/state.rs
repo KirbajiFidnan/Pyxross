@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn left_dock_placement_maps_to_left_side() {
-        let mut manager = DockManager::demo();
+        let mut manager = DockManager::demo_with_dummies();
         manager
             .transition_panel(PanelId::new(3), PanelPlacement::DockedLeft)
             .unwrap();

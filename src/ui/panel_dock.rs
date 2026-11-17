@@ -1,5 +1,6 @@
 mod demo;
 mod geometry;
+pub mod animation_preview;
 pub mod nest;
 pub mod preview;
 pub mod skin;

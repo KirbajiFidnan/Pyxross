@@ -122,42 +122,55 @@ impl Component for StaticOverlay {
 }
 
 impl DockManager {
+    /// The production demo dock: ONLY the id-1 "Preview" panel plus the App's
+    /// own specs. Dummy panels B/C/D (ids 2/3/4) were removed.
     pub fn demo() -> Self {
+        Self::from_demo_specs(false)
+    }
+
+    /// Test-only dock that also registers the legacy dummy panels B/C/D, so the
+    /// low-level dock geometry/z-order tests keep a multi-panel fixture.
+    #[cfg(test)]
+    pub(crate) fn demo_with_dummies() -> Self {
+        Self::from_demo_specs(true)
+    }
+
+    fn from_demo_specs(include_dummies: bool) -> Self {
         let preview = PreviewFeed::default();
-        let specs = [
-            demo_spec(
-                1,
-                "Preview",
-                true,
-                PanelPlacement::DockedRight,
-                pos2(40.0, 80.0),
-                &preview,
-            ),
-            demo_spec(
+        let mut specs = vec![demo_spec(
+            1,
+            "Preview",
+            true,
+            PanelPlacement::DockedRight,
+            pos2(40.0, 80.0),
+            &preview,
+        )];
+        if include_dummies {
+            specs.push(demo_spec(
                 2,
                 "Panel B",
                 false,
                 PanelPlacement::DockedRight,
                 pos2(220.0, 140.0),
                 &preview,
-            ),
-            demo_spec(
+            ));
+            specs.push(demo_spec(
                 4,
                 "Panel D",
                 true,
                 PanelPlacement::DockedRight,
                 pos2(400.0, 200.0),
                 &preview,
-            ),
-            demo_spec(
+            ));
+            specs.push(demo_spec(
                 3,
                 "Panel C",
                 false,
                 PanelPlacement::DockedBottom,
                 pos2(160.0, 360.0),
                 &preview,
-            ),
-        ];
+            ));
+        }
         match Self::try_new(specs) {
             Ok(mut manager) => {
                 manager.preview_feed = preview;

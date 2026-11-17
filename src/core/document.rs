@@ -32,14 +32,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::model::BlendMode;
-use crate::core::tilemap::{TileMap, TilePalette};
+use crate::core::tilemap::{TileMap, TilePalette, TileSize};
 
 /// Current on-disk format version of the `.pyxross` save format.
 ///
 /// Bump this when the manifest structure changes incompatibly, and add a
 /// stepwise migration in [`crate::io::migrate_document`] for the previous
 /// version. Loaders reject manifests saved by a newer version.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// A complete `.pyxross` project: canvas, layers, regions, frames,
 /// sequences, palette, and editor settings.
@@ -53,8 +53,8 @@ pub struct Document {
     pub canvas_width: u32,
     /// Canvas height in pixels.
     pub canvas_height: u32,
-    /// Tile size in pixels (the grid snap unit).
-    pub tile_size: u32,
+    /// Tile size in pixels (the grid snap unit), per axis.
+    pub tile_size: TileSize,
     /// Layers, bottom-to-top (index 0 is the bottom layer).
     pub layers: Vec<LayerDoc>,
     /// Named rectangular windows into the sheet.
@@ -159,8 +159,18 @@ pub struct SequenceDoc {
     pub frame_ids: Vec<u64>,
     /// Whether the sequence loops back to the first frame.
     pub loop_flag: bool,
+    /// Delay multiplier in hundredths (`100` = 1.00×). Stored as an integer so
+    /// `SequenceDoc` can keep deriving `Eq`. Defaults to `100` when absent so
+    /// manifests saved before this field load unchanged.
+    #[serde(default = "delay_multiplier_default")]
+    pub delay_multiplier: u32,
     /// Free-form tags (e.g. "idle", "attack").
     pub tags: Vec<String>,
+}
+
+/// Serde default for [`SequenceDoc::delay_multiplier`]: 1.00×.
+pub fn delay_multiplier_default() -> u32 {
+    100
 }
 
 /// Editor preferences persisted with the document.
@@ -175,5 +185,25 @@ impl Default for EditorSettings {
         Self {
             autosave_interval_min: 5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_doc_missing_delay_multiplier_defaults_to_100() {
+        // JSON with no `delay_multiplier` key (as written by older versions).
+        let json = r#"{
+            "name": "walk",
+            "frame_ids": [1, 2],
+            "loop_flag": true,
+            "tags": []
+        }"#;
+        let doc: SequenceDoc = serde_json::from_str(json).unwrap();
+        assert_eq!(doc.delay_multiplier, 100);
+        assert_eq!(doc.name, "walk");
+        assert!(doc.loop_flag);
     }
 }

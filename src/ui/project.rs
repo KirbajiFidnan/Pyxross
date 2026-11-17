@@ -22,10 +22,10 @@ use crate::core::math::Rect2i;
 use crate::core::model::frame::Frame;
 use crate::core::model::region::Region;
 use crate::core::model::sequence::AnimationSequence;
-use crate::core::model::{Layer, LayerId, LayerStack};
+use crate::core::model::{AnimationSet, Layer, LayerId, LayerStack};
 use crate::core::palette::Palette;
 use crate::core::select::{SelectMode, Selection};
-use crate::core::tilemap::TilePalette;
+use crate::core::tilemap::{TilePalette, TileSize};
 use crate::core::transform::{CurveTransform, TransformAlgorithm, TransformObject};
 use crate::core::undo::UndoStack;
 use crate::input::{Tool, ToolState};
@@ -95,7 +95,7 @@ impl Ownership {
         Self { category: "clipboard", owner: OwnerClass::ProjectLocal, fields: "clipboard, os_clipboard_available", close_policy: "discard with session" },
         Self { category: "active layer/frame", owner: OwnerClass::ProjectLocal, fields: "layers, animation", close_policy: "discard with session" },
         Self { category: "camera", owner: OwnerClass::ProjectLocal, fields: "camera", close_policy: "discard with session" },
-        Self { category: "animation/playback", owner: OwnerClass::ProjectLocal, fields: "sequence, animation", close_policy: "discard with session" },
+        Self { category: "animation/playback", owner: OwnerClass::ProjectLocal, fields: "animations, animation, onion_prev, onion_next", close_policy: "discard with session" },
         Self { category: "palette/colors", owner: OwnerClass::ProjectLocal, fields: "palettes, active_palette, color, secondary_color, tile_palette", close_policy: "discard with session" },
         Self { category: "tool/brush/grid", owner: OwnerClass::ProjectLocal, fields: "tool_state, pen_draw_settings, eraser_draw_settings, grid_visible", close_policy: "discard with session" },
         Self { category: "canvas texture", owner: OwnerClass::ProjectLocal, fields: "canvas_generation", close_policy: "discard with session" },
@@ -136,7 +136,7 @@ pub struct ProjectSession {
     pub id: ProjectId,
     pub name: String,
     pub path: Option<PathBuf>,
-    pub tile_size: u32,
+    pub tile_size: TileSize,
     pub layers: LayerStack,
     pub undo: UndoStack,
     pub camera: Camera,
@@ -149,8 +149,15 @@ pub struct ProjectSession {
     pub clipboard: Option<ClipboardRegion>,
     pub stroke: Option<crate::core::stroke_command::StrokeSession>,
     pub transform: Option<TransformSession>,
-    pub sequence: AnimationSequence,
+    /// All animations in this project; the active one is `animations.active()`.
+    /// The `sequence` field was replaced by the `sequence()`/`sequence_mut()`
+    /// accessors below, which forward to the active animation.
+    pub animations: AnimationSet,
     pub animation: AnimationController,
+    /// Onion-skin toggle for the previous frame.
+    pub onion_prev: bool,
+    /// Onion-skin toggle for the next frame.
+    pub onion_next: bool,
     pub palettes: Vec<Palette>,
     pub active_palette: usize,
     pub color: Color,
@@ -461,7 +468,7 @@ pub enum PendingAction {
         project: ProjectId,
         width: u32,
         height: u32,
-        tile: u32,
+        tile: TileSize,
     },
     Open {
         project: ProjectId,
@@ -508,6 +515,26 @@ impl<'a> ProjectFrameMut<'a> {
 }
 
 impl ProjectSession {
+    /// The ACTIVE animation sequence.
+    pub fn sequence(&self) -> &AnimationSequence {
+        self.animations.active_ref()
+    }
+
+    /// The ACTIVE animation sequence, mutably.
+    pub fn sequence_mut(&mut self) -> &mut AnimationSequence {
+        self.animations.active_mut()
+    }
+
+    /// Effective per-frame playback delays (ms) of the ACTIVE animation, with
+    /// the delay multiplier applied. This is the single source of truth shared
+    /// by on-screen playback and GIF export.
+    pub fn effective_frame_delays(&self) -> Vec<u32> {
+        let sequence = self.sequence();
+        (0..sequence.len())
+            .map(|index| sequence.effective_delay_ms(index))
+            .collect()
+    }
+
     pub fn to_document(&self) -> Document {
         let layers = self
             .layers
@@ -529,36 +556,41 @@ impl ProjectSession {
                 },
             })
             .collect();
-        let frames: Vec<crate::core::document::FrameDoc> = self
-            .sequence
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| crate::core::document::FrameDoc {
-                region_id: index as u64 + 1,
-                delay_ms: frame.delay_ms(),
-            })
-            .collect();
-        let regions = self
-            .sequence
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| {
+        // Region and frame ids come from ONE global monotonic allocator across
+        // ALL animations, so ids never collide between sequences. For a single
+        // animation this yields the same `index + 1` ids as before, keeping the
+        // existing round-trip tests byte-equivalent.
+        let mut next_region_id: u64 = 1;
+        let mut regions: Vec<crate::core::document::RegionDoc> = Vec::new();
+        let mut frames: Vec<crate::core::document::FrameDoc> = Vec::new();
+        let mut sequences: Vec<crate::core::document::SequenceDoc> = Vec::new();
+        for sequence in self.animations.iter() {
+            let mut frame_ids: Vec<u64> = Vec::with_capacity(sequence.len());
+            for frame in sequence.iter() {
                 let rect = frame.region().rect();
-                crate::core::document::RegionDoc {
-                    id: index as u64 + 1,
+                let region_id = next_region_id;
+                next_region_id += 1;
+                regions.push(crate::core::document::RegionDoc {
+                    id: region_id,
                     x: rect.x.max(0) as u32,
                     y: rect.y.max(0) as u32,
                     width: rect.w.max(0) as u32,
                     height: rect.h.max(0) as u32,
-                }
-            })
-            .collect();
-        let sequences = vec![crate::core::document::SequenceDoc {
-            name: self.sequence.name().to_string(),
-            frame_ids: (0..frames.len() as u64).collect(),
-            loop_flag: self.sequence.looping(),
-            tags: Vec::new(),
-        }];
+                });
+                frames.push(crate::core::document::FrameDoc {
+                    region_id,
+                    delay_ms: frame.delay_ms(),
+                });
+                frame_ids.push(region_id);
+            }
+            sequences.push(crate::core::document::SequenceDoc {
+                name: sequence.name().to_string(),
+                frame_ids,
+                loop_flag: sequence.looping(),
+                delay_multiplier: sequence.delay_multiplier_centi(),
+                tags: sequence.tags().to_vec(),
+            });
+        }
         Document {
             canvas_width: self.layers.width() as u32,
             canvas_height: self.layers.height() as u32,
@@ -576,6 +608,15 @@ impl ProjectSession {
         }
     }
 
+    /// Loads a [`Document`] into this session, replacing its layers,
+    /// animations and derived playback controller.
+    ///
+    /// **Deterministic skip (S3):** a sequence's `frame_id` that does not
+    /// resolve to a [`FrameDoc`] (or whose `region_id` does not resolve to a
+    /// [`RegionDoc`]) is SKIPPED, not fatal. The remaining frames keep their
+    /// order; there is no error and no partial frame is invented. This keeps a
+    /// manifest with stale references loadable and is covered by
+    /// `load_document_skips_unresolved_frames`.
     pub fn load_document(&mut self, doc: &Document) {
         let width = doc.canvas_width as usize;
         let height = doc.canvas_height as usize;
@@ -630,44 +671,84 @@ impl ProjectSession {
         }
         self.layers = layers;
 
-        let mut sequence = AnimationSequence::new(
-            doc.sequences
-                .first()
-                .map_or("Animation 1", |item| item.name.as_str()),
-        );
-        if let Some(sequence_doc) = doc.sequences.first() {
-            sequence.set_looping(sequence_doc.loop_flag);
-        }
         let region_by_id: HashMap<u64, &crate::core::document::RegionDoc> = doc
             .regions
             .iter()
             .map(|region| (region.id, region))
             .collect();
-        for (index, frame) in doc.frames.iter().enumerate() {
-            if let Some(region) = region_by_id.get(&frame.region_id) {
-                sequence.push(Frame::new(
-                    Region::new(
-                        Rect2i::new(
-                            region.x as i32,
-                            region.y as i32,
-                            region.width as i32,
-                            region.height as i32,
-                        ),
-                        format!("Frame {}", index + 1),
-                    ),
-                    frame.delay_ms,
-                ));
-            }
-        }
-        if sequence.is_empty() {
-            sequence.push(Frame::new(
+        let frame_by_id: HashMap<u64, &crate::core::document::FrameDoc> =
+            doc.frames.iter().map(|frame| (frame.region_id, frame)).collect();
+
+        let mut animations = AnimationSet::new();
+        if doc.sequences.is_empty() {
+            // Old/other files with no sequence at all: seed one "Animation 1"
+            // with a single full-canvas frame, matching the historical fallback.
+            let fallback = animations.active_mut();
+            fallback.set_name("Animation 1");
+            // Match `ProjectSession::new`: a fresh/default animation loops.
+            // The controller is built from the sequence's flag below, so both
+            // stay in lock-step (B2).
+            fallback.set_looping(true);
+            fallback.push(Frame::new(
                 Region::new(Rect2i::new(0, 0, width as i32, height as i32), "Frame 1"),
                 100,
             ));
+        } else {
+            for (seq_index, sequence_doc) in doc.sequences.iter().enumerate() {
+                let mut sequence = AnimationSequence::new(sequence_doc.name.clone());
+                sequence.set_looping(sequence_doc.loop_flag);
+                sequence.set_delay_multiplier_centi(sequence_doc.delay_multiplier);
+                sequence.set_tags(sequence_doc.tags.clone());
+                for (frame_index, frame_id) in sequence_doc.frame_ids.iter().enumerate() {
+                    let Some(frame_doc) = frame_by_id.get(frame_id) else {
+                        // S3: unresolved frame reference — deterministic skip.
+                        continue;
+                    };
+                    let Some(region) = region_by_id.get(&frame_doc.region_id) else {
+                        // S3: unresolved region reference — deterministic skip.
+                        continue;
+                    };
+                    sequence.push(Frame::new(
+                        Region::new(
+                            Rect2i::new(
+                                region.x as i32,
+                                region.y as i32,
+                                region.width as i32,
+                                region.height as i32,
+                            ),
+                            format!("Frame {}", frame_index + 1),
+                        ),
+                        frame_doc.delay_ms,
+                    ));
+                }
+                if seq_index == 0 {
+                    // Reuse the seeded "Animation 1" slot for the first doc
+                    // sequence so its index stays 0.
+                    *animations.active_mut() = sequence;
+                } else {
+                    let index = animations.add(sequence_doc.name.clone());
+                    *animations.get_mut(index).expect("just added") = sequence;
+                }
+            }
         }
-        let delays = sequence.iter().map(|frame| frame.delay_ms()).collect();
-        self.sequence = sequence;
-        self.animation = AnimationController::new_from_delays(self.sequence.len(), delays);
+        animations.set_active(0);
+        // B1: the controller's delays MUST be the SAME multiplier-scaled
+        // effective delays GIF export uses (`effective_frame_delays`). Raw
+        // `frame.delay_ms()` would ignore the sequence's delay multiplier and
+        // make on-screen playback diverge from the GIF.
+        let (active_len, active_delays, active_looping) = {
+            let active = animations.active_ref();
+            let delays: Vec<u32> = (0..active.len())
+                .map(|index| active.effective_delay_ms(index))
+                .collect();
+            (active.len(), delays, active.looping())
+        };
+        self.animations = animations;
+        self.animation = AnimationController::new_from_delays(active_len, active_delays);
+        // B2: `new_from_delays` defaults the loop flag to `true`; restore the
+        // loaded sequence's own flag so a non-looping animation stays
+        // non-looping.
+        self.animation.set_looping(active_looping);
         self.undo.clear();
         self.selection = None;
         self.selection_snapshot = None;
@@ -675,7 +756,7 @@ impl ProjectSession {
         self.clipboard = None;
         self.stroke = None;
         self.transform = None;
-        self.tile_size = doc.tile_size.max(1);
+        self.tile_size = TileSize::new(doc.tile_size.w, doc.tile_size.h);
         if !doc.palette.is_empty() {
             self.palettes = vec![Palette {
                 name: "Project".to_string(),
@@ -698,18 +779,22 @@ impl ProjectSession {
 
     pub fn new(id: ProjectId, name: impl Into<String>, width: usize, height: usize) -> Self {
         let layers = LayerStack::new(width, height);
-        let mut sequence = AnimationSequence::new("Animation 1");
-        sequence.set_looping(true);
-        sequence.push(Frame::new(
-            Region::new(Rect2i::new(0, 0, width as i32, height as i32), "Frame 1"),
-            100,
-        ));
+        let mut animations = AnimationSet::new();
+        {
+            let sequence = animations.active_mut();
+            sequence.set_name("Animation 1");
+            sequence.set_looping(true);
+            sequence.push(Frame::new(
+                Region::new(Rect2i::new(0, 0, width as i32, height as i32), "Frame 1"),
+                100,
+            ));
+        }
         let animation = AnimationController::new_from_delays(1, vec![100]);
         Self {
             id,
             name: name.into(),
             path: None,
-            tile_size: 16,
+            tile_size: TileSize::square(16),
             layers,
             undo: UndoStack::new(),
             camera: Camera::new(),
@@ -720,8 +805,10 @@ impl ProjectSession {
             os_clipboard_available: false,
             stroke: None,
             transform: None,
-            sequence,
+            animations,
             animation,
+            onion_prev: false,
+            onion_next: false,
             palettes: vec![Palette::default()],
             active_palette: 0,
             color: Color::BLACK,
@@ -772,7 +859,8 @@ impl ProjectSession {
             | Tool::Fill
             | Tool::Eyedropper
             | Tool::Fieldier
-            | Tool::Tile => &self.pen_draw_settings,
+            | Tool::Tile
+            | Tool::AnimationPlacer => &self.pen_draw_settings,
         }
     }
 
@@ -785,7 +873,8 @@ impl ProjectSession {
             | Tool::Fill
             | Tool::Eyedropper
             | Tool::Fieldier
-            | Tool::Tile => &mut self.pen_draw_settings,
+            | Tool::Tile
+            | Tool::AnimationPlacer => &mut self.pen_draw_settings,
         }
     }
 }
@@ -1027,5 +1116,243 @@ impl ProjectStore {
             closed: id,
             activation,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> ProjectSession {
+        ProjectSession::new(ProjectId::new(1), "Test", 16, 8)
+    }
+
+    fn region(name: &str, x: i32, y: i32, w: i32, h: i32) -> Region {
+        Region::new(Rect2i::new(x, y, w, h), name)
+    }
+
+    #[test]
+    fn new_seeds_single_animation_and_off_onion_flags() {
+        let s = session();
+        assert_eq!(s.animations.len(), 1);
+        assert_eq!(s.animations.active(), 0);
+        assert_eq!(s.sequence().name(), "Animation 1");
+        assert_eq!(s.sequence().len(), 1);
+        assert!(!s.onion_prev);
+        assert!(!s.onion_next);
+    }
+
+    #[test]
+    fn multi_animation_save_load_roundtrip() {
+        let mut s = session();
+        // Second animation "Walk": different loop flag + multiplier, two frames.
+        // `add` appends AND makes it active.
+        let walk = s.animations.add("Walk");
+        assert_eq!(walk, 1);
+        assert_eq!(s.animations.active(), 1);
+        {
+            let seq = s.animations.get_mut(walk).unwrap();
+            seq.set_looping(false);
+            seq.set_delay_multiplier_centi(250);
+            seq.add_tag("walk".to_string());
+            seq.add_tag("locomotion".to_string());
+            seq.push(Frame::new(region("Walk A", 1, 1, 4, 4), 100));
+            seq.push(Frame::new(region("Walk B", 5, 1, 4, 4), 200));
+        }
+        // Give Animation 1 (index 0) a second frame and a distinct multiplier.
+        {
+            let seq = s.animations.get_mut(0).unwrap();
+            seq.set_delay_multiplier_centi(150);
+            seq.add_tag("idle".to_string());
+            seq.push(Frame::new(region("Idle B", 0, 0, 4, 4), 300));
+        }
+        // "Walk" is already active (set by `add`); confirm it round-trips.
+
+        let doc = s.to_document();
+        assert_eq!(doc.sequences.len(), 2);
+        assert_eq!(doc.sequences[0].name, "Animation 1");
+        assert_eq!(doc.sequences[1].name, "Walk");
+        assert_eq!(doc.sequences[0].delay_multiplier, 150);
+        assert_eq!(doc.sequences[1].delay_multiplier, 250);
+        assert!(doc.sequences[0].loop_flag);
+        assert!(!doc.sequences[1].loop_flag);
+        assert_eq!(doc.sequences[0].tags, vec!["idle".to_string()]);
+        assert_eq!(
+            doc.sequences[1].tags,
+            vec!["walk".to_string(), "locomotion".to_string()]
+        );
+
+        // Global region/frame id allocator: 4 frames total (2 per animation),
+        // ids 1..=4, unique across animations.
+        let region_ids: Vec<u64> = doc.regions.iter().map(|r| r.id).collect();
+        assert_eq!(region_ids, vec![1, 2, 3, 4]);
+        let frame_region_ids: Vec<u64> = doc.frames.iter().map(|f| f.region_id).collect();
+        assert_eq!(frame_region_ids, vec![1, 2, 3, 4]);
+        assert_eq!(doc.sequences[0].frame_ids, vec![1, 2]);
+        assert_eq!(doc.sequences[1].frame_ids, vec![3, 4]);
+
+        let mut restored = session();
+        restored.load_document(&doc);
+
+        assert_eq!(restored.animations.len(), 2);
+        let idle = restored.animations.get(0).unwrap();
+        assert_eq!(idle.name(), "Animation 1");
+        assert!(idle.looping());
+        assert_eq!(idle.delay_multiplier_centi(), 150);
+        assert_eq!(idle.len(), 2);
+        assert_eq!(idle.frame(0).unwrap().region().name(), "Frame 1");
+        assert_eq!(idle.frame(0).unwrap().region().rect(), Rect2i::new(0, 0, 16, 8));
+        assert_eq!(idle.frame(1).unwrap().region().rect(), Rect2i::new(0, 0, 4, 4));
+        assert_eq!(idle.frame(1).unwrap().delay_ms(), 300);
+        assert_eq!(idle.tags(), &["idle".to_string()]);
+
+        let walk = restored.animations.get(1).unwrap();
+        assert_eq!(walk.name(), "Walk");
+        assert!(!walk.looping());
+        assert_eq!(walk.delay_multiplier_centi(), 250);
+        assert_eq!(walk.len(), 2);
+        assert_eq!(walk.frame(0).unwrap().region().rect(), Rect2i::new(1, 1, 4, 4));
+        assert_eq!(walk.frame(1).unwrap().region().rect(), Rect2i::new(5, 1, 4, 4));
+        assert_eq!(walk.frame(0).unwrap().delay_ms(), 100);
+        assert_eq!(walk.frame(1).unwrap().delay_ms(), 200);
+        assert_eq!(walk.tags(), &["walk".to_string(), "locomotion".to_string()]);
+
+        // `load_document` always resets to active = 0 (per spec), so the
+        // controller is rebuilt from "Animation 1" (2 frames).
+        assert_eq!(restored.animations.active(), 0);
+        assert_eq!(restored.sequence().name(), "Animation 1");
+        assert_eq!(restored.animation.frame_count(), 2);
+    }
+
+    #[test]
+    fn single_animation_ids_and_roundtrip_unchanged() {
+        let mut s = session();
+        s.sequence_mut()
+            .push(Frame::new(region("Frame 2", 2, 2, 4, 4), 250));
+        let doc = s.to_document();
+        // Single-animation ids stay `index + 1`, identical to the old scheme.
+        assert_eq!(doc.sequences.len(), 1);
+        assert_eq!(doc.sequences[0].frame_ids, vec![1, 2]);
+        assert_eq!(doc.regions.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(doc.frames.iter().map(|f| f.region_id).collect::<Vec<_>>(), vec![1, 2]);
+
+        let mut restored = session();
+        restored.load_document(&doc);
+        assert_eq!(restored.animations.len(), 1);
+        assert_eq!(restored.sequence().len(), 2);
+        assert_eq!(restored.sequence().frame(1).unwrap().delay_ms(), 250);
+    }
+
+    #[test]
+    fn single_animation_tag_roundtrip() {
+        let mut s = session();
+        s.sequence_mut().add_tag("hero".to_string());
+        s.sequence_mut().add_tag("idle".to_string());
+        s.sequence_mut()
+            .push(Frame::new(region("Frame 2", 2, 2, 4, 4), 250));
+
+        let doc = s.to_document();
+        assert_eq!(doc.sequences.len(), 1);
+        assert_eq!(
+            doc.sequences[0].tags,
+            vec!["hero".to_string(), "idle".to_string()]
+        );
+
+        let mut restored = session();
+        restored.load_document(&doc);
+        assert_eq!(restored.sequence().tags(), &["hero".to_string(), "idle".to_string()]);
+    }
+
+    #[test]
+    fn default_sequence_has_no_tags_and_roundtrips_empty() {
+        let s = session();
+        assert!(s.sequence().tags().is_empty());
+
+        let doc = s.to_document();
+        assert!(doc.sequences[0].tags.is_empty());
+
+        let mut restored = session();
+        restored.load_document(&doc);
+        assert!(restored.sequence().tags().is_empty());
+    }
+
+    #[test]
+    fn empty_sequences_seed_full_canvas_fallback() {
+        let mut s = session();
+        let mut doc = s.to_document();
+        doc.sequences.clear();
+        doc.frames.clear();
+        doc.regions.clear();
+        let mut restored = session();
+        restored.load_document(&doc);
+        assert_eq!(restored.animations.len(), 1);
+        assert_eq!(restored.sequence().len(), 1);
+        assert_eq!(restored.sequence().frame(0).unwrap().region().name(), "Frame 1");
+    }
+
+    #[test]
+    fn effective_frame_delays_apply_multiplier() {
+        let mut s = session();
+        s.sequence_mut().set_delay_multiplier_centi(200);
+        s.sequence_mut()
+            .push(Frame::new(region("Frame 2", 0, 0, 4, 4), 100));
+        // Frame 0 is 100 ms, frame 1 is 100 ms -> 2.00x -> 200 ms each.
+        assert_eq!(s.effective_frame_delays(), vec![200, 200]);
+
+        s.sequence_mut().set_delay_multiplier_centi(50);
+        assert_eq!(s.effective_frame_delays(), vec![50, 50]);
+    }
+
+    #[test]
+    fn load_document_uses_effective_delays_and_loop_flag() {
+        // B1/B2: the loaded controller must mirror the sequence's
+        // multiplier-scaled delay table AND its loop flag — not raw delays with
+        // looping defaulted to true.
+        let mut s = session();
+        {
+            let seq = s.sequence_mut();
+            seq.set_delay_multiplier_centi(250); // 2.50×
+            seq.set_looping(false);
+            seq.push(Frame::new(region("Frame 2", 2, 2, 4, 4), 200));
+        }
+        let doc = s.to_document();
+
+        let mut restored = session();
+        restored.load_document(&doc);
+
+        assert!(!restored.animation.looping(), "non-looping flag preserved");
+        for index in 0..restored.sequence().len() {
+            assert_eq!(
+                restored.animation.delay_ms(index),
+                restored.sequence().effective_delay_ms(index),
+                "frame {index} playback delay must equal the effective delay"
+            );
+        }
+        assert_eq!(restored.animation.delay_ms(0), 250); // 100 × 2.50
+        assert_eq!(restored.animation.delay_ms(1), 500); // 200 × 2.50
+    }
+
+    #[test]
+    fn load_document_skips_unresolved_frames() {
+        // S3: a frame_id with no matching FrameDoc is skipped (documented,
+        // deterministic) rather than aborting the whole load.
+        let mut s = session();
+        s.sequence_mut()
+            .push(Frame::new(region("Frame 2", 2, 2, 4, 4), 100));
+        let mut doc = s.to_document();
+        doc.sequences[0].frame_ids.push(9_999); // bogus reference
+
+        let mut restored = session();
+        restored.load_document(&doc);
+        assert_eq!(restored.sequence().len(), 2, "the bogus frame_id is skipped");
+        assert_eq!(restored.animation.frame_count(), 2);
+
+        // An unresolved REGION reference skips only its own frame.
+        let mut doc2 = s.to_document();
+        doc2.frames[0].region_id = 9_999; // frame_id 1 now resolves to no region
+        let mut restored2 = session();
+        restored2.load_document(&doc2);
+        assert_eq!(restored2.sequence().len(), 1, "the orphaned frame is skipped");
+        assert_eq!(restored2.sequence().frame(0).unwrap().region().name(), "Frame 2");
     }
 }
