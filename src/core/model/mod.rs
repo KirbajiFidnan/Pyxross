@@ -532,6 +532,64 @@ impl LayerStack {
         self.changed = true;
     }
 
+    /// Resizes every `(old_tile.w × old_tile.h)` region in a
+    /// `count_w × count_h` grid to `(new_tile.w × new_tile.h)` in place within
+    /// its own cell via [`crate::core::canvas_resize::resize_regions_pixels`].
+    ///
+    /// Group layers keep an EMPTY buffer. Any layer tilemap has its `tile_size`
+    /// updated to `new_tile` and is re-gridded to `count_w × count_h`. Render
+    /// caches are dropped and the stack is marked changed.
+    pub fn resize_regions(
+        &mut self,
+        old_tile: crate::core::tilemap::TileSize,
+        new_tile: crate::core::tilemap::TileSize,
+        count_w: u32,
+        count_h: u32,
+        pivot: crate::core::canvas_resize::Pivot,
+        resample: bool,
+    ) {
+        let count_w = count_w.max(1);
+        let count_h = count_h.max(1);
+        let (new_w, new_h) = crate::core::canvas_resize::canvas_size(
+            new_tile.w.max(1),
+            new_tile.h.max(1),
+            count_w,
+            count_h,
+        );
+        let new_w = (new_w as usize).max(1);
+        let new_h = (new_h as usize).max(1);
+        for layer in &mut self.layers {
+            if layer.is_group {
+                continue;
+            }
+            let old_w = layer.buffer.width() as u32;
+            let old_h = layer.buffer.height() as u32;
+            let resized = crate::core::canvas_resize::resize_regions_pixels(
+                layer.buffer.as_bytes(),
+                old_w,
+                old_h,
+                (old_tile.w.max(1), old_tile.h.max(1)),
+                (new_tile.w.max(1), new_tile.h.max(1)),
+                (count_w, count_h),
+                pivot,
+                resample,
+            );
+            let mut buffer = PixelBuffer::new(new_w, new_h);
+            if resized.len() == buffer.as_bytes().len() {
+                buffer.as_bytes_mut().copy_from_slice(&resized);
+            }
+            layer.buffer = buffer;
+            if let Some(tm) = layer.tilemap.as_mut() {
+                tm.tile_size = new_tile;
+                tm.resize(count_w, count_h);
+            }
+            layer.tilemap_cache = RefCell::new(None);
+        }
+        self.width = new_w;
+        self.height = new_h;
+        self.changed = true;
+    }
+
     /// Composites all visible layers (bottom-to-top) over the full canvas.
     ///
     /// `palette` supplies the tile pixels for any layer with a tilemap.

@@ -255,13 +255,13 @@ fn rotxel_generic_v3(src: &[u8], w: usize, h: usize, angle_deg: f32) -> (Vec<u8>
     rotxel_vote_and_post(src, w, h, angle_deg, fx, fy)
 }
 
-/// Number of fully-opaque (`alpha == 255`) source pixels — one linear pass over
+/// Number of non-transparent (`alpha > 0`) source pixels — one linear pass over
 /// the buffer, no allocation. Deterministic and exact (integer count).
 fn opaque_pixel_count(src: &[u8], w: usize, h: usize) -> usize {
     let total = w.saturating_mul(h);
     src.chunks_exact(BYTES_PER_PIXEL)
         .take(total)
-        .filter(|px| px[3] == 255)
+        .filter(|px| px[3] > 0)
         .count()
 }
 
@@ -369,8 +369,19 @@ fn rotxel_vote_and_post(
     let mut repidx = [0u8; TALLY_CAP];
     let mut repsrc = [(0i64, 0i64); TALLY_CAP];
 
+    let wf = w as f64;
+    let hf = h as f64;
+
     for dy in 0..h_prime {
+        let ay_c = dy as f64 - geo.dcy;
         for dx in 0..w_prime {
+            let ax_c = dx as f64 - geo.dcx;
+            let sx_c = geo.cx + geo.cos_t * ax_c + geo.sin_t * ay_c;
+            let sy_c = geo.cy - geo.sin_t * ax_c + geo.cos_t * ay_c;
+            if sx_c < -3.0 || sx_c > wf + 2.0 || sy_c < -3.0 || sy_c > hf + 2.0 {
+                continue;
+            }
+
             let mut opaque = 0usize;
             let mut n = 0usize;
 
@@ -379,7 +390,7 @@ fn rotxel_vote_and_post(
                 for u in 0..SUBCELL {
                     let ox = subcell_offset(u, fx, SUBCELL);
                     if let Some((c, (ix, iy))) = geo.sample_idx(src, dx, dy, ox, oy) {
-                        if c[3] == 255 {
+                        if c[3] > 0 {
                             opaque += 1;
                             tally_add(
                                 &mut keys,
@@ -396,19 +407,19 @@ fn rotxel_vote_and_post(
                 }
             }
 
-            // Strict majority; an exact tie (2*opaque == N²) stays opaque.
+            // Strict majority; an exact tie (2*opaque == N²) stays non-transparent.
             if 2 * opaque >= TALLY_CAP {
                 let best = argmax(&keys, &cnt, n);
                 let mut color = keys[best];
                 if ROTXEL_EPX_REFINE {
                     // Optional refinement (OFF by default): run EPX for the
                     // plurality winner's representative subcell, only for an
-                    // interior source pixel, and accept only a fully opaque
+                    // interior source pixel, and accept only a non-transparent
                     // result.
                     let (rx, ry) = repsrc[best];
                     if rx >= 1 && ry >= 1 && rx < w as i64 - 1 && ry < h as i64 - 1 {
                         let refined = epx(src, w, rx as usize, ry as usize, repidx[best] as i64);
-                        if refined[3] == 255 {
+                        if refined[3] > 0 {
                             color = refined;
                         }
                     }
@@ -805,7 +816,7 @@ fn restore_isolated_local(
     for y in 0..h {
         for x in 0..w {
             let p = read_px(src, w, x, y);
-            if p[3] != 255 || !is_isolated_local(src, w, h, x, y, p) {
+            if p[3] == 0 || !is_isolated_local(src, w, h, x, y, p) {
                 continue;
             }
             let vx = x as f64 - src_cx;
@@ -1736,5 +1747,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rotxel_preserves_semitransparent_pixels_verbatim() {
+        let semi = [120u8, 60, 240, 128];
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        for y in 2..6 {
+            for x in 2..6 {
+                let i = (y * 8 + x) * 4;
+                buf[i..i + 4].copy_from_slice(&semi);
+            }
+        }
+        let (out, ow, oh) = rotxel_rotate(&buf, 8, 8, 25.0);
+        assert!(ow > 0 && oh > 0);
+        assert!(
+            out.chunks_exact(4).any(|px| px == semi),
+            "semi-transparent pixels must be preserved verbatim, not erased"
+        );
     }
 }

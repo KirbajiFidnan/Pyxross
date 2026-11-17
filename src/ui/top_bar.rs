@@ -93,6 +93,21 @@ pub enum MenuAction {
     OpenProject,
     ImportImages,
     ImportGif,
+    ExportSpriteSheet,
+    ExportGif,
+    ExportSelected,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    DeleteSelection,
+    SelectAll,
+    Deselect,
+    InvertSelection,
+    FlipSelectionHorizontal,
+    FlipSelectionVertical,
+    RotateSelection,
     ResizeCanvas,
 }
 
@@ -115,7 +130,7 @@ pub struct MenuDef {
 /// The centered header shown at the top of the File dropdown.
 pub const FILE_MENU_TITLE: &str = "document";
 
-static FILE_ITEMS: [MenuItem; 6] = [
+static FILE_ITEMS: [MenuItem; 9] = [
     MenuItem {
         label: "new project",
         action: MenuAction::NewProject,
@@ -140,6 +155,69 @@ static FILE_ITEMS: [MenuItem; 6] = [
         label: "import gif",
         action: MenuAction::ImportGif,
     },
+    MenuItem {
+        label: "export sprite sheet",
+        action: MenuAction::ExportSpriteSheet,
+    },
+    MenuItem {
+        label: "export gif",
+        action: MenuAction::ExportGif,
+    },
+    MenuItem {
+        label: "export selection",
+        action: MenuAction::ExportSelected,
+    },
+];
+
+static EDIT_ITEMS: [MenuItem; 12] = [
+    MenuItem {
+        label: "undo (Ctrl+Z)",
+        action: MenuAction::Undo,
+    },
+    MenuItem {
+        label: "redo (Ctrl+Y)",
+        action: MenuAction::Redo,
+    },
+    MenuItem {
+        label: "cut (Ctrl+X)",
+        action: MenuAction::Cut,
+    },
+    MenuItem {
+        label: "copy (Ctrl+C)",
+        action: MenuAction::Copy,
+    },
+    MenuItem {
+        label: "paste (Ctrl+V)",
+        action: MenuAction::Paste,
+    },
+    MenuItem {
+        label: "delete (Del)",
+        action: MenuAction::DeleteSelection,
+    },
+    MenuItem {
+        label: "select all",
+        action: MenuAction::SelectAll,
+    },
+    MenuItem {
+        label: "deselect (Esc)",
+        action: MenuAction::Deselect,
+    },
+    MenuItem {
+        label: "invert selection (Ctrl+I)",
+        action: MenuAction::InvertSelection,
+    },
+    MenuItem {
+        label: "flip horizontal (Ctrl+F)",
+        action: MenuAction::FlipSelectionHorizontal,
+    },
+    MenuItem {
+        label: "flip vertical (Shift+F)",
+        action: MenuAction::FlipSelectionVertical,
+    },
+    MenuItem {
+        label: "rotate 90° (Alt+F)",
+        action: MenuAction::RotateSelection,
+    },
 ];
 
 static CANVAS_ITEMS: [MenuItem; 1] = [MenuItem {
@@ -147,11 +225,16 @@ static CANVAS_ITEMS: [MenuItem; 1] = [MenuItem {
     action: MenuAction::ResizeCanvas,
 }];
 
-static MENUS: [MenuDef; 2] = [
+static MENUS: [MenuDef; 3] = [
     MenuDef {
         title: "File",
         dropdown_title: Some(FILE_MENU_TITLE),
         items: &FILE_ITEMS,
+    },
+    MenuDef {
+        title: "Edit",
+        dropdown_title: None,
+        items: &EDIT_ITEMS,
     },
     MenuDef {
         title: "Canvas",
@@ -233,7 +316,7 @@ pub fn tab_close_button_rect(tab_rect: Rect) -> Rect {
 
 /// Menu-bar metrics: title width, dropdown width, item height and padding.
 const MENU_TITLE_WIDTH: f32 = 72.0;
-const MENU_DROPDOWN_WIDTH: f32 = 168.0;
+const MENU_DROPDOWN_WIDTH: f32 = 204.0;
 const MENU_ITEM_HEIGHT: f32 = 22.0;
 const MENU_DROPDOWN_PAD: f32 = 4.0;
 const MENU_HEADER_HEIGHT: f32 = 20.0;
@@ -797,19 +880,21 @@ mod tests {
     }
 
     #[test]
-    fn menu_bar_is_file_then_canvas_with_document_header() {
+    fn menu_bar_is_file_then_edit_then_canvas_with_document_header() {
         let menus = menu_bar();
-        assert_eq!(menus.len(), 2, "two menu titles");
+        assert_eq!(menus.len(), 3, "three menu titles");
         assert_eq!(menus[0].title, "File");
-        assert_eq!(menus[1].title, "Canvas");
+        assert_eq!(menus[1].title, "Edit");
+        assert_eq!(menus[2].title, "Canvas");
         assert_eq!(
             menus[0].dropdown_title,
             Some("document"),
             "the File dropdown carries the centered 'document' header"
         );
-        assert_eq!(menus[0].items.len(), 6);
-        assert_eq!(menus[1].items.len(), 1);
-        assert_eq!(menus[1].items[0].label, "resize canvas");
+        assert_eq!(menus[0].items.len(), 9);
+        assert_eq!(menus[1].items.len(), 12);
+        assert_eq!(menus[2].items.len(), 1);
+        assert_eq!(menus[2].items[0].label, "resize canvas");
     }
 
     #[test]
@@ -827,12 +912,52 @@ mod tests {
             MenuAction::OpenProject,
             MenuAction::ImportImages,
             MenuAction::ImportGif,
+            MenuAction::ExportSpriteSheet,
+            MenuAction::ExportGif,
+            MenuAction::ExportSelected,
         ];
         let items = menu_item_rects(&layout, 0);
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 9);
         for (i, (item, rect)) in items.iter().enumerate() {
             // Open File, then click this item.
             click_host(&ctx, &mut host, &layout, &colors, file_title);
+            click_host(&ctx, &mut host, &layout, &colors, rect.center());
+            let events = host.drain_events();
+            assert!(
+                events.contains(&TopBarEvent::MenuAction(expected[i])),
+                "item {:?} must emit {:?}, got {events:?}",
+                item.label,
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn edit_menu_each_item_emits_its_action() {
+        let ctx = egui::Context::default();
+        let colors = crate::ui::theme::Theme::default_dark().colors;
+        let layout = split_frame(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+        let mut host = TopBarHost::new();
+        let edit_title = menu_title_rects(&layout)[1].1.center();
+
+        let expected = [
+            MenuAction::Undo,
+            MenuAction::Redo,
+            MenuAction::Cut,
+            MenuAction::Copy,
+            MenuAction::Paste,
+            MenuAction::DeleteSelection,
+            MenuAction::SelectAll,
+            MenuAction::Deselect,
+            MenuAction::InvertSelection,
+            MenuAction::FlipSelectionHorizontal,
+            MenuAction::FlipSelectionVertical,
+            MenuAction::RotateSelection,
+        ];
+        let items = menu_item_rects(&layout, 1);
+        assert_eq!(items.len(), 12);
+        for (i, (item, rect)) in items.iter().enumerate() {
+            click_host(&ctx, &mut host, &layout, &colors, edit_title);
             click_host(&ctx, &mut host, &layout, &colors, rect.center());
             let events = host.drain_events();
             assert!(
@@ -850,8 +975,8 @@ mod tests {
         let colors = crate::ui::theme::Theme::default_dark().colors;
         let layout = split_frame(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
         let mut host = TopBarHost::new();
-        let canvas_title = menu_title_rects(&layout)[1].1.center();
-        let items = menu_item_rects(&layout, 1);
+        let canvas_title = menu_title_rects(&layout)[2].1.center();
+        let items = menu_item_rects(&layout, 2);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0.label, "resize canvas");
 

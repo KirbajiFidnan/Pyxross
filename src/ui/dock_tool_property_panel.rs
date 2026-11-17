@@ -97,7 +97,7 @@ impl ToolPropertyComponent {
             .draw
             .size
             .clamp(BrushSpec::MIN_SIZE, BrushSpec::MAX_SIZE);
-        property_row(ui, "Size", |ui| {
+        property_row(ui, "Size (Shift+Scroll)", |ui| {
             let input = ui.add(
                 egui::DragValue::new(&mut size).range(BrushSpec::MIN_SIZE..=BrushSpec::MAX_SIZE),
             );
@@ -117,7 +117,7 @@ impl ToolPropertyComponent {
                     .push(ToolbarEvent::BrushSizeChanged(BrushSpec::MIN_SIZE));
             }
         });
-        property_row(ui, "Shape", |ui| {
+        property_row(ui, "Shape (Ctrl+Scroll)", |ui| {
             let square = chrome.button(
                 ui,
                 "Square",
@@ -162,7 +162,7 @@ impl ToolPropertyComponent {
                 events.borrow_mut().push(ToolbarEvent::BrushTailChanged(0));
             }
         });
-        property_row(ui, "Scatter", |ui| {
+        property_row(ui, "Scatter (Alt+Scroll)", |ui| {
             let mut scatter = view.draw.scatter.min(DrawTool::MAX_SCATTER);
             let input = ui.add(egui::DragValue::new(&mut scatter).range(0..=DrawTool::MAX_SCATTER));
             let slider = ui
@@ -210,9 +210,9 @@ impl ToolPropertyComponent {
         let events = &self.host.events;
         property_row(ui, "Child", |ui| {
             let children = [
-                (FieldierChild::Rectangle, "Rectangle"),
-                (FieldierChild::Wand, "Wand"),
-                (FieldierChild::Lasso, "Lasso"),
+                (FieldierChild::Rectangle, "Rectangle (S)"),
+                (FieldierChild::Wand, "Wand (W)"),
+                (FieldierChild::Lasso, "Lasso (L)"),
             ];
             for (child, label) in children {
                 if chrome
@@ -232,7 +232,7 @@ impl ToolPropertyComponent {
         // checkbox must never emit — the temp Alt override is a gesture-engine
         // concern, not a stored setting.
         let mut effective = view.wand_contiguous_effective;
-        ui.add_enabled(false, egui::Checkbox::new(&mut effective, "Contiguous"));
+        ui.add_enabled(false, egui::Checkbox::new(&mut effective, "Contiguous (Alt)"));
         property_row(ui, "Tolerance", |ui| {
             let mut tolerance = view.wand.tolerance;
             let input = ui.add(egui::DragValue::new(&mut tolerance).range(0..=u8::MAX));
@@ -307,7 +307,7 @@ impl ToolPropertyComponent {
     /// The two flip checkboxes are stacked vertically, horizontal above vertical.
     fn tile_properties(&self, ui: &mut egui::Ui, view: &ToolboxView) {
         let events = &self.host.events;
-        property_row(ui, "Rotation", |ui| {
+        property_row(ui, "Rotation (Q / R)", |ui| {
             let mut degrees = view.tile_placer.rotation;
             let input = ui.add(
                 egui::DragValue::new(&mut degrees)
@@ -327,19 +327,19 @@ impl ToolPropertyComponent {
             }
         });
         let mut flip_x = view.tile_placer.flip_x;
-        if ui.checkbox(&mut flip_x, "horizontal flip").changed() {
+        if ui.checkbox(&mut flip_x, "horizontal flip (X)").changed() {
             events
                 .borrow_mut()
                 .push(ToolbarEvent::TileFlipXChanged(flip_x));
         }
         let mut flip_y = view.tile_placer.flip_y;
-        if ui.checkbox(&mut flip_y, "vertical flip").changed() {
+        if ui.checkbox(&mut flip_y, "vertical flip (Z)").changed() {
             events
                 .borrow_mut()
                 .push(ToolbarEvent::TileFlipYChanged(flip_y));
         }
         let mut tile_eraser = view.tile_placer.tile_eraser;
-        if ui.checkbox(&mut tile_eraser, "tile eraser").changed() {
+        if ui.checkbox(&mut tile_eraser, "tile eraser (Alt)").changed() {
             events
                 .borrow_mut()
                 .push(ToolbarEvent::TileEraserChanged(tile_eraser));
@@ -372,6 +372,8 @@ impl ToolPropertyComponent {
                 }
             }
         });
+        ui.add_space(4.0);
+        ui.weak("Rotate (R / Shift+R) · Scale (+ / -) · Flip (H / V) · Cancel (Esc)");
     }
 }
 

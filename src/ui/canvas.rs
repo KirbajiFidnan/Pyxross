@@ -430,6 +430,8 @@ pub struct CanvasWidget {
     /// list, so it is recomputed only when the selection boundary actually
     /// changes.
     ants_polylines: Option<(Vec<BoundarySegment>, Vec<Vec<(f32, f32)>>)>,
+    /// Cached seamless 16×16 pale sand-grey "X" + dither canvas backdrop.
+    sand_bg_texture: Option<egui::TextureHandle>,
 }
 
 /// GG: order-independent union of two [`egui::Modifiers`] snapshots.
@@ -464,7 +466,56 @@ impl CanvasWidget {
             selection_secondary_armed: false,
             click_press_modifiers: None,
             ants_polylines: None,
+            sand_bg_texture: None,
         }
+    }
+
+    /// Lazily builds and caches the 8×8 seamless pale sand-grey X-dither
+    /// checkerboard backdrop texture (1 texel = 1 canvas pixel).
+    fn ensure_sand_bg_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        if let Some(tex) = &self.sand_bg_texture {
+            return tex.id();
+        }
+        const SIZE: usize = 8;
+        // Very pale, light-greyish warm sand tones.
+        const LIGHT: [u8; 4] = [236, 234, 224, 255];
+        const BASE: [u8; 4] = [230, 228, 217, 255];
+        const MID: [u8; 4] = [224, 221, 209, 255];
+
+        let mut rgba = vec![0u8; SIZE * SIZE * 4];
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                // Checkerboard base + diagonal X-dither weave.
+                let checker = (x + y) & 1 == 0;
+                let diag_a = (x + y) % 4 == 0;
+                let diag_b = (x + SIZE - y) % 4 == 0;
+                let px = if diag_a && diag_b {
+                    MID
+                } else if checker {
+                    LIGHT
+                } else if diag_a || diag_b {
+                    MID
+                } else {
+                    BASE
+                };
+                let i = (y * SIZE + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&px);
+            }
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &rgba);
+        let tex = ctx.load_texture(
+            "canvas_sand_dither_bg",
+            image,
+            egui::TextureOptions {
+                magnification: egui::TextureFilter::Nearest,
+                minification: egui::TextureFilter::Nearest,
+                wrap_mode: egui::TextureWrapMode::Repeat,
+                ..Default::default()
+            },
+        );
+        let id = tex.id();
+        self.sand_bg_texture = Some(tex);
+        id
     }
 
     /// The [`SurfaceId`] this widget routes through the shared [`InputCapture`].
@@ -671,9 +722,10 @@ impl CanvasWidget {
             canvas_rect_clip(canvas_size)
         };
         let preview_clip: Option<&PixelClip> = selection_clip.as_ref().or(canvas_clip.as_ref());
-        let scale = camera.scale() as f32;
-        let pan = camera.pan();
-        let draw_rect = self.canvas_rect_to_screen(camera, view_rect);
+        let render_camera = camera;
+        let scale = render_camera.scale() as f32;
+        let pan = render_camera.pan();
+        let draw_rect = self.canvas_rect_to_screen(render_camera, view_rect);
         // Primary/secondary button interactions are scoped to the canvas draw
         // rect: presses in the letterbox (or on widgets drawn above the canvas)
         // never claim the canvas gesture, so the App can arm a tool from
@@ -746,6 +798,19 @@ impl CanvasWidget {
             ),
             _ => egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         };
+        let sand_id = self.ensure_sand_bg_texture(ui.ctx());
+        let tile_px = 8.0_f32;
+        let sand_uv = egui::Rect::from_min_max(
+            egui::pos2(
+                uv.min.x * canvas_size.0 as f32 / tile_px,
+                uv.min.y * canvas_size.1 as f32 / tile_px,
+            ),
+            egui::pos2(
+                uv.max.x * canvas_size.0 as f32 / tile_px,
+                uv.max.y * canvas_size.1 as f32 / tile_px,
+            ),
+        );
+        painter.image(sand_id, draw_rect, sand_uv, crate::ui::theme::SKIN_TINT);
         painter.image(
             image_id,
             draw_rect,
@@ -1382,7 +1447,7 @@ impl CanvasWidget {
                             cells: &cells,
                             mode: draw_mode,
                             color: brush_color,
-                            origin: self.content_origin(camera),
+                            origin: self.content_origin(render_camera),
                             scale,
                             clip: selection_clip.as_ref(),
                         },
@@ -1407,7 +1472,7 @@ impl CanvasWidget {
                     cells: &cells,
                     mode: draw_mode,
                     color: brush_color,
-                    origin: self.content_origin(camera),
+                    origin: self.content_origin(render_camera),
                     scale,
                     // The pen preview clips its cells to the selection, or to
                     // the canvas when nothing is selected; the eraser
@@ -1426,15 +1491,15 @@ impl CanvasWidget {
         // the tile's baked pixels: the overlay used to be painted mid-pass,
         // where anything drawn afterwards (footprints, line/gizmo chrome) could
         // bury it under the tile content it is meant to describe.
-        self.paint_tile_placer_overlay(&painter, theme, camera, tile_size, scale);
+        self.paint_tile_placer_overlay(&painter, theme, render_camera, tile_size, scale);
         // Animation-placer boundary highlights share the same final pass, so the
         // red/green/grey region outlines and the live in-flight rectangle read
         // above the canvas content too.
-        self.paint_animation_placer_overlay(&painter, theme, camera);
+        self.paint_animation_placer_overlay(&painter, theme, render_camera);
         // Frame-edit onion overlay viewports, painted in the same final pass so
         // the translucent neighbour regions sit ON TOP of the base frame-edit
         // content.
-        self.paint_onion_overlay(&painter, theme, camera, image_id, canvas_size);
+        self.paint_onion_overlay(&painter, theme, render_camera, image_id, canvas_size);
 
         interactions.primary_down_on_canvas = primary_response.is_pointer_button_down_on();
         interactions.updated_camera = camera;
@@ -3674,6 +3739,91 @@ mod tests {
         );
         assert!(camera.zoom_percent() > 100);
         assert_eq!(camera.canvas_to_screen(50, 50), (50, 50));
+    }
+
+    #[test]
+    fn hollow_brush_preview_stays_aligned_with_rendered_canvas_during_zoom() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let mut camera = Camera::new();
+        camera.set_zoom_percent(400);
+        let theme = crate::ui::theme::Theme::default_dark();
+        let stroke_color = theme.colors.selection_stroke32();
+        let brush = Some(crate::core::brush::BrushSpec::new(
+            1,
+            crate::core::brush::BrushShape::Square,
+        ));
+        let pointer_pos = egui::pos2(62.0, 62.0);
+
+        let collect_hollow_rects = |output: &egui::FullOutput| -> Vec<egui::Rect> {
+            let mut out = Vec::new();
+            for clipped in &output.shapes {
+                if let egui::epaint::Shape::Rect(rect_shape) = &clipped.shape {
+                    if rect_shape.fill == stroke_color {
+                        out.push(rect_shape.rect);
+                    }
+                }
+            }
+            out
+        };
+
+        let run_eraser_frame =
+            |widget: &mut CanvasWidget, camera: &mut Camera, events: Vec<egui::Event>| {
+                let capture = crate::ui::input_capture::InputCapture::new();
+                capture.set_target(Some(crate::ui::input_capture::SurfaceId::Canvas));
+                let mut interactions = CanvasInteractions::default();
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            interactions = widget.ui(
+                                ui,
+                                &theme.colors,
+                                &capture,
+                                egui::TextureId::Managed(0),
+                                zoomed_view(brush, DrawMode::Eraser, Color::BLACK, None, None),
+                                *camera,
+                            );
+                        });
+                });
+                output.textures_delta.clear();
+                *camera = interactions.updated_camera;
+                (interactions, output)
+            };
+
+        let (_, baseline_out) = run_eraser_frame(
+            &mut widget,
+            &mut camera,
+            vec![egui::Event::PointerMoved(pointer_pos)],
+        );
+        let baseline_rects = collect_hollow_rects(&baseline_out);
+        assert_eq!(baseline_rects.len(), 4);
+
+        let (zoom_interactions, zoom_out) = run_eraser_frame(
+            &mut widget,
+            &mut camera,
+            vec![
+                egui::Event::PointerMoved(pointer_pos),
+                wheel(1.0, egui::Modifiers::NONE),
+            ],
+        );
+        assert!(zoom_interactions.zoom.is_some());
+        assert_ne!(camera.pan(), (0, 0));
+
+        // On the zoom frame itself, the canvas texture is still drawn with the
+        // pre-zoom `render_camera`, so the hollow brush preview must stay
+        // aligned with that same `render_camera` instead of jumping to the
+        // post-zoom pan while keeping the pre-zoom scale.
+        let zoom_rects = collect_hollow_rects(&zoom_out);
+        assert_eq!(zoom_rects, baseline_rects);
     }
 
     #[test]

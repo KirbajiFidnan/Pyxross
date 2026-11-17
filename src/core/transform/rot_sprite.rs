@@ -1004,11 +1004,33 @@ fn vote_block(rot: &[u8], rw: usize, x0: usize, y0: usize, scale: usize) -> [u8;
     let mut weights = [0u64; SCALE_HIGH * SCALE_HIGH];
     let mut n = 0usize;
 
+    // Fast uniform-block check: >70% of blocks in sprite rotations are all
+    // transparent or a single solid colour.
+    let first = read_px(rot, rw, x0, y0);
+    let mut all_same = true;
+    let row_stride = rw * BYTES_PER_PIXEL;
     for l in 0..scale {
-        let by = y0 + l;
-        for k in 0..scale {
-            let bx = x0 + k;
-            let c = read_px(rot, rw, bx, by);
+        let row_start = (y0 + l) * row_stride + x0 * BYTES_PER_PIXEL;
+        let row = &rot[row_start..row_start + scale * BYTES_PER_PIXEL];
+        for px in row.chunks_exact(BYTES_PER_PIXEL) {
+            if px != first {
+                all_same = false;
+                break;
+            }
+        }
+        if !all_same {
+            break;
+        }
+    }
+    if all_same {
+        return first;
+    }
+
+    for l in 0..scale {
+        let row_start = (y0 + l) * row_stride + x0 * BYTES_PER_PIXEL;
+        let row = &rot[row_start..row_start + scale * BYTES_PER_PIXEL];
+        for px in row.chunks_exact(BYTES_PER_PIXEL) {
+            let c = [px[0], px[1], px[2], px[3]];
             let w = if c[3] == 0 {
                 TRANSPARENT_WEIGHT
             } else {
@@ -1324,35 +1346,54 @@ fn scale2x_epx(src: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
     let dh = h.checked_mul(2)?;
     let len = dw.checked_mul(dh)?.checked_mul(BYTES_PER_PIXEL)?;
     let mut out = alloc_zeroed(len)?;
+    let src_stride = w * BYTES_PER_PIXEL;
+    let dst_stride = dw * BYTES_PER_PIXEL;
 
     for y in 0..h {
+        let y_above = if y > 0 { y - 1 } else { y };
+        let y_below = if y + 1 < h { y + 1 } else { y };
+        let row_a = &src[y_above * src_stride..y_above * src_stride + src_stride];
+        let row_p = &src[y * src_stride..y * src_stride + src_stride];
+        let row_c = &src[y_below * src_stride..y_below * src_stride + src_stride];
+        let out_y0 = (2 * y) * dst_stride;
+        let out_y1 = out_y0 + dst_stride;
+
         for x in 0..w {
-            let p = read_px(src, w, x, y);
-            let a = if y > 0 { read_px(src, w, x, y - 1) } else { p };
+            let xi = x * BYTES_PER_PIXEL;
+            let p = [row_p[xi], row_p[xi + 1], row_p[xi + 2], row_p[xi + 3]];
+            let a = [row_a[xi], row_a[xi + 1], row_a[xi + 2], row_a[xi + 3]];
+            let c = [row_c[xi], row_c[xi + 1], row_c[xi + 2], row_c[xi + 3]];
             let b = if x + 1 < w {
-                read_px(src, w, x + 1, y)
+                let bi = xi + BYTES_PER_PIXEL;
+                [row_p[bi], row_p[bi + 1], row_p[bi + 2], row_p[bi + 3]]
             } else {
                 p
             };
-            let c = if y + 1 < h {
-                read_px(src, w, x, y + 1)
+            let d = if x > 0 {
+                let di = xi - BYTES_PER_PIXEL;
+                [row_p[di], row_p[di + 1], row_p[di + 2], row_p[di + 3]]
             } else {
                 p
             };
-            let d = if x > 0 { read_px(src, w, x - 1, y) } else { p };
 
-            // Top-left, top-right, bottom-left, bottom-right quadrants.
-            let e0 = if a == d && d != c && a != b { d } else { p };
-            let e1 = if a == b && a != d && b != c { b } else { p };
-            let e2 = if d == c && d != a && c != b { d } else { p };
-            let e3 = if b == c && b != a && c != d { b } else { p };
+            let (e0, e1, e2, e3) = if a == p && b == p && c == p && d == p {
+                (p, p, p, p)
+            } else {
+                (
+                    if a == d && d != c && a != b { d } else { p },
+                    if a == b && a != d && b != c { b } else { p },
+                    if d == c && d != a && c != b { d } else { p },
+                    if b == c && b != a && c != d { b } else { p },
+                )
+            };
 
-            let ox = 2 * x;
-            let oy = 2 * y;
-            write_px(&mut out, dw, ox, oy, e0);
-            write_px(&mut out, dw, ox + 1, oy, e1);
-            write_px(&mut out, dw, ox, oy + 1, e2);
-            write_px(&mut out, dw, ox + 1, oy + 1, e3);
+            let ox = 2 * x * BYTES_PER_PIXEL;
+            out[out_y0 + ox..out_y0 + ox + BYTES_PER_PIXEL].copy_from_slice(&e0);
+            out[out_y0 + ox + BYTES_PER_PIXEL..out_y0 + ox + 2 * BYTES_PER_PIXEL]
+                .copy_from_slice(&e1);
+            out[out_y1 + ox..out_y1 + ox + BYTES_PER_PIXEL].copy_from_slice(&e2);
+            out[out_y1 + ox + BYTES_PER_PIXEL..out_y1 + ox + 2 * BYTES_PER_PIXEL]
+                .copy_from_slice(&e3);
         }
     }
 

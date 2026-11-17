@@ -202,28 +202,42 @@ fn clean_edge_rotate_generic_opts(
     // destination pixel `[dx - 0.5, dx + 0.5]` (and likewise for `y`).
     let step = 1.0 / ss as f64;
     let half = step / 2.0;
+    let step_x = cos_t * step;
+    let step_y = -sin_t * step;
+    let wf = w as f64;
+    let hf = h as f64;
 
     // Reusable per-pixel fragment tally (≤ ss² entries; ss ≤ SUPERSAMPLE).
     let mut keys = [[0u8; 4]; SUPERSAMPLE * SUPERSAMPLE];
     let mut counts = [0u32; SUPERSAMPLE * SUPERSAMPLE];
 
     for dy in 0..h_prime {
+        let rel_y_center = dy as f64 - dst_cy;
         for dx in 0..w_prime {
+            let rel_x_center = dx as f64 - dst_cx;
+            let sx_c = cos_t * rel_x_center + sin_t * rel_y_center + src_cx;
+            let sy_c = -sin_t * rel_x_center + cos_t * rel_y_center + src_cy;
+
+            // Every fragment's 21-neighbour footprint (±2 around `ceil(sx)-1`)
+            // stays strictly out-of-bounds when the pixel centre is >3.5 px
+            // outside the source rect; output stays zeroed transparent.
+            if sx_c < -3.5 || sx_c > wf + 2.5 || sy_c < -3.5 || sy_c > hf + 2.5 {
+                continue;
+            }
+
             let mut n = 0usize;
             for j in 0..ss {
                 let oy = -0.5 + half + j as f64 * step;
-                for i in 0..ss {
-                    let ox = -0.5 + half + i as f64 * step;
+                let rel_y = dy as f64 + oy - dst_cy;
+                let rel_x0 = dx as f64 + (-0.5 + half) - dst_cx;
+                let mut sx = cos_t * rel_x0 + sin_t * rel_y + src_cx;
+                let mut sy = -sin_t * rel_x0 + cos_t * rel_y + src_cy;
 
-                    let rel_x = dx as f64 + ox - dst_cx;
-                    let rel_y = dy as f64 + oy - dst_cy;
-
-                    // Inverse (clockwise) rotation into source space.
-                    let sx = cos_t * rel_x + sin_t * rel_y + src_cx;
-                    let sy = -sin_t * rel_x + cos_t * rel_y + src_cy;
-
+                for _ in 0..ss {
                     let col =
                         clean_edge_pixel(src, w, h, sx, sy, cleanup, &palette, tables.as_ref());
+                    sx += step_x;
+                    sy += step_y;
 
                     // Alpha-weighted plurality tally (palette-pure: only
                     // fragment colours are ever emitted).
@@ -330,6 +344,34 @@ fn clean_edge_pixel(
     let ddb = sample(-1, 2);
     let dd = sample(0, 2);
     let ddf = sample(1, 2);
+
+    // Uniform-neighbourhood fast path (bit-identical): if all 21 neighbours
+    // share the exact same colour, `similar` is true and `higher` is false for
+    // every pair, so none of the three `slice_dist` passes can ever override `c`.
+    let cr = c.raw;
+    if u.raw == cr
+        && d.raw == cr
+        && b.raw == cr
+        && f.raw == cr
+        && ub.raw == cr
+        && uf.raw == cr
+        && db.raw == cr
+        && df.raw == cr
+        && uub.raw == cr
+        && uu.raw == cr
+        && uuf.raw == cr
+        && ubb.raw == cr
+        && uff.raw == cr
+        && bb.raw == cr
+        && ff.raw == cr
+        && dbb.raw == cr
+        && dff.raw == cr
+        && ddb.raw == cr
+        && dd.raw == cr
+        && ddf.raw == cr
+    {
+        return cr;
+    }
 
     let point = [local_x, local_y];
     let point_dir = [pdx as f64, pdy as f64];

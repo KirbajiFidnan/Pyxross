@@ -34,10 +34,10 @@ const MAX_REGION_SIDE: u32 = 4096;
 const MAX_REGION_COUNT: u32 = 256;
 
 /// Fixed minimum size of the (non-resizable) floating window.
-const RESIZE_CANVAS_MIN_SIZE: egui::Vec2 = vec2(260.0, 180.0);
+const RESIZE_CANVAS_MIN_SIZE: egui::Vec2 = vec2(420.0, 260.0);
 
 /// Side of one pivot-grid cell, in points.
-const PIVOT_CELL: f32 = 18.0;
+const PIVOT_CELL: f32 = 22.0;
 
 /// Gap between pivot-grid cells, in points.
 const PIVOT_GAP: f32 = 2.0;
@@ -118,20 +118,45 @@ fn pivot_for_index(index: usize) -> Pivot {
     }
 }
 
-/// 3×3 pivot selector: the selected cell is drawn dark/filled, the rest are
-/// empty. Clicking a different cell sets `*pivot` and returns `true`; clicking
-/// the already-selected cell (or no cell) returns `false`.
+/// Human-readable label for a [`Pivot`] cell tooltip.
+fn pivot_label(pivot: Pivot) -> &'static str {
+    match pivot {
+        Pivot::TopLeft => "Top-Left",
+        Pivot::TopCenter => "Top-Center",
+        Pivot::TopRight => "Top-Right",
+        Pivot::MidLeft => "Mid-Left",
+        Pivot::Center => "Center",
+        Pivot::MidRight => "Mid-Right",
+        Pivot::BottomLeft => "Bottom-Left",
+        Pivot::BottomCenter => "Bottom-Center",
+        Pivot::BottomRight => "Bottom-Right",
+    }
+}
+
+/// 3×3 pivot selector: the selected cell is drawn filled with an inner dot,
+/// hovered cells highlight, and clicking any cell sets `*pivot`.
 ///
-/// Colors come from `ui.visuals()` (the active theme), never hard-coded.
+/// Uses `ui.id().with(...)` so multiple pivot grids in the same window never
+/// collide on widget IDs. Colors come from `ui.visuals()` (the active theme),
+/// never hard-coded.
 pub fn pivot_grid(ui: &mut egui::Ui, pivot: &mut Pivot) -> bool {
     let side = PIVOT_CELL * 3.0 + PIVOT_GAP * 2.0;
     let (rect, _) = ui.allocate_exact_size(vec2(side, side), egui::Sense::hover());
 
-    let (selected_fill, selected_stroke, empty_fill, empty_stroke) = {
+    let (
+        selected_fill,
+        selected_stroke,
+        hovered_fill,
+        hovered_stroke,
+        empty_fill,
+        empty_stroke,
+    ) = {
         let visuals = ui.visuals();
         (
             visuals.selection.bg_fill,
             visuals.selection.stroke,
+            visuals.widgets.hovered.bg_fill,
+            visuals.widgets.hovered.bg_stroke,
             visuals.widgets.inactive.bg_fill,
             visuals.widgets.inactive.bg_stroke,
         )
@@ -148,15 +173,20 @@ pub fn pivot_grid(ui: &mut egui::Ui, pivot: &mut Pivot) -> bool {
             ),
             vec2(PIVOT_CELL, PIVOT_CELL),
         );
-        let response = ui.interact(
-            cell_rect,
-            egui::Id::new(("resize-canvas-pivot", index)),
-            egui::Sense::click(),
-        );
         let target = pivot_for_index(index);
+        let response = ui
+            .interact(
+                cell_rect,
+                ui.id().with(("resize-canvas-pivot", index)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(pivot_label(target));
         let selected = *pivot == target;
         let (fill, stroke) = if selected {
             (selected_fill, selected_stroke)
+        } else if response.hovered() {
+            (hovered_fill, hovered_stroke)
         } else {
             (empty_fill, empty_stroke)
         };
@@ -167,6 +197,10 @@ pub fn pivot_grid(ui: &mut egui::Ui, pivot: &mut Pivot) -> bool {
             stroke,
             egui::StrokeKind::Inside,
         );
+        if selected {
+            ui.painter()
+                .circle_filled(cell_rect.center(), 3.0, selected_stroke.color);
+        }
         if response.clicked() && !selected {
             *pivot = target;
             changed = true;
@@ -208,81 +242,126 @@ fn push_resize_counts(host: &ResizeCanvasHost) {
 
 /// Left section: resize the single region (size, pivot, resample) and Apply.
 fn resize_regions_section(ui: &mut egui::Ui, host: &ResizeCanvasHost, chrome: &PanelChrome) {
-    ui.strong("resize regions");
+    ui.push_id("resize_regions_section", |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong("Resize Regions");
+            ui.add_space(4.0);
 
-    // The locals are copied out of the host so the borrow is released before
-    // the widgets run; on change the edited values are written back.
-    let (mut region_w, mut region_h) = {
-        let view = host.view.borrow();
-        (view.region_w, view.region_h)
-    };
-    ui.horizontal(|ui| {
-        ui.label("width");
-        let w = ui.add(egui::DragValue::new(&mut region_w).range(1..=MAX_REGION_SIDE));
-        ui.label("height");
-        let h = ui.add(egui::DragValue::new(&mut region_h).range(1..=MAX_REGION_SIDE));
-        if w.changed() || h.changed() {
-            let mut view = host.view.borrow_mut();
-            view.region_w = region_w.max(1);
-            view.region_h = region_h.max(1);
-        }
+            // The locals are copied out of the host so the borrow is released before
+            // the widgets run; on change the edited values are written back.
+            let (mut region_w, mut region_h) = {
+                let view = host.view.borrow();
+                (view.region_w, view.region_h)
+            };
+            egui::Grid::new("resize_regions_dims")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Width");
+                    let w = ui.add(
+                        egui::DragValue::new(&mut region_w)
+                            .range(1..=MAX_REGION_SIDE)
+                            .suffix(" px"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Height");
+                    let h = ui.add(
+                        egui::DragValue::new(&mut region_h)
+                            .range(1..=MAX_REGION_SIDE)
+                            .suffix(" px"),
+                    );
+                    ui.end_row();
+
+                    if w.changed() || h.changed() {
+                        let mut view = host.view.borrow_mut();
+                        view.region_w = region_w.max(1);
+                        view.region_h = region_h.max(1);
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.label("Anchor");
+            let mut pivot = host.view.borrow().region_pivot;
+            if pivot_grid(ui, &mut pivot) {
+                host.view.borrow_mut().region_pivot = pivot;
+            }
+
+            ui.add_space(4.0);
+            let mut resample = host.view.borrow().resample;
+            if ui.checkbox(&mut resample, "Resample pixels").changed() {
+                host.view.borrow_mut().resample = resample;
+            }
+
+            ui.add_space(4.0);
+            // Apply emits the CURRENT view values for the App shell to apply; the panel
+            // itself mutates no model.
+            if chrome
+                .button(ui, "Apply", ButtonStyle::plain())
+                .on_hover_text("Resize each region")
+                .clicked()
+            {
+                push_resize_regions(host);
+            }
+        });
     });
-
-    ui.strong("pivot point");
-    let mut pivot = host.view.borrow().region_pivot;
-    if pivot_grid(ui, &mut pivot) {
-        host.view.borrow_mut().region_pivot = pivot;
-    }
-
-    let mut resample = host.view.borrow().resample;
-    if ui.checkbox(&mut resample, "resample regions").changed() {
-        host.view.borrow_mut().resample = resample;
-    }
-
-    // Apply emits the CURRENT view values for the App shell to apply; the panel
-    // itself mutates no model.
-    if chrome
-        .button(ui, "Apply", ButtonStyle::plain())
-        .on_hover_text("Resize each region")
-        .clicked()
-    {
-        push_resize_regions(host);
-    }
 }
 
 /// Right section: resize the region counts (size, pivot) and Apply.
 fn resize_counts_section(ui: &mut egui::Ui, host: &ResizeCanvasHost, chrome: &PanelChrome) {
-    ui.strong("resize numbers of regions");
+    ui.push_id("resize_counts_section", |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong("Resize Region Count");
+            ui.add_space(4.0);
 
-    let (mut count_w, mut count_h) = {
-        let view = host.view.borrow();
-        (view.count_w, view.count_h)
-    };
-    ui.horizontal(|ui| {
-        ui.label("width");
-        let w = ui.add(egui::DragValue::new(&mut count_w).range(1..=MAX_REGION_COUNT));
-        ui.label("height");
-        let h = ui.add(egui::DragValue::new(&mut count_h).range(1..=MAX_REGION_COUNT));
-        if w.changed() || h.changed() {
-            let mut view = host.view.borrow_mut();
-            view.count_w = count_w.max(1);
-            view.count_h = count_h.max(1);
-        }
+            let (mut count_w, mut count_h) = {
+                let view = host.view.borrow();
+                (view.count_w, view.count_h)
+            };
+            egui::Grid::new("resize_counts_dims")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Columns");
+                    let w =
+                        ui.add(egui::DragValue::new(&mut count_w).range(1..=MAX_REGION_COUNT));
+                    ui.end_row();
+
+                    ui.label("Rows");
+                    let h =
+                        ui.add(egui::DragValue::new(&mut count_h).range(1..=MAX_REGION_COUNT));
+                    ui.end_row();
+
+                    if w.changed() || h.changed() {
+                        let mut view = host.view.borrow_mut();
+                        view.count_w = count_w.max(1);
+                        view.count_h = count_h.max(1);
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.label("Anchor");
+            let mut pivot = host.view.borrow().count_pivot;
+            if pivot_grid(ui, &mut pivot) {
+                host.view.borrow_mut().count_pivot = pivot;
+            }
+
+            ui.add_space(4.0);
+            // Keep Apply aligned with the left column's checkbox row.
+            ui.label("");
+            ui.add_space(4.0);
+
+            if chrome
+                .button(ui, "Apply", ButtonStyle::plain())
+                .on_hover_text("Resize the region grid")
+                .clicked()
+            {
+                push_resize_counts(host);
+            }
+        });
     });
-
-    ui.strong("pivot point");
-    let mut pivot = host.view.borrow().count_pivot;
-    if pivot_grid(ui, &mut pivot) {
-        host.view.borrow_mut().count_pivot = pivot;
-    }
-
-    if chrome
-        .button(ui, "Apply", ButtonStyle::plain())
-        .on_hover_text("Resize the region grid")
-        .clicked()
-    {
-        push_resize_counts(host);
-    }
 }
 
 /// The resize form: the region section and the counts section side by side.
@@ -420,6 +499,128 @@ mod tests {
                 count_h: 4,
                 count_pivot: Pivot::Center,
             }
+        );
+    }
+
+    #[test]
+    fn both_pivot_grids_are_clickable_independently_without_id_collision() {
+        use crate::ui::input_capture::{InputCapture, SurfaceId};
+        use crate::ui::theme::Theme;
+
+        let host = ResizeCanvasHost::default();
+        let mut nest = build_resize_canvas_nest(&host);
+        let theme = Theme::default_dark();
+        let capture = InputCapture::default();
+        let chrome = PanelChrome::flat(
+            &theme,
+            &capture,
+            SurfaceId::Panel(PanelId::new(RESIZE_CANVAS_PANEL_ID)),
+        );
+        let ctx = egui::Context::default();
+
+        // First pass: lay out the full panel in a 440x280 frame to verify it
+        // runs cleanly at the new window size.
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(440.0, 280.0));
+        let mut raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        ctx.run_ui(raw.clone(), |ui| {
+            nest.ui(ui, &chrome);
+        })
+        .textures_delta
+        .clear();
+
+        let mut p1 = Pivot::Center;
+        let mut p2 = Pivot::Center;
+        let mut cell0_pos = None;
+        let mut cell8_pos = None;
+        ctx.run_ui(raw.clone(), |ui| {
+            ui.columns(2, |cols| {
+                cols[0].push_id("resize_regions_section", |ui| {
+                    let r = ui.cursor();
+                    pivot_grid(ui, &mut p1);
+                    cell0_pos = Some(r.min + vec2(PIVOT_CELL * 0.5, PIVOT_CELL * 0.5));
+                });
+                cols[1].push_id("resize_counts_section", |ui| {
+                    let r = ui.cursor();
+                    pivot_grid(ui, &mut p2);
+                    let step = PIVOT_CELL + PIVOT_GAP;
+                    cell8_pos = Some(
+                        r.min + vec2(step * 2.0 + PIVOT_CELL * 0.5, step * 2.0 + PIVOT_CELL * 0.5),
+                    );
+                });
+            });
+        })
+        .textures_delta
+        .clear();
+
+        // Click TopLeft on the left pivot grid and verify ONLY p1 changes.
+        let pos0 = cell0_pos.expect("left pivot cell 0 pos");
+        raw.events = vec![
+            egui::Event::PointerMoved(pos0),
+            egui::Event::PointerButton {
+                pos: pos0,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: pos0,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        ctx.run_ui(raw.clone(), |ui| {
+            ui.columns(2, |cols| {
+                cols[0].push_id("resize_regions_section", |ui| {
+                    pivot_grid(ui, &mut p1);
+                });
+                cols[1].push_id("resize_counts_section", |ui| {
+                    pivot_grid(ui, &mut p2);
+                });
+            });
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(p1, Pivot::TopLeft, "left pivot grid must respond to click");
+        assert_eq!(p2, Pivot::Center, "right pivot grid must stay untouched");
+
+        // Click BottomRight on the right pivot grid and verify ONLY p2 changes.
+        let pos8 = cell8_pos.expect("right pivot cell 8 pos");
+        raw.events = vec![
+            egui::Event::PointerMoved(pos8),
+            egui::Event::PointerButton {
+                pos: pos8,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: pos8,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        ctx.run_ui(raw, |ui| {
+            ui.columns(2, |cols| {
+                cols[0].push_id("resize_regions_section", |ui| {
+                    pivot_grid(ui, &mut p1);
+                });
+                cols[1].push_id("resize_counts_section", |ui| {
+                    pivot_grid(ui, &mut p2);
+                });
+            });
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(p1, Pivot::TopLeft);
+        assert_eq!(
+            p2,
+            Pivot::BottomRight,
+            "right pivot grid must respond to click"
         );
     }
 }

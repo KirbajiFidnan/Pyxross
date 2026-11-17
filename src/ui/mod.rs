@@ -28,10 +28,12 @@ pub mod dock_import_gif_panel;
 pub mod dock_import_image_panel;
 pub mod dock_layers_panel;
 pub mod dock_layers_settings;
+pub mod dock_recovery_panel;
 pub mod dock_resize_canvas_panel;
 pub mod dock_tile_palette_panel;
 pub mod dock_tool_property_panel;
 pub mod dock_toolbox_panel;
+pub mod dock_unsaved_guard_panel;
 pub mod host_registry;
 pub mod input_capture;
 pub mod keybindings;
@@ -102,7 +104,7 @@ use dock_color_palette_panel::{palette_panel_spec, PalettePanelEvent};
 use dock_hosts::{
     ColorPickerView, LayerRow, LayerView, PaletteView, TilePlacerView, ToolboxView,
 };
-use dock_tile_palette_panel::{tile_palette_panel_spec, TilePalettePanelEvent, TilePaletteView};
+use dock_tile_palette_panel::{tile_palette_panel_spec, TilePalettePanelEvent};
 use host_registry::{ContextGenerationService, ContextSnapshot, WindowHostRegistry};
 use input_capture::{InputCapture, SurfaceId};
 use keybindings::KeybindingsPanel;
@@ -316,6 +318,10 @@ struct App {
     /// Shared cells for the floating "Import Image" panel (id 210). The modal
     /// form (split by pixels / by regions) is validated by the panel.
     import_image_host: dock_import_image_panel::ImportImageHost,
+    /// Shared cells for the floating "Unsaved Changes" panel (id 211).
+    unsaved_guard_host: dock_unsaved_guard_panel::UnsavedGuardHost,
+    /// Shared cells for the floating "Recover Unsaved Work?" panel (id 212).
+    recovery_host: dock_recovery_panel::RecoveryHost,
     /// Decoded GIF awaiting the Import GIF panel's confirmation.
     pending_gif_import: Option<PendingGifImport>,
     /// Decoded PNG awaiting the Import Image panel's confirmation.
@@ -570,6 +576,8 @@ impl Default for App {
             resize_canvas_host: dock_resize_canvas_panel::ResizeCanvasHost::default(),
             import_gif_host: dock_import_gif_panel::ImportGifHost::new(),
             import_image_host: dock_import_image_panel::ImportImageHost::new(),
+            unsaved_guard_host: dock_unsaved_guard_panel::UnsavedGuardHost::new(),
+            recovery_host: dock_recovery_panel::RecoveryHost::new(),
             pending_gif_import: None,
             pending_image_import: None,
             last_dir: discover_last_dir(),
@@ -1626,6 +1634,21 @@ impl App {
             // `drain_file_chooser_events` → the two-step Import panels.
             top_bar::MenuAction::ImportImages => self.file_import_png(),
             top_bar::MenuAction::ImportGif => self.file_import_gif(),
+            top_bar::MenuAction::ExportSpriteSheet => self.file_export_sprite_sheet(),
+            top_bar::MenuAction::ExportGif => self.file_export_gif(),
+            top_bar::MenuAction::ExportSelected => self.file_export_selected(),
+            top_bar::MenuAction::Undo => self.undo_document(),
+            top_bar::MenuAction::Redo => self.redo_document(),
+            top_bar::MenuAction::Cut => self.cut_selection(),
+            top_bar::MenuAction::Copy => self.copy_selection(),
+            top_bar::MenuAction::Paste => self.paste_clipboard_as_transform(),
+            top_bar::MenuAction::DeleteSelection => self.delete_selection(),
+            top_bar::MenuAction::SelectAll => self.select_all(),
+            top_bar::MenuAction::Deselect => self.deselect(),
+            top_bar::MenuAction::InvertSelection => self.invert_selection(),
+            top_bar::MenuAction::FlipSelectionHorizontal => self.flip_selection(true),
+            top_bar::MenuAction::FlipSelectionVertical => self.flip_selection(false),
+            top_bar::MenuAction::RotateSelection => self.rotate_selection(),
             // File ops are handled by `file_op_for` above.
             top_bar::MenuAction::SaveProject
             | top_bar::MenuAction::SaveProjectAs
@@ -1643,9 +1666,21 @@ impl App {
             self.panel_dock.raise_floating(panel_id);
             return;
         }
+        {
+            let s = self.projects.current();
+            let tw = s.tile_size.w.max(1);
+            let th = s.tile_size.h.max(1);
+            let cw = (s.layers.width() as u32 / tw).max(1);
+            let ch = (s.layers.height() as u32 / th).max(1);
+            let mut view = self.resize_canvas_host.view.borrow_mut();
+            view.region_w = tw;
+            view.region_h = th;
+            view.count_w = cw;
+            view.count_h = ch;
+        }
         let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(380.0, 180.0),
-            egui::vec2(300.0, 260.0),
+            egui::pos2(340.0, 160.0),
+            egui::vec2(440.0, 280.0),
         );
         let spec = dock_resize_canvas_panel::resize_canvas_panel_spec(
             &self.resize_canvas_host,
@@ -1916,6 +1951,15 @@ impl App {
     ) {
         self.import_gif_host
             .seed(path, frame_count, frame_w, frame_h, MAX_FRAMES);
+        if let Some(pending) = &self.pending_gif_import {
+            let frames = pending
+                .decode
+                .frames
+                .iter()
+                .map(|f| f.rgba.clone())
+                .collect();
+            self.import_gif_host.set_preview_frames(frames);
+        }
         let panel_id = panel_dock::PanelId::new(dock_import_gif_panel::IMPORT_GIF_PANEL_ID);
         if self.panel_dock.placement(panel_id).is_some() {
             self.panel_dock.raise_floating(panel_id);
@@ -1971,6 +2015,10 @@ impl App {
             IMPORT_MAX_CANVAS_SIDE,
             MAX_FRAMES,
         );
+        if let Some(pending) = &self.pending_image_import {
+            self.import_image_host
+                .set_preview_rgba(pending.image.rgba.clone());
+        }
         let panel_id = panel_dock::PanelId::new(dock_import_image_panel::IMPORT_IMAGE_PANEL_ID);
         if self.panel_dock.placement(panel_id).is_some() {
             self.panel_dock.raise_floating(panel_id);
@@ -2033,7 +2081,12 @@ impl App {
             .collect();
         for event in events {
             match event {
-                dock_save_as_panel::SaveAsEvent::Cancel => self.close_save_as_panel(),
+                dock_save_as_panel::SaveAsEvent::Cancel => {
+                    self.close_save_as_panel();
+                    if self.projects.active_id().is_some() {
+                        self.projects.current_mut().pending_action = None;
+                    }
+                }
                 dock_save_as_panel::SaveAsEvent::BrowseLocation => {
                     let start = {
                         let view = self.save_as_host.view.borrow();
@@ -2054,6 +2107,11 @@ impl App {
                 dock_save_as_panel::SaveAsEvent::Save { path, .. } => {
                     if self.save_as_target(&path) {
                         self.close_save_as_panel();
+                        if self.projects.active_id().is_some()
+                            && self.projects.current().pending_action.is_some()
+                        {
+                            self.execute_pending();
+                        }
                     }
                 }
             }
@@ -2194,16 +2252,22 @@ impl App {
         let old_tile = self.projects.current().tile_size;
         let old_w = self.projects.current().layers.width() as u32;
         let old_h = self.projects.current().layers.height() as u32;
-        let count_w = (old_w / old_tile.w).max(1);
-        let count_h = (old_h / old_tile.h).max(1);
-        let (new_w, new_h) = crate::core::canvas_resize::canvas_size(w, h, count_w, count_h);
+        let count_w = (old_w / old_tile.w.max(1)).max(1);
+        let count_h = (old_h / old_tile.h.max(1)).max(1);
+        let new_tile = TileSize::new(w, h);
+        let (new_w, new_h) =
+            crate::core::canvas_resize::canvas_size(new_tile.w, new_tile.h, count_w, count_h);
         let (new_w, new_h) = (new_w.max(1), new_h.max(1));
-        self.projects
-            .current_mut()
-            .layers
-            .resize_canvas(new_w as usize, new_h as usize, pivot, resample);
-        self.projects.current_mut().tile_size = TileSize::new(w, h);
-        self.scale_frames_to_canvas(w, h, old_tile, new_w as i32, new_h as i32);
+        self.projects.current_mut().layers.resize_regions(
+            old_tile,
+            new_tile,
+            count_w,
+            count_h,
+            pivot,
+            resample,
+        );
+        self.projects.current_mut().tile_size = new_tile;
+        self.scale_frames_to_canvas(new_tile.w, new_tile.h, old_tile, new_w as i32, new_h as i32);
     }
 
     /// Clamp every frame's region rect into `0..new_w × 0..new_h` (overflow is
@@ -3069,11 +3133,14 @@ impl App {
             primary: session.color,
             secondary: session.secondary_color,
         };
-        *self.tile_palette_host.view.borrow_mut() = TilePaletteView {
-            tiles: session.tile_palette.tiles.clone(),
-            selected: session.tile_palette.selected,
-            pixel_overrides: self.live_tile_pixel_overrides(),
-        };
+        {
+            let mut tile_view = self.tile_palette_host.view.borrow_mut();
+            if tile_view.tiles != session.tile_palette.tiles {
+                tile_view.tiles = session.tile_palette.tiles.clone();
+            }
+            tile_view.selected = session.tile_palette.selected;
+            tile_view.pixel_overrides = self.live_tile_pixel_overrides();
+        }
         // Animation panels snapshot: the list, the settings row (only while the
         // floating settings panel is open) and the transport/onion/loop cells.
         let active_animation = session.animations.active();
@@ -3208,6 +3275,16 @@ impl App {
         }
         if id.raw() == dock_color_picker_panel::COLOR_PICKER_PANEL_ID {
             self.color_picker_host.view.borrow_mut().open = false;
+        }
+        if id.raw() == dock_unsaved_guard_panel::UNSAVED_GUARD_PANEL_ID
+            && self.projects.active_id().is_some()
+        {
+            self.guard_cancel();
+        }
+        if id.raw() == dock_recovery_panel::RECOVERY_PANEL_ID
+            && self.projects.active_id().is_some()
+        {
+            self.recovery_discard();
         }
     }
 
@@ -3831,6 +3908,20 @@ impl App {
         self.clear_selection();
     }
 
+    /// Select the entire canvas on the active layer (committing any live
+    /// floating transform first).
+    fn select_all(&mut self) {
+        self.transform_session_commit();
+        let captured = {
+            let buf = &self.projects.current().layers.active_layer().buffer;
+            let rect = Rect2i::new(0, 0, buf.width() as i32, buf.height() as i32);
+            Selection::capture(buf, rect)
+        };
+        let session = self.projects.current_mut();
+        session.selection = captured;
+        session.gesture = SelectGesture::Idle;
+    }
+
     /// The current selection's marching-ants overlay.
     ///
     /// Every committed selection is drawn the same way (D76): the mask
@@ -4387,18 +4478,24 @@ impl App {
             return Self::selection_overlay(sel);
         }
         // Persistent frame-region borders for the ACTIVE animation: a
-        // tool-independent marching-ants highlight of every frame region. It is
-        // the LOWEST overlay priority — tool overlays (Tile/AnimationPlacer),
-        // the transform gizmo, live selection gestures and the committed
-        // selection all win when active, so frame regions never mask what the
-        // artist is doing. The Animation Placer tool's richer red/green/grey
-        // overlay is handled above.
+        // tool-independent marching-ants highlight of every frame region. Skip
+        // the default single full-canvas frame on a fresh document so the
+        // workspace does not open with a yellow border around the whole screen.
         {
-            let sequence = self.projects.current().sequence();
+            let session = self.projects.current();
+            let sequence = session.sequence();
             if sequence.len() > 0 {
+                let full_canvas = Rect2i::new(
+                    0,
+                    0,
+                    session.layers.width() as i32,
+                    session.layers.height() as i32,
+                );
                 let regions: Vec<Rect2i> =
                     sequence.iter().map(|frame| frame.region().rect()).collect();
-                return CanvasOverlay::FrameRegions(regions);
+                if !(regions.len() == 1 && regions[0] == full_canvas) {
+                    return CanvasOverlay::FrameRegions(regions);
+                }
             }
         }
         CanvasOverlay::None
@@ -8571,7 +8668,7 @@ impl App {
     /// archive.
     fn file_save_as(&mut self) -> bool {
         self.open_save_as_panel(dock_save_as_panel::SaveAsKind::Project, None);
-        true
+        false
     }
 
     /// Remember the directory a file dialog resolved to as `last_dir` and
@@ -8784,7 +8881,9 @@ impl App {
                 self.projects.current_mut().mark_saved();
                 self.close_project(project, project::CloseProject::Discard)
                     .expect("saved pending close must remove its project");
-                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if self.projects.active_id().is_none() {
+                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
     }
@@ -8879,27 +8978,60 @@ impl App {
         });
     }
 
-    /// Modal for the unsaved-changes guard: Save / Discard / Cancel.
-    fn unsaved_guard_dialog(&mut self) {
-        let ctx = self.ctx.clone();
-        egui::Modal::new(egui::Id::new("unsaved_guard_dialog")).show(&ctx, |ui| {
-            ui.heading("Unsaved Changes");
-            ui.label(format!(
-                "{} has unsaved changes.",
-                self.projects.current().name
-            ));
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+    /// Opens or closes the floating Unsaved Changes dock panel (id 211) to
+    /// match `pending_action` (hidden while Save As is open).
+    fn sync_unsaved_guard_panel(&mut self) {
+        let panel_id =
+            panel_dock::PanelId::new(dock_unsaved_guard_panel::UNSAVED_GUARD_PANEL_ID);
+        let save_as_open = self
+            .panel_dock
+            .placement(panel_dock::PanelId::new(
+                dock_save_as_panel::SAVE_AS_PANEL_ID,
+            ))
+            .is_some();
+        let should_open = self.projects.active_id().is_some()
+            && self.projects.current().pending_action.is_some()
+            && !save_as_open;
+
+        if !should_open {
+            if self.panel_dock.placement(panel_id).is_some() {
+                let _ = self.panel_dock.remove_spec(panel_id);
+            }
+            return;
+        }
+
+        let name = self.projects.current().name.clone();
+        self.unsaved_guard_host.set_document_name(name);
+        if self.panel_dock.placement(panel_id).is_some() {
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(420.0, 260.0),
+            egui::vec2(320.0, 120.0),
+        );
+        let spec = dock_unsaved_guard_panel::unsaved_guard_panel_spec(
+            &self.unsaved_guard_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_unsaved_guard_events(&mut self) {
+        for event in self.unsaved_guard_host.take_events() {
+            match event {
+                dock_unsaved_guard_panel::UnsavedGuardEvent::Save => {
                     self.guard_save();
                 }
-                if ui.button("Discard").clicked() {
+                dock_unsaved_guard_panel::UnsavedGuardEvent::Discard => {
                     self.guard_discard();
                 }
-                if ui.button("Cancel").clicked() {
+                dock_unsaved_guard_panel::UnsavedGuardEvent::Cancel => {
                     self.guard_cancel();
                 }
-            });
-        });
+            }
+        }
     }
 
     /// R6 F3: write a separate autosave copy under `autosave_base` and record
@@ -8932,7 +9064,6 @@ impl App {
                     Ok(()) => {
                         let session = self.projects.current_mut();
                         session.recovery = Some(journal);
-                        session.recovery_pending = true;
                         session.autosave_generation = session.autosave_generation.wrapping_add(1);
                         session.last_autosave = Some(Instant::now());
                         session.last_error = None;
@@ -8949,34 +9080,60 @@ impl App {
         }
     }
 
-    /// R6 F4: modal offering to restore the journaled autosave after a crash.
-    fn recovery_dialog(&mut self) {
-        let ctx = self.ctx.clone();
-        egui::Modal::new(egui::Id::new("recovery_dialog")).show(&ctx, |ui| {
-            ui.heading("Recover Unsaved Work?");
-            let name = self
-                .projects
-                .current()
-                .recovery
-                .as_ref()
-                .map(|r| r.project_name.clone())
-                .unwrap_or_default();
-            ui.label(format!("Pyxross found unsaved work from {name}."));
-            ui.horizontal(|ui| {
-                if ui.button("Restore").clicked() {
+    /// R6 F4: opens or closes the floating Recover Unsaved Work dock panel (id 212)
+    /// to match `recovery_pending` and `recovery`.
+    fn sync_recovery_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_recovery_panel::RECOVERY_PANEL_ID);
+        let should_open = self.projects.active_id().is_some()
+            && self.projects.current().recovery_pending
+            && self.projects.current().recovery.is_some();
+
+        if !should_open {
+            if self.panel_dock.placement(panel_id).is_some() {
+                let _ = self.panel_dock.remove_spec(panel_id);
+            }
+            return;
+        }
+
+        let name = self
+            .projects
+            .current()
+            .recovery
+            .as_ref()
+            .map(|r| r.project_name.clone())
+            .unwrap_or_default();
+        self.recovery_host.set_project_name(name);
+        if self.panel_dock.placement(panel_id).is_some() {
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(420.0, 260.0),
+            egui::vec2(340.0, 120.0),
+        );
+        let spec = dock_recovery_panel::recovery_panel_spec(&self.recovery_host, floating_rect);
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_recovery_events(&mut self) {
+        for event in self.recovery_host.take_events() {
+            match event {
+                dock_recovery_panel::RecoveryEvent::Restore => {
                     self.recovery_restore();
                 }
-                if ui.button("Discard").clicked() {
+                dock_recovery_panel::RecoveryEvent::Discard => {
                     self.recovery_discard();
                 }
-            });
-        });
+            }
+        }
     }
 
     /// R6 F4: load the journaled autosave, restore project identity, keep the
     /// document modified, and delete the journal.
     fn recovery_restore(&mut self) {
         let Some(journal) = self.projects.current_mut().recovery.clone() else {
+            self.clear_active_recovery();
             return;
         };
         match load_document(&journal.autosave_dir) {
@@ -8993,6 +9150,7 @@ impl App {
                 self.update_title();
             }
             Err(err) => {
+                self.clear_active_recovery();
                 self.projects.current_mut().last_error = Some(format!("Recovery failed: {err}"));
             }
         }
@@ -9690,6 +9848,11 @@ impl App {
         let top_bar_events = self.top_bar.drain_events();
         self.apply_top_bar_events(top_bar_events);
 
+        self.drain_unsaved_guard_events();
+        self.sync_unsaved_guard_panel();
+        self.drain_recovery_events();
+        self.sync_recovery_panel();
+
         // Feedback status line: render the session's last_error (e.g. "the
         // tile palette is empty", "cannot place tiles on a group layer")
         // so silent no-ops are
@@ -9811,6 +9974,7 @@ impl App {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.ui_frame(ui));
         });
+        let needs_redraw = self.needs_continuous_redraw(&full_output);
 
         {
             let Some(window) = self.window.as_ref() else {
@@ -9837,10 +10001,40 @@ impl App {
         }
         full_output.textures_delta.clear();
 
-        // Live loop: keep the canvas repainting so strokes and zoom stay smooth.
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+        if needs_redraw {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
         }
+    }
+
+    /// Returns `true` only when continuous frame-by-frame repainting is needed
+    /// (playback, animated marching ants, in-flight stroke/gesture, or egui
+    /// immediate repaint), so idle frames sleep at ~0% CPU under `ControlFlow::Wait`.
+    fn needs_continuous_redraw(&self, full_output: &egui::FullOutput) -> bool {
+        let active_busy = self.projects.active_id().is_some_and(|_| {
+            let s = self.projects.current();
+            s.animation.is_playing()
+                || s.stroke.is_some()
+                || !matches!(s.gesture, SelectGesture::Idle)
+                || s.transform.is_some()
+        });
+        if active_busy || self.os_paste_rx.is_some() {
+            return true;
+        }
+        if matches!(
+            self.canvas_widget.overlay(),
+            CanvasOverlay::Ants(_)
+                | CanvasOverlay::AntsMask(_)
+                | CanvasOverlay::FrameRegions(_)
+                | CanvasOverlay::RegionCells { .. }
+        ) {
+            return true;
+        }
+        full_output
+            .viewport_output
+            .values()
+            .any(|v| v.repaint_delay <= std::time::Duration::from_millis(50))
     }
 }
 
@@ -9987,10 +10181,14 @@ impl ApplicationHandler for App {
                 read_recovery_journal(&journal_base)
             })
             .flatten();
-        self.projects.current_mut().recovery = recovery;
+        let has_recovery = recovery.is_some();
+        let session = self.projects.current_mut();
+        session.recovery = recovery;
+        session.recovery_pending = has_recovery;
 
-        // Continuous polling keeps input latency minimal for live strokes.
-        event_loop.set_control_flow(ControlFlow::Poll);
+        // Event-driven redraws: sleep when idle, wake on input or when
+        // `needs_continuous_redraw` schedules the next frame.
+        event_loop.set_control_flow(ControlFlow::Wait);
         self.service_pending_native_hosts(event_loop);
     }
 
@@ -10441,6 +10639,44 @@ mod tests {
         // NN 2x: the single source pixel fills a 2x2 block.
         assert_eq!(buf.get_pixel(0, 0), Some(RED));
         assert_eq!(buf.get_pixel(1, 1), Some(RED));
+    }
+
+    #[test]
+    fn resize_regions_with_center_pivot_keeps_pixels_centered_inside_each_region() {
+        use crate::core::canvas_resize::Pivot;
+        let mut app = App::default();
+        let green = Color::rgba(0, 255, 0, 255);
+        {
+            let s = app.projects.current_mut();
+            s.tile_size = TileSize::square(4);
+            // 2x1 regions of 4x4 -> 8x4 canvas.
+            s.layers.resize_canvas(8, 4, Pivot::TopLeft, false);
+            // Region (0,0) has RED at its local (0,0) = (0,0);
+            // Region (1,0) has green at its local (0,0) = (4,0).
+            s.layers.active_layer_mut().buffer.set_pixel(0, 0, RED);
+            s.layers.active_layer_mut().buffer.set_pixel(4, 0, green);
+        }
+        app.resize_canvas_host
+            .events
+            .borrow_mut()
+            .push(dock_resize_canvas_panel::ResizeCanvasEvent::ResizeRegions {
+                w: 8,
+                h: 8,
+                pivot: Pivot::Center,
+                resample: false,
+            });
+        app.drain_resize_canvas_events();
+
+        let s = app.projects.current();
+        assert_eq!((s.layers.width(), s.layers.height()), (16, 8));
+        let buf = &s.layers.active_layer().buffer;
+        // Each 4x4 region grows to 8x8 centered -> local offset (+2, +2).
+        // Region (0,0) is 0..8 x 0..8 -> (2, 2).
+        // Region (1,0) is 8..16 x 0..8 -> (10, 2).
+        assert_eq!(buf.get_pixel(2, 2), Some(RED));
+        assert_eq!(buf.get_pixel(10, 2), Some(green));
+        assert_eq!(buf.get_pixel(0, 0), Some(Color::TRANSPARENT));
+        assert_eq!(buf.get_pixel(8, 0), Some(Color::TRANSPARENT));
     }
 
     #[test]
@@ -21735,7 +21971,10 @@ mod tests {
         );
         assert!(app.projects.current().last_autosave.is_some());
         assert_eq!(app.projects.current().autosave_generation, 1);
-        assert!(app.projects.current().recovery_pending);
+        assert!(
+            !app.projects.current().recovery_pending,
+            "live autosave must not raise the crash-recovery prompt"
+        );
         assert!(app.projects.current_mut().last_error.is_none());
         let journal_base = recovery_base_for(base.path(), app.projects.current().id);
         let journal = read_recovery_journal(&journal_base).unwrap();
@@ -21963,6 +22202,86 @@ mod tests {
                 .as_bytes(),
             &before[..]
         );
+    }
+
+    #[test]
+    fn recovery_restore_keeps_panel_closed_across_subsequent_autosave() {
+        let mut app = App::default();
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 4, 4));
+        app.projects.current_mut().name = "crash project".to_string();
+        let base = TempDir::new("f4_restore_stays_closed");
+        app.autosave_base = Some(base.path().to_path_buf());
+        let autosave_dir = autosave_dir_for(
+            base.path(),
+            &format!("{}-crash project", app.projects.current().id.raw()),
+        );
+        save_document(&app.app_to_document(), &autosave_dir).unwrap();
+        let journal_base = recovery_base_for(base.path(), app.projects.current().id);
+        write_recovery_journal(
+            &journal_base,
+            &RecoveryJournal {
+                format_version: FORMAT_VERSION,
+                project_dir: None,
+                autosave_dir,
+                project_name: "crash project".to_string(),
+                saved_at: 1,
+            },
+        )
+        .unwrap();
+        app.projects.current_mut().recovery = read_recovery_journal(&journal_base);
+        app.projects.current_mut().recovery_pending = true;
+
+        app.sync_recovery_panel();
+        let panel_id = panel_dock::PanelId::new(dock_recovery_panel::RECOVERY_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_some());
+
+        app.recovery_restore();
+        app.sync_recovery_panel();
+        assert!(!app.projects.current().recovery_pending);
+        assert!(app.panel_dock.placement(panel_id).is_none());
+
+        app.perform_autosave();
+        app.sync_recovery_panel();
+        assert!(!app.projects.current().recovery_pending);
+        assert!(app.panel_dock.placement(panel_id).is_none());
+    }
+
+    #[test]
+    fn recovery_discard_keeps_panel_closed_after_stroke_and_autosave() {
+        let mut app = App::default();
+        let base = TempDir::new("f4_discard_stays_closed");
+        app.autosave_base = Some(base.path().to_path_buf());
+        let journal_base = recovery_base_for(base.path(), app.projects.current().id);
+        write_recovery_journal(
+            &journal_base,
+            &RecoveryJournal {
+                format_version: FORMAT_VERSION,
+                project_dir: None,
+                autosave_dir: PathBuf::from("/tmp/stale"),
+                project_name: "stale".to_string(),
+                saved_at: 1,
+            },
+        )
+        .unwrap();
+        app.projects.current_mut().recovery = read_recovery_journal(&journal_base);
+        app.projects.current_mut().recovery_pending = true;
+
+        app.sync_recovery_panel();
+        let panel_id = panel_dock::PanelId::new(dock_recovery_panel::RECOVERY_PANEL_ID);
+        assert!(app.panel_dock.placement(panel_id).is_some());
+
+        app.recovery_discard();
+        app.sync_recovery_panel();
+        assert!(!app.projects.current().recovery_pending);
+        assert!(app.panel_dock.placement(panel_id).is_none());
+
+        // Simulate a stroke making the document dirty and triggering autosave.
+        seed_red_rect(&mut app, Rect2i::new(0, 0, 2, 2));
+        app.projects.current_mut().mark_dirty();
+        app.perform_autosave();
+        app.sync_recovery_panel();
+        assert!(!app.projects.current().recovery_pending);
+        assert!(app.panel_dock.placement(panel_id).is_none());
     }
 
     #[test]
@@ -22365,7 +22684,7 @@ mod tests {
         let view = app.import_image_host.view.borrow();
         assert_eq!(view.path, file);
         assert_eq!((view.img_w, view.img_h), (1, 1));
-        assert_eq!(view.pixels_text, "1x1");
+        assert_eq!((view.pixels_x_text.as_str(), view.pixels_y_text.as_str()), ("1", "1"));
     }
 
     #[test]
@@ -22430,6 +22749,41 @@ mod tests {
             dock_file_chooser_panel::FileChooserMode::ImportGif
         );
         assert!(app.panel_dock.placement(chooser_id).is_some());
+    }
+
+    #[test]
+    fn edit_menu_selection_actions_drive_select_all_invert_and_deselect() {
+        let mut app = App::default();
+        let (w, h) = {
+            let buf = &app.projects.current().layers.active_layer().buffer;
+            (buf.width() as usize, buf.height() as usize)
+        };
+        assert!(app.projects.current().selection.is_none());
+
+        app.apply_menu_action(top_bar::MenuAction::SelectAll);
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("SelectAll selects the full canvas");
+        assert_eq!(sel.pixel_count(), w * h);
+
+        app.apply_menu_action(top_bar::MenuAction::Deselect);
+        assert!(app.projects.current().selection.is_none());
+
+        app.projects.current_mut().selection = Selection::capture(
+            &app.projects.current().layers.active_layer().buffer,
+            Rect2i::new(0, 0, 2, 2),
+        );
+        app.apply_menu_action(top_bar::MenuAction::InvertSelection);
+        let inverted = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("InvertSelection produces complement selection");
+        assert_eq!(inverted.pixel_count(), w * h - 4);
     }
 
     #[test]
@@ -22657,8 +23011,8 @@ mod tests {
             let view = app.import_image_host.view.borrow();
             assert_eq!(view.path, path.path());
             assert_eq!((view.img_w, view.img_h), (64, 64));
-            assert_eq!(view.pixels_text, "64x64");
-            assert_eq!(view.regions_text, "1x1");
+            assert_eq!((view.pixels_x_text.as_str(), view.pixels_y_text.as_str()), ("64", "64"));
+            assert_eq!((view.regions_x_text.as_str(), view.regions_y_text.as_str()), ("1", "1"));
         }
         // Staging leaves the pre-existing project untouched.
         let old_before = import_state_of(&app, old_id);
@@ -30906,17 +31260,25 @@ mod tests {
     fn idle_overlay_highlights_the_active_animations_frame_regions() {
         let mut app = App::default();
         assert_eq!(app.projects.current().sequence().len(), 1);
-        let expected = app
-            .projects
-            .current()
-            .sequence()
-            .frame(0)
-            .unwrap()
-            .region()
-            .rect();
+        // A fresh document's single default full-canvas frame does NOT draw a
+        // full-screen yellow border on startup.
+        assert_eq!(
+            app.current_overlay(),
+            CanvasOverlay::None,
+            "default single full-canvas frame must not show a yellow border on startup"
+        );
+
+        // Once sub-regions or multiple frames exist, FrameRegions highlights them.
+        let r0 = Rect2i::new(0, 0, 16, 16);
+        let r1 = Rect2i::new(16, 0, 16, 16);
+        {
+            let sequence = app.projects.current_mut().sequence_mut();
+            sequence.frame_mut(0).unwrap().region.rect = r0;
+            sequence.push(Frame::new(Region::new(r1, "Frame 2"), 100));
+        }
         match app.current_overlay() {
             CanvasOverlay::FrameRegions(regions) => {
-                assert_eq!(regions, vec![expected], "idle frame-region highlight");
+                assert_eq!(regions, vec![r0, r1], "idle frame-region highlight");
             }
             other => panic!("expected FrameRegions, got {other:?}"),
         }
@@ -30943,5 +31305,37 @@ mod tests {
             CanvasOverlay::None,
             "no frames -> no frame-region highlight"
         );
+    }
+
+    #[test]
+    fn guard_save_on_neversaved_opens_save_as_and_completes_close_on_save() {
+        let mut app = App::default();
+        let dir = TempDir::new("guard_save_neversaved");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let target = dir.path().join("saved_on_close.pyxross");
+
+        let project = app.projects.active_id().unwrap();
+        app.mark_dirty();
+        app.projects.current_mut().pending_action = Some(PendingAction::Close { project });
+
+        // Clicking Save on a never-saved document opens Save As and keeps the
+        // pending Close until Save As actually writes.
+        assert!(!app.guard_save());
+        let save_as_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(save_as_id).is_some());
+        assert!(app.projects.active_id().is_some());
+
+        // Completing Save As writes the file and executes the pending Close.
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Save {
+                path: target.clone(),
+                name: "saved_on_close.pyxross".to_owned(),
+            });
+        app.drain_save_as_events();
+        assert!(target.exists());
+        assert!(app.panel_dock.placement(save_as_id).is_none());
+        assert!(app.projects.active_id().is_none());
     }
 }

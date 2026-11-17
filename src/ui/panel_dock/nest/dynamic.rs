@@ -68,9 +68,10 @@ fn handle_input(
     capture: &InputCapture,
 ) {
     let pointer = ui.input(|input| input.pointer.latest_pos());
+    let in_viewport = pointer.is_some_and(|p| viewport.contains(p));
 
     let middle_pressed =
-        ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Middle));
+        in_viewport && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Middle));
     let middle_released =
         ui.input(|input| input.pointer.button_released(egui::PointerButton::Middle));
     if middle_released && capture.is_owner(surface) {
@@ -83,7 +84,7 @@ fn handle_input(
         nest.camera.pan_by(delta);
     }
 
-    if !capture.handles_wheel(surface) {
+    if !in_viewport || !capture.handles_wheel(surface) {
         return;
     }
 

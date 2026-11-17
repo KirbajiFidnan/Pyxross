@@ -72,6 +72,22 @@ impl NestCamera {
         self.offset += delta;
     }
 
+    /// Fits `content_size` centered inside `viewport_size` with a small margin.
+    pub fn fit(&mut self, content_size: Vec2, viewport_size: Vec2) {
+        if content_size.x <= 0.0
+            || content_size.y <= 0.0
+            || viewport_size.x <= 0.0
+            || viewport_size.y <= 0.0
+        {
+            return;
+        }
+        let scale = ((viewport_size.x * 0.88 / content_size.x)
+            .min(viewport_size.y * 0.88 / content_size.y))
+        .clamp(Self::MIN_SCALE, Self::MAX_SCALE);
+        self.scale = scale;
+        self.offset = (viewport_size - content_size * scale) * 0.5;
+    }
+
     /// Maps a world-space point to screen space for the given viewport origin.
     pub fn world_to_screen(&self, origin: Pos2, world: Pos2) -> Pos2 {
         origin + self.offset + world.to_vec2() * self.scale

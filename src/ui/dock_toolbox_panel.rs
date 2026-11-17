@@ -2,6 +2,7 @@
 
 use egui::vec2;
 
+use crate::input::Tool;
 use crate::ui::dock_hosts::ToolboxHost;
 use crate::ui::panel_dock::nest::NestView;
 use crate::ui::panel_dock::{
@@ -18,6 +19,23 @@ const TOOLBOX_PANEL_ID: u64 = 100;
 /// follows the panel so a narrow dock never overflows horizontally.
 const TOOLBOX_CONTENT_HEIGHT: f32 = 360.0;
 
+fn toolbox_button_label(tool: Tool) -> String {
+    let shortcut = match tool {
+        Tool::Pencil => Some("D"),
+        Tool::Eraser => Some("E"),
+        Tool::Fieldier => Some("S/W/L"),
+        Tool::Fill => Some("F"),
+        Tool::Eyedropper => Some("R-Click"),
+        Tool::Tile => Some("T"),
+        Tool::AnimationPlacer => Some("A"),
+        Tool::Draw => None,
+    };
+    match shortcut {
+        Some(key) => format!("{} ({key})", tool_label(tool)),
+        None => tool_label(tool).to_string(),
+    }
+}
+
 /// One selectable tool row: highlights the active tool and emits a
 /// [`ToolbarEvent::ToolSelected`] on click.
 struct ToolboxComponent {
@@ -30,8 +48,9 @@ impl Component for ToolboxComponent {
         let active_tool = self.host.view.borrow().tool;
         for tool in TOOLS {
             let active = active_tool == tool;
+            let label = toolbox_button_label(tool);
             if chrome
-                .button(ui, tool_label(tool), ButtonStyle::toggled(active))
+                .button(ui, &label, ButtonStyle::toggled(active))
                 .clicked()
             {
                 self.host
