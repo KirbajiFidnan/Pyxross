@@ -8,6 +8,7 @@ pub enum KeybindingsEvent {
 }
 
 pub struct KeybindingsPanel {
+    committed: Keymap,
     draft: Keymap,
     error: Option<String>,
 }
@@ -15,9 +16,16 @@ pub struct KeybindingsPanel {
 impl KeybindingsPanel {
     pub fn new(keymap: &Keymap) -> Self {
         Self {
+            committed: keymap.clone(),
             draft: keymap.clone(),
             error: None,
         }
+    }
+
+    /// Returns `true` when the user has modified bindings or reset to defaults
+    /// without applying yet.
+    pub fn is_dirty(&self) -> bool {
+        self.draft != self.committed
     }
 
     pub fn ui(
@@ -26,50 +34,106 @@ impl KeybindingsPanel {
         theme: &ThemeColors,
         events: &mut Vec<KeybindingsEvent>,
     ) {
+        self.ui_rows(ui, theme);
+        self.ui_footer(ui, theme, events);
+    }
+
+    /// Renders the scrollable list of keybinding rows with alternating
+    /// accordion/zebra row backgrounds.
+    pub fn ui_rows(&mut self, ui: &mut egui::Ui, theme: &ThemeColors) {
         ui.strong("Keybindings");
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut row_idx = 0usize;
         for action in Action::ALL {
             let Some(mut binding) = self.draft.binding(action) else {
                 continue;
             };
             let original = binding;
-            ui.horizontal(|ui| {
-                ui.label(action_label(action));
-                egui::ComboBox::from_id_salt(("keybinding-key", action))
-                    .selected_text(key_label(binding.key))
-                    .show_ui(ui, |ui| {
-                        for key in logical_keys() {
-                            ui.selectable_value(&mut binding.key, key, key_label(key));
-                        }
+            let row_bg = if row_idx % 2 == 0 {
+                theme.list_bg32()
+            } else {
+                theme.list_stripe_bg32()
+            };
+            row_idx += 1;
+            egui::Frame::NONE
+                .fill(row_bg)
+                .inner_margin(egui::Margin {
+                    left: 6,
+                    right: 18,
+                    top: 3,
+                    bottom: 3,
+                })
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(action_label(action));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            for (label, modifier) in [
+                                ("Shift", &mut binding.modifiers.shift),
+                                ("Alt", &mut binding.modifiers.alt),
+                                ("Ctrl", &mut binding.modifiers.ctrl),
+                                ("Cmd", &mut binding.modifiers.command),
+                            ] {
+                                ui.checkbox(modifier, label);
+                            }
+                            egui::ComboBox::from_id_salt(("keybinding-key", action))
+                                .width(54.0)
+                                .selected_text(key_label(binding.key))
+                                .show_ui(ui, |ui| {
+                                    for key in logical_keys() {
+                                        ui.selectable_value(&mut binding.key, key, key_label(key));
+                                    }
+                                });
+                        });
                     });
-                for (label, modifier) in [
-                    ("Cmd", &mut binding.modifiers.command),
-                    ("Ctrl", &mut binding.modifiers.ctrl),
-                    ("Alt", &mut binding.modifiers.alt),
-                    ("Shift", &mut binding.modifiers.shift),
-                ] {
-                    ui.checkbox(modifier, label);
-                }
-            });
+                });
             if binding != original {
                 self.draft.bindings.insert(action, binding);
             }
         }
-        ui.horizontal(|ui| {
-            if ui.button("Reset").clicked() {
-                self.reset(events);
-            }
-            if ui.button("Apply").clicked() {
-                match self.draft.validate() {
-                    Ok(()) => {
-                        self.error = None;
-                        events.push(KeybindingsEvent::Apply(self.draft.clone()));
+    }
+
+    /// Renders the static bottom bar containing `Reset` and `Apply`.
+    pub fn ui_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &ThemeColors,
+        events: &mut Vec<KeybindingsEvent>,
+    ) {
+        egui::Frame::NONE
+            .fill(theme.panel_header_bg32())
+            .stroke(egui::Stroke::new(1.0, theme.panel_border32()))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if ui.button("Reset").clicked() {
+                        self.reset(events);
                     }
-                    Err(error) => self.error = Some(format!("{error:?}")),
-                }
+                    if ui.button("Apply").clicked() {
+                        self.try_apply(events);
+                    }
+                    if let Some(error) = &self.error {
+                        ui.colored_label(theme.selection_stroke32(), error);
+                    }
+                });
+            });
+    }
+
+    /// Validates the draft keymap and emits [`KeybindingsEvent::Apply`] if valid.
+    pub fn try_apply(&mut self, events: &mut Vec<KeybindingsEvent>) -> bool {
+        match self.draft.validate() {
+            Ok(()) => {
+                self.committed = self.draft.clone();
+                self.error = None;
+                events.push(KeybindingsEvent::Apply(self.draft.clone()));
+                true
             }
-        });
-        if let Some(error) = &self.error {
-            ui.colored_label(theme.selection_stroke32(), error);
+            Err(error) => {
+                self.error = Some(format!("{error:?}"));
+                false
+            }
         }
     }
 
@@ -122,13 +186,14 @@ fn action_label(action: Action) -> &'static str {
         Action::SelectFill => "Select fill",
         Action::SelectTileTool => "Select tile tool",
         Action::SelectAnimationPlacer => "Select animation placer (A)",
+        Action::SelectText => "Select text",
         Action::SaveProject => "Save project",
         Action::SaveProjectAs => "Save project as",
         Action::OpenProject => "Open project",
     }
 }
 
-fn binding_label(binding: Option<KeyBinding>) -> String {
+pub(crate) fn binding_label(binding: Option<KeyBinding>) -> String {
     let Some(binding) = binding else {
         return "Unbound".to_string();
     };
@@ -149,7 +214,7 @@ fn binding_label(binding: Option<KeyBinding>) -> String {
     parts.join("+")
 }
 
-fn logical_keys() -> [crate::input::LogicalKey; 24] {
+fn logical_keys() -> [crate::input::LogicalKey; 25] {
     [
         crate::input::LogicalKey::Z,
         crate::input::LogicalKey::Y,
@@ -175,6 +240,7 @@ fn logical_keys() -> [crate::input::LogicalKey; 24] {
         crate::input::LogicalKey::T,
         crate::input::LogicalKey::A,
         crate::input::LogicalKey::O,
+        crate::input::LogicalKey::Q,
     ]
 }
 
@@ -204,6 +270,7 @@ fn key_label(key: crate::input::LogicalKey) -> &'static str {
         crate::input::LogicalKey::T => "T",
         crate::input::LogicalKey::A => "A",
         crate::input::LogicalKey::O => "O",
+        crate::input::LogicalKey::Q => "Q",
     }
 }
 
@@ -338,8 +405,12 @@ mod tests {
         panel.draft_mut().bindings.insert(
             Action::Undo,
             KeyBinding {
-                key: crate::input::LogicalKey::G,
-                modifiers: crate::input::Modifiers::default(),
+                key: crate::input::LogicalKey::B,
+                modifiers: crate::input::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..crate::input::Modifiers::default()
+                },
             },
         );
         let mut events = Vec::new();
@@ -349,5 +420,27 @@ mod tests {
             Keymap::defaults().binding(Action::Undo)
         );
         assert_eq!(events, vec![KeybindingsEvent::Reset]);
+    }
+
+    #[test]
+    fn dirty_tracks_unapplied_edits_until_apply() {
+        let mut panel = KeybindingsPanel::default();
+        assert!(!panel.is_dirty());
+        panel.draft_mut().bindings.insert(
+            Action::Undo,
+            KeyBinding {
+                key: crate::input::LogicalKey::B,
+                modifiers: crate::input::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..crate::input::Modifiers::default()
+                },
+            },
+        );
+        assert!(panel.is_dirty());
+        let mut events = Vec::new();
+        assert!(panel.try_apply(&mut events));
+        assert!(!panel.is_dirty());
+        assert_eq!(events.len(), 1);
     }
 }

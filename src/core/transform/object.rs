@@ -463,6 +463,63 @@ impl TransformObject {
         self.alg = alg;
     }
 
+    /// Replaces the single source layer buffer while preserving placement,
+    /// pivot, rotation, scale, flips, and rotation algorithm (used by Text Tool
+    /// live re-rasterization).
+    pub fn replace_source_layer(&mut self, buffer: LayerBuffer) {
+        self.layers = vec![buffer];
+        self.placement_cache = std::cell::RefCell::new(PlacementCache::new());
+    }
+
+    /// Inverse-maps a canvas-space point `(cx, cy)` back into local source-buffer
+    /// coordinates `(lx, ly)` (undoing rotation, scale, pivot offset, and flips).
+    pub fn canvas_to_local(&self, canvas_pt: (f32, f32)) -> (f32, f32) {
+        let theta = self.angle_deg.to_radians();
+        let (sin_t, cos_t) = theta.sin_cos();
+        let dx = canvas_pt.0 - self.pivot.0;
+        let dy = canvas_pt.1 - self.pivot.1;
+        // R(-theta) * d
+        let rx = dx * cos_t + dy * sin_t;
+        let ry = -dx * sin_t + dy * cos_t;
+        let sx = self.sx.max(0.01);
+        let sy = self.sy.max(0.01);
+        let mut lx = rx / sx + self.pivot.0 - self.pos.0;
+        let mut ly = ry / sy + self.pivot.1 - self.pos.1;
+        if let Some(layer) = self.layers.first() {
+            if self.flip_h {
+                lx = layer.w as f32 - lx;
+            }
+            if self.flip_v {
+                ly = layer.h as f32 - ly;
+            }
+        }
+        (lx, ly)
+    }
+
+    /// Forward-maps a local source-buffer point `(lx, ly)` to canvas space.
+    pub fn local_to_canvas(&self, local_pt: (f32, f32)) -> (f32, f32) {
+        let mut lx = local_pt.0;
+        let mut ly = local_pt.1;
+        if let Some(layer) = self.layers.first() {
+            if self.flip_h {
+                lx = layer.w as f32 - lx;
+            }
+            if self.flip_v {
+                ly = layer.h as f32 - ly;
+            }
+        }
+        let vx = self.pos.0 + lx - self.pivot.0;
+        let vy = self.pos.1 + ly - self.pivot.1;
+        let sx = vx * self.sx.max(0.01);
+        let sy = vy * self.sy.max(0.01);
+        let theta = self.angle_deg.to_radians();
+        let (sin_t, cos_t) = theta.sin_cos();
+        (
+            self.pivot.0 + sx * cos_t - sy * sin_t,
+            self.pivot.1 + sx * sin_t + sy * cos_t,
+        )
+    }
+
     /// Renders the transformed layers.
     ///
     /// - `None` — **exact path** (commit path): full-resolution NN resample

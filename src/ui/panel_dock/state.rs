@@ -173,12 +173,19 @@ pub(super) struct DragSession {
     pub offset: Vec2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ActiveResize {
+    Dock(DockSide),
+    Panel(PanelId),
+}
+
 pub struct DockManager {
     pub(super) panels: BTreeMap<PanelId, PanelEntry>,
     pub(super) left: DockAreaState,
     pub(super) right: DockAreaState,
     pub(super) bottom: DockAreaState,
     pub(super) drag: Option<DragSession>,
+    pub(super) active_resize: Option<ActiveResize>,
     pub(super) actions: Vec<DockAction>,
     last_dock_positions: BTreeMap<PanelId, DockPosition>,
     /// The rect each floating panel occupied when it was last removed, so a
@@ -205,12 +212,18 @@ impl DockManager {
             right: DockAreaState::new(DockSide::Right),
             bottom: DockAreaState::new(DockSide::Bottom),
             drag: None,
+            active_resize: None,
             actions: Vec::new(),
             last_dock_positions: BTreeMap::new(),
             last_floating_rects: BTreeMap::new(),
             floating_mru: Vec::new(),
             preview_feed: PreviewFeed::default(),
         }
+    }
+
+    /// True while a panel drag or dock/panel resize gesture is in flight.
+    pub fn is_interacting(&self) -> bool {
+        self.drag.is_some() || self.active_resize.is_some()
     }
 
     pub fn try_new(specs: impl IntoIterator<Item = PanelSpec>) -> Result<Self, DockError> {

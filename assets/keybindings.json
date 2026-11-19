@@ -28,6 +28,7 @@
     "select_fill": {"key":"f"},
     "select_tile_tool": {"key":"t"},
     "select_animation_placer": {"key":"a"},
+    "select_text": {"key":"q"},
     "save_project": {"key":"s","modifiers":{"command":true}},
     "save_project_as": {"key":"s","modifiers":{"command":true,"shift":true}},
     "open_project": {"key":"o","modifiers":{"command":true}}

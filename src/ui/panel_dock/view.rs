@@ -154,66 +154,92 @@ impl DockManager {
     }
 
     fn show_docks(&mut self, ui: &mut egui::Ui, viewport: Rect, chrome: &PanelChrome) {
+        if !ui.ctx().input(|input| input.pointer.primary_down()) {
+            self.active_resize = None;
+        }
         let left_rect = self.dock_rect(DockSide::Left, viewport);
         let right_rect = self.dock_rect(DockSide::Right, viewport);
         let bottom_rect = self.dock_rect(DockSide::Bottom, viewport);
+
+        // Claim dock-boundary resize handles BEFORE panel headers so dragging a
+        // dock border never starts a panel move.
+        let mut handle_visuals: Vec<(Rect, bool)> = Vec::new();
+        let dock_handles = [
+            (
+                DockSide::Left,
+                left_rect,
+                Rect::from_min_max(
+                    pos2(left_rect.right() - HANDLE_SIZE, left_rect.top()),
+                    pos2(left_rect.right() + HANDLE_SIZE, left_rect.bottom()),
+                ),
+                "panel-dock-left-resize",
+                true,
+            ),
+            (
+                DockSide::Right,
+                right_rect,
+                Rect::from_min_max(
+                    pos2(right_rect.left() - HANDLE_SIZE, right_rect.top()),
+                    pos2(right_rect.left() + HANDLE_SIZE, right_rect.bottom()),
+                ),
+                "panel-dock-right-resize",
+                false,
+            ),
+            (
+                DockSide::Bottom,
+                bottom_rect,
+                Rect::from_min_max(
+                    pos2(bottom_rect.left(), bottom_rect.top() - HANDLE_SIZE),
+                    pos2(bottom_rect.right(), bottom_rect.top() + HANDLE_SIZE),
+                ),
+                "panel-dock-bottom-resize",
+                false,
+            ),
+        ];
+        for (side, _dock_rect, handle_rect, id_str, positive) in dock_handles {
+            if self.dock_order(side).is_empty() {
+                continue;
+            }
+            let target = super::state::ActiveResize::Dock(side);
+            let can_interact = self.drag.is_none()
+                && (self.active_resize.is_none() || self.active_resize == Some(target));
+            let active = if can_interact {
+                let response = ui.interact(handle_rect, Id::new(id_str), Sense::drag());
+                if response.drag_started()
+                    || (response.dragged() && self.active_resize == Some(target))
+                {
+                    self.active_resize = Some(target);
+                    let delta = ui.ctx().input(|input| input.pointer.delta());
+                    let raw = match side {
+                        DockSide::Left | DockSide::Right => delta.x,
+                        DockSide::Bottom => -delta.y,
+                    };
+                    let axis = if side == DockSide::Right { -raw } else if positive { raw } else { raw };
+                    self.resize_dock_area(side, axis, viewport.size());
+                }
+                response.hovered() || self.active_resize == Some(target)
+            } else {
+                self.active_resize == Some(target)
+            };
+            handle_visuals.push((handle_rect, active));
+        }
+
         self.paint_dock(ui, DockSide::Left, left_rect, chrome);
         self.paint_dock(ui, DockSide::Right, right_rect, chrome);
         self.paint_dock(ui, DockSide::Bottom, bottom_rect, chrome);
 
-        let left_handle = Rect::from_min_max(
-            pos2(left_rect.right() - HANDLE_SIZE, left_rect.top()),
-            pos2(left_rect.right() + HANDLE_SIZE, left_rect.bottom()),
-        );
-        let left_response = ui.interact(
-            left_handle,
-            Id::new("panel-dock-left-resize"),
-            Sense::drag(),
-        );
-        if left_response.dragged() {
-            let delta = ui.ctx().input(|input| input.pointer.delta());
-            self.resize_dock_area(DockSide::Left, delta.x, viewport.size());
+        for (handle_rect, active) in handle_visuals {
+            paint_resize_handle(ui, handle_rect, chrome, active);
         }
-        paint_resize_handle(ui, left_handle, chrome);
-
-        let right_handle = Rect::from_min_max(
-            pos2(right_rect.left() - HANDLE_SIZE, right_rect.top()),
-            pos2(right_rect.left() + HANDLE_SIZE, right_rect.bottom()),
-        );
-        let right_response = ui.interact(
-            right_handle,
-            Id::new("panel-dock-right-resize"),
-            Sense::drag(),
-        );
-        if right_response.dragged() {
-            let delta = ui.ctx().input(|input| input.pointer.delta());
-            self.resize_dock_area(DockSide::Right, -delta.x, viewport.size());
-        }
-        paint_resize_handle(ui, right_handle, chrome);
-
-        let bottom_handle = Rect::from_min_max(
-            pos2(bottom_rect.left(), bottom_rect.top() - HANDLE_SIZE),
-            pos2(bottom_rect.right(), bottom_rect.top() + HANDLE_SIZE),
-        );
-        let bottom_response = ui.interact(
-            bottom_handle,
-            Id::new("panel-dock-bottom-resize"),
-            Sense::drag(),
-        );
-        if bottom_response.dragged() {
-            let delta = ui.ctx().input(|input| input.pointer.delta());
-            self.resize_dock_area(DockSide::Bottom, -delta.y, viewport.size());
-        }
-        paint_resize_handle(ui, bottom_handle, chrome);
     }
 
     fn paint_dock(&mut self, ui: &mut egui::Ui, side: DockSide, rect: Rect, chrome: &PanelChrome) {
         if !chrome.paint_slice(ui.painter(), "panel_bg", SkinState::Normal, rect) {
             ui.painter()
-                .rect_filled(rect, 2.0, chrome.colors.panel_bg32());
+                .rect_filled(rect, chrome.rounding, chrome.colors.panel_bg32());
             ui.painter().rect_stroke(
                 rect,
-                2.0,
+                chrome.rounding,
                 Stroke::new(1.0, chrome.colors.panel_border32()),
                 egui::StrokeKind::Inside,
             );
@@ -239,21 +265,32 @@ impl DockManager {
                         pos2(panel_rect.right() + HANDLE_SIZE, panel_rect.bottom()),
                     ),
                 };
-                let response = ui.interact(
-                    handle_rect,
-                    Id::new(("panel-dock-panel-resize", id.raw())),
-                    Sense::drag(),
-                );
-                if response.dragged() {
-                    let delta = ui.ctx().input(|input| input.pointer.delta());
-                    let axis_delta = match side {
-                        DockSide::Left => delta.y,
-                        DockSide::Right => delta.y,
-                        DockSide::Bottom => delta.x,
-                    };
-                    self.resize_dock_panel(id, axis_delta, rect.size());
-                }
-                paint_resize_handle(ui, handle_rect, chrome);
+                let target = super::state::ActiveResize::Panel(id);
+                let can_interact = self.drag.is_none()
+                    && (self.active_resize.is_none() || self.active_resize == Some(target));
+                let active = if can_interact {
+                    let response = ui.interact(
+                        handle_rect,
+                        Id::new(("panel-dock-panel-resize", id.raw())),
+                        Sense::drag(),
+                    );
+                    if response.drag_started()
+                        || (response.dragged() && self.active_resize == Some(target))
+                    {
+                        self.active_resize = Some(target);
+                        let delta = ui.ctx().input(|input| input.pointer.delta());
+                        let axis_delta = match side {
+                            DockSide::Left => delta.y,
+                            DockSide::Right => delta.y,
+                            DockSide::Bottom => delta.x,
+                        };
+                        self.resize_dock_panel(id, axis_delta, rect.size());
+                    }
+                    response.hovered() || self.active_resize == Some(target)
+                } else {
+                    self.active_resize == Some(target)
+                };
+                paint_resize_handle(ui, handle_rect, chrome, active);
             }
         }
         self.paint_drop_preview(ui, side, rect, chrome);
@@ -269,8 +306,11 @@ impl DockManager {
         ui.scope_builder(
             UiBuilder::new()
                 .id(Id::new(("panel-dock-panel", id.raw())))
-                .max_rect(rect),
+                .max_rect(rect)
+                .layout(Layout::top_down(Align::Min)),
             |panel_ui| {
+                panel_ui.set_clip_rect(rect);
+                panel_ui.spacing_mut().item_spacing = Vec2::ZERO;
                 self.paint_panel(panel_ui, id, chrome, PanelScope::Docked);
             },
         );
@@ -288,7 +328,7 @@ impl DockManager {
         };
         let title = metadata.title.clone();
         let header_action = self.header_action(id);
-        let width = ui.available_width().max(1.0);
+        let width = ui.max_rect().width().max(1.0);
         let skinned_frame = scope == PanelScope::Docked
             && chrome.paint_slice(ui.painter(), "panel_bg", SkinState::Normal, ui.max_rect());
         let (header_rect, response) =
@@ -301,8 +341,18 @@ impl DockManager {
             SkinState::Normal
         };
         if !chrome.paint_slice(ui.painter(), "panel_header", header_state, header_rect) {
-            ui.painter()
-                .rect_filled(header_rect, 2.0, chrome.colors.panel_header_bg32());
+            ui.painter().rect_filled(
+                header_rect,
+                chrome.rounding,
+                chrome.colors.panel_header_bg32(),
+            );
+            ui.painter().line_segment(
+                [
+                    pos2(header_rect.left(), header_rect.bottom()),
+                    pos2(header_rect.right(), header_rect.bottom()),
+                ],
+                Stroke::new(1.0, chrome.colors.panel_border32()),
+            );
         }
         // The title is painted centered in the header band; the action button
         // stays pinned to the right.
@@ -371,23 +421,27 @@ impl DockManager {
             self.update_drag(id, response, pop_out_rect, ui.ctx());
         }
 
-        let body_rect = ui.available_rect_before_wrap();
+        let body_rect = Rect::from_min_max(
+            pos2(ui.max_rect().left(), header_rect.bottom()),
+            ui.max_rect().max,
+        );
         let body_rect = if skinned_frame {
             body_rect.shrink(FRAME_PADDING)
         } else {
             body_rect
         };
         ui.scope_builder(UiBuilder::new().max_rect(body_rect), |body| {
-            // The scroll fade multiplies content colors near the edges, which
-            // would dim nest content; the static nest draws its own bars.
+            // Hard boundary: nest content must never paint outside its body
+            // rect (above the panel header or the outer top bar). Do NOT wrap
+            // in an outer egui::ScrollArea: NestContent owns its own static/
+            // dynamic viewport and an outer ScrollArea shifts `available_rect`
+            // upward when scrolled, pushing overlays and scrollbars into the
+            // panel header.
+            body.set_clip_rect(body_rect.intersect(body.clip_rect()));
             body.spacing_mut().scroll.fade.strength = 0.0;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(body, |body| {
-                    if let Some((_, content)) = self.panel_content_mut(id) {
-                        content.ui(body, &chrome.for_surface(SurfaceId::Panel(id)));
-                    }
-                });
+            if let Some((_, content)) = self.panel_content_mut(id) {
+                content.ui(body, &chrome.for_surface(SurfaceId::Panel(id)));
+            }
         });
     }
 
@@ -433,13 +487,13 @@ impl DockManager {
                     ) {
                         window_ui.painter().rect_filled(
                             frame_rect,
-                            2.0,
+                            chrome.rounding,
                             chrome.colors.panel_bg32(),
                         );
                     }
                     window_ui.painter().rect_stroke(
                         frame_rect,
-                        2.0,
+                        chrome.rounding,
                         Stroke::new(1.0, chrome.colors.panel_border32()),
                         egui::StrokeKind::Inside,
                     );
@@ -478,6 +532,12 @@ impl DockManager {
         pop_out_rect: Option<Rect>,
         ctx: &egui::Context,
     ) {
+        if self.active_resize.is_some() {
+            return;
+        }
+        if self.drag.as_ref().is_some_and(|session| session.panel != id) {
+            return;
+        }
         let is_floating = self.placement(id) == Some(PanelPlacement::Floating);
         let pointer =
             ctx.input(|input| input.pointer.latest_pos().or(input.pointer.press_origin()));
@@ -666,22 +726,33 @@ impl DockManager {
     }
 }
 
-/// Paints a resize handle: the `scrollbar_handle` skin center-stretched
-/// (corner 0) when available, else the flat panel-border fill.
-fn paint_resize_handle(ui: &mut egui::Ui, handle_rect: Rect, chrome: &PanelChrome) {
-    if let Some((skin, atlas)) = chrome.skin("scrollbar_handle") {
-        chrome.paint_nine_slice(
-            ui.painter(),
-            skin,
-            atlas,
-            SkinState::Normal,
-            handle_rect,
-            0.0,
-        );
+/// Paints a clean 1px hairline divider along the center of a resize handle
+/// (thickening and highlighting to accent when hovered or dragged).
+fn paint_resize_handle(
+    ui: &mut egui::Ui,
+    handle_rect: Rect,
+    chrome: &PanelChrome,
+    active: bool,
+) {
+    let color = if active {
+        chrome.colors.selection_stroke_color32()
     } else {
-        ui.painter()
-            .rect_filled(handle_rect, 0.0, chrome.colors.panel_border32());
-    }
+        chrome.colors.panel_border32()
+    };
+    let thickness = if active { 2.0 } else { 1.0 };
+    let center = handle_rect.center();
+    let (a, b) = if handle_rect.width() >= handle_rect.height() {
+        (
+            pos2(handle_rect.left(), center.y),
+            pos2(handle_rect.right(), center.y),
+        )
+    } else {
+        (
+            pos2(center.x, handle_rect.top()),
+            pos2(center.x, handle_rect.bottom()),
+        )
+    };
+    ui.painter().line_segment([a, b], Stroke::new(thickness, color));
 }
 
 /// Size of the skinned header action button: label width plus the standard
@@ -759,5 +830,94 @@ mod tests {
         assert_eq!(bottom.left(), left.right());
         assert_eq!(bottom.right(), right.left());
         assert_eq!(bottom.bottom(), viewport.bottom());
+    }
+
+    #[test]
+    fn nest_content_and_scrollbar_stay_below_panel_header() {
+        use super::super::nest::{Component, NestContent, NestMode, NestView};
+        use super::super::state::{PanelMetadata, PanelSpec};
+
+        struct TallComponent;
+        impl Component for TallComponent {
+            fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+                ui.set_min_size(vec2(ui.available_width(), 400.0));
+                let _ = chrome.button(ui, "TopItem", super::super::skin::ButtonStyle::plain());
+            }
+        }
+
+        let mut nest = NestContent::new(NestMode::Static);
+        nest.push(TallComponent);
+
+        let mut manager = DockManager::try_new([PanelSpec {
+            id: PanelId::new(1),
+            metadata: PanelMetadata::new("TestPanel", false, vec2(120.0, 100.0)),
+            placement: PanelPlacement::DockedLeft,
+            floating_rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0)),
+            content: Box::new(nest),
+        }])
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        let theme = crate::ui::theme::Theme::default_dark();
+        let capture = crate::ui::input_capture::InputCapture::new();
+        let chrome = PanelChrome::flat(&theme, &capture, SurfaceId::Canvas);
+
+        let mut run = |events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 200.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        manager.show_inside(ui, &chrome);
+                    });
+            });
+            out.textures_delta.clear();
+            out.shapes
+        };
+
+        let shapes = run(vec![egui::Event::PointerMoved(pos2(40.0, 60.0))]);
+        let mut saw_button = false;
+        for clipped in &shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                if t.galley.text() == "TopItem" {
+                    saw_button = true;
+                    assert!(
+                        clipped.clip_rect.min.y >= HEADER_HEIGHT,
+                        "button clip_rect.min.y ({}) must be >= HEADER_HEIGHT ({HEADER_HEIGHT})",
+                        clipped.clip_rect.min.y
+                    );
+                    assert!(
+                        t.pos.y >= HEADER_HEIGHT,
+                        "button text y ({}) must be >= HEADER_HEIGHT ({HEADER_HEIGHT})",
+                        t.pos.y
+                    );
+                }
+            }
+        }
+        assert!(saw_button, "TopItem button must be rendered");
+
+        // Even after scrolling inside the panel, the button and scrollbar clip
+        // must remain strictly below HEADER_HEIGHT.
+        let scrolled_shapes = run(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -40.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        for clipped in &scrolled_shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                if t.galley.text() == "TopItem" {
+                    assert!(
+                        clipped.clip_rect.min.y >= HEADER_HEIGHT,
+                        "scrolled button clip_rect.min.y ({}) must stay >= HEADER_HEIGHT ({HEADER_HEIGHT})",
+                        clipped.clip_rect.min.y
+                    );
+                }
+            }
+        }
     }
 }

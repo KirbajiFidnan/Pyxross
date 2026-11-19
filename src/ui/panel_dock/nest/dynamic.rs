@@ -37,7 +37,7 @@ pub fn show_dynamic(nest: &mut NestContent, ui: &mut Ui, chrome: &PanelChrome) {
     // nest inside its panel's z band and guarantees overlays stay above the
     // zoomed/panned content.
     let content_view = NestView::new(origin, nest.camera.scale(), nest.camera.offset(), viewport);
-    ui.set_clip_rect(viewport);
+    ui.set_clip_rect(viewport.intersect(ui.clip_rect()));
     for component in &mut nest.components {
         match component.placement() {
             ComponentPlacement::Content => component.ui(ui, &content_view, chrome),

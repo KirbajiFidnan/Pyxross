@@ -66,11 +66,19 @@ pub fn load_palettes_from_dirs(dirs: &[PathBuf]) -> Vec<Palette> {
 }
 
 pub fn load_embedded_palettes() -> Vec<Palette> {
-    EMBEDDED_PALETTE_JSON
-        .iter()
-        .filter_map(|json| serde_json::from_str::<Palette>(json).ok())
-        .filter(|palette| palette.validate().is_ok())
-        .collect()
+    let mut palettes = vec![crate::core::palette::builtin_palette(
+        crate::core::palette::BuiltinPaletteKind::Ross,
+    )];
+    for json in EMBEDDED_PALETTE_JSON {
+        if let Ok(palette) = serde_json::from_str::<Palette>(json) {
+            if palette.validate().is_ok()
+                && !palettes.iter().any(|existing| existing.name == palette.name)
+            {
+                palettes.push(palette);
+            }
+        }
+    }
+    palettes
 }
 
 pub fn user_palette_dir() -> Option<PathBuf> {

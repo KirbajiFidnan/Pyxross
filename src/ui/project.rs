@@ -172,6 +172,8 @@ pub struct ProjectSession {
     /// selection transforms. A fresh session seeds its `TransformObject` from
     /// this, so the Tool Property panel's selector survives lift/cancel/lift.
     pub transform_algorithm: TransformAlgorithm,
+    pub text_font: String,
+    pub text_size: u32,
     pub grid_visible: bool,
     pub canvas_generation: u64,
     pub modified: bool,
@@ -411,16 +413,38 @@ pub struct CurveTransformSession {
 /// A live in-canvas transform object: either a lifted pixel selection
 /// (D32/D35/D36) or the Alt-driven dynamic curve. Both share the gesture
 /// routing, overlay, cancel and commit-and-clear lifecycle.
+pub struct TextTransformSession {
+    pub selection: SelectionTransform,
+    pub text: String,
+    pub caret: usize,
+    pub font_name: String,
+    pub font_size: u32,
+    pub color: Color,
+    pub layout: crate::core::text::TextLayout,
+}
+
 pub enum TransformSession {
     Selection(SelectionTransform),
     Curve(CurveTransformSession),
+    Text(TextTransformSession),
 }
 
 impl TransformSession {
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text(_))
+    }
+
+    pub fn text_mut(&mut self) -> Option<&mut TextTransformSession> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Selection(_) | Self::Curve(_) => None,
+        }
+    }
     /// The lifted-pixel selection, when this session is the selection variant.
     pub fn selection(&self) -> Option<&SelectionTransform> {
         match self {
             Self::Selection(selection) => Some(selection),
+            Self::Text(text) => Some(&text.selection),
             Self::Curve(_) => None,
         }
     }
@@ -429,6 +453,7 @@ impl TransformSession {
     pub fn selection_mut(&mut self) -> Option<&mut SelectionTransform> {
         match self {
             Self::Selection(selection) => Some(selection),
+            Self::Text(text) => Some(&mut text.selection),
             Self::Curve(_) => None,
         }
     }
@@ -437,7 +462,7 @@ impl TransformSession {
     pub fn curve(&self) -> Option<&CurveTransform> {
         match self {
             Self::Curve(curve) => Some(&curve.curve),
-            Self::Selection(_) => None,
+            Self::Selection(_) | Self::Text(_) => None,
         }
     }
 
@@ -445,7 +470,7 @@ impl TransformSession {
     pub fn curve_mut(&mut self) -> Option<&mut CurveTransformSession> {
         match self {
             Self::Curve(curve) => Some(curve),
-            Self::Selection(_) => None,
+            Self::Selection(_) | Self::Text(_) => None,
         }
     }
 
@@ -475,6 +500,9 @@ pub enum PendingAction {
         path: PathBuf,
     },
     Close {
+        project: ProjectId,
+    },
+    CloseWindow {
         project: ProjectId,
     },
 }
@@ -809,7 +837,9 @@ impl ProjectSession {
             animation,
             onion_prev: false,
             onion_next: false,
-            palettes: vec![Palette::default()],
+            palettes: vec![crate::core::palette::builtin_palette(
+                crate::core::palette::BuiltinPaletteKind::Ross,
+            )],
             active_palette: 0,
             color: Color::BLACK,
             secondary_color: Color::WHITE,
@@ -818,6 +848,8 @@ impl ProjectSession {
             pen_draw_settings: DrawSettings::default(),
             eraser_draw_settings: DrawSettings::default(),
             transform_algorithm: TransformAlgorithm::default(),
+            text_font: crate::core::text::BUILTIN_PIXEL_FONT_NAME.to_owned(),
+            text_size: 14,
             grid_visible: true,
             canvas_generation: 0,
             dialog_open: false,
@@ -860,7 +892,8 @@ impl ProjectSession {
             | Tool::Eyedropper
             | Tool::Fieldier
             | Tool::Tile
-            | Tool::AnimationPlacer => &self.pen_draw_settings,
+            | Tool::AnimationPlacer
+            | Tool::Text => &self.pen_draw_settings,
         }
     }
 
@@ -874,7 +907,8 @@ impl ProjectSession {
             | Tool::Eyedropper
             | Tool::Fieldier
             | Tool::Tile
-            | Tool::AnimationPlacer => &mut self.pen_draw_settings,
+            | Tool::AnimationPlacer
+            | Tool::Text => &mut self.pen_draw_settings,
         }
     }
 }

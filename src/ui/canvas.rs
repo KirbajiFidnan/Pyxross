@@ -432,6 +432,11 @@ pub struct CanvasWidget {
     ants_polylines: Option<(Vec<BoundarySegment>, Vec<Vec<(f32, f32)>>)>,
     /// Cached seamless 16×16 pale sand-grey "X" + dither canvas backdrop.
     sand_bg_texture: Option<egui::TextureHandle>,
+    /// Sub-pixel pan remainder accumulated across slow drag frames so small
+    /// deltas (< 0.5 px) are never dropped.
+    pan_remainder: egui::Vec2,
+    /// Optional canvas-space caret line `(top, bottom)` during Text Transform.
+    text_caret: Option<((f32, f32), (f32, f32))>,
 }
 
 /// GG: order-independent union of two [`egui::Modifiers`] snapshots.
@@ -467,36 +472,36 @@ impl CanvasWidget {
             click_press_modifiers: None,
             ants_polylines: None,
             sand_bg_texture: None,
+            pan_remainder: egui::Vec2::ZERO,
+            text_caret: None,
         }
     }
 
-    /// Lazily builds and caches the 8×8 seamless pale sand-grey X-dither
-    /// checkerboard backdrop texture (1 texel = 1 canvas pixel).
+    pub fn set_text_caret(&mut self, caret: Option<((f32, f32), (f32, f32))>) {
+        self.text_caret = caret;
+    }
+
+    /// Lazily builds and caches the 24×24 seamless diagonal accordion-stripe
+    /// backdrop texture (low-contrast ergonomic light grey wide bands with
+    /// thinner darker grey bands, screen-locked to avoid shimmering on pan/zoom).
     fn ensure_sand_bg_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
         if let Some(tex) = &self.sand_bg_texture {
             return tex.id();
         }
-        const SIZE: usize = 8;
-        // Very pale, light-greyish warm sand tones.
-        const LIGHT: [u8; 4] = [236, 234, 224, 255];
-        const BASE: [u8; 4] = [230, 228, 217, 255];
-        const MID: [u8; 4] = [224, 221, 209, 255];
+        const SIZE: usize = 24;
+        // Soft, low-contrast ergonomic greys: wide light band (16px) + thinner darker band (8px).
+        const LIGHT_STRIPE: [u8; 4] = [126, 126, 130, 255];
+        const DARK_STRIPE: [u8; 4] = [115, 115, 119, 255];
+        const LIGHT_BAND_WIDTH: usize = 16;
 
         let mut rgba = vec![0u8; SIZE * SIZE * 4];
         for y in 0..SIZE {
             for x in 0..SIZE {
-                // Checkerboard base + diagonal X-dither weave.
-                let checker = (x + y) & 1 == 0;
-                let diag_a = (x + y) % 4 == 0;
-                let diag_b = (x + SIZE - y) % 4 == 0;
-                let px = if diag_a && diag_b {
-                    MID
-                } else if checker {
-                    LIGHT
-                } else if diag_a || diag_b {
-                    MID
+                let diag = (x + y) % SIZE;
+                let px = if diag < LIGHT_BAND_WIDTH {
+                    LIGHT_STRIPE
                 } else {
-                    BASE
+                    DARK_STRIPE
                 };
                 let i = (y * SIZE + x) * 4;
                 rgba[i..i + 4].copy_from_slice(&px);
@@ -504,11 +509,11 @@ impl CanvasWidget {
         }
         let image = egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &rgba);
         let tex = ctx.load_texture(
-            "canvas_sand_dither_bg",
+            "canvas_diagonal_stripe_bg",
             image,
             egui::TextureOptions {
-                magnification: egui::TextureFilter::Nearest,
-                minification: egui::TextureFilter::Nearest,
+                magnification: egui::TextureFilter::Linear,
+                minification: egui::TextureFilter::Linear,
                 wrap_mode: egui::TextureWrapMode::Repeat,
                 ..Default::default()
             },
@@ -799,16 +804,11 @@ impl CanvasWidget {
             _ => egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         };
         let sand_id = self.ensure_sand_bg_texture(ui.ctx());
-        let tile_px = 8.0_f32;
+        let tile_px = 24.0_f32;
+        // Lock UVs to screen coordinates so the backdrop never shimmers during pan/zoom.
         let sand_uv = egui::Rect::from_min_max(
-            egui::pos2(
-                uv.min.x * canvas_size.0 as f32 / tile_px,
-                uv.min.y * canvas_size.1 as f32 / tile_px,
-            ),
-            egui::pos2(
-                uv.max.x * canvas_size.0 as f32 / tile_px,
-                uv.max.y * canvas_size.1 as f32 / tile_px,
-            ),
+            egui::pos2(draw_rect.left() / tile_px, draw_rect.top() / tile_px),
+            egui::pos2(draw_rect.right() / tile_px, draw_rect.bottom() / tile_px),
         );
         painter.image(sand_id, draw_rect, sand_uv, crate::ui::theme::SKIN_TINT);
         painter.image(
@@ -1084,6 +1084,24 @@ impl CanvasWidget {
                 *active,
                 colors,
             );
+            if let Some((c0, c1)) = self.text_caret {
+                let time = ui.input(|i| i.time);
+                if (time * 2.0) as i64 % 2 == 0 {
+                    let s0 = egui::pos2(
+                        origin.x + pan.0 as f32 + c0.0 * scale,
+                        origin.y + pan.1 as f32 + c0.1 * scale,
+                    );
+                    let s1 = egui::pos2(
+                        origin.x + pan.0 as f32 + c1.0 * scale,
+                        origin.y + pan.1 as f32 + c1.1 * scale,
+                    );
+                    painter.line_segment(
+                        [s0, s1],
+                        egui::Stroke::new(2.0, theme.selection_stroke_color32()),
+                    );
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            }
             // Live drag HUD (item 5): a compact size / angle / position / scale
             // readout near the pointer while a handle is grabbed.
             if let Some(hud) = hud {
@@ -1314,26 +1332,49 @@ impl CanvasWidget {
             interactions.eyedropper_ended = true;
         }
 
-        // Middle drag → pan. `Sense::click_and_drag` only senses the primary
-        // button, so read the middle button directly. The gesture belongs to
-        // this surface once claimed and keeps tracking until release, even if
-        // the pointer leaves the canvas.
+        // Middle drag OR Space + Left drag → pan. Accumulate fractional pointer
+        // deltas in `pan_remainder` so slow drags never feel sticky.
         let canvas_surface = self.surface;
         let middle_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
         let middle_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
+        let space_held = !ui.ctx().text_edit_focused() && ui.input(|i| i.key_down(egui::Key::Space));
+        let space_pan_pressed = space_held && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        let space_pan_active = space_held && ui.input(|i| i.pointer.primary_down())
+            && capture.handles_buttons(canvas_surface, space_pan_pressed);
         if middle_released && capture.is_owner(canvas_surface) {
             capture.release();
         }
         let middle_panning = ui.input(|i| i.pointer.middle_down())
             && capture.handles_buttons(canvas_surface, middle_pressed);
-        if middle_panning {
+        if space_held && !pointer_over_panel {
+            ui.ctx().set_cursor_icon(if space_pan_active {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+        if space_pan_active {
+            interactions.stroke_started = false;
+            interactions.stroke_segment_started = false;
+            interactions.stroke_point = None;
+            interactions.stroke_ended = false;
+            interactions.clicked = None;
+            interactions.double_clicked = None;
+            interactions.raw_pressed_over_canvas = None;
+        }
+        if middle_panning || space_pan_active {
             let delta = ui.input(|i| i.pointer.delta());
-            let dx = delta.x.round() as i32;
-            let dy = delta.y.round() as i32;
+            self.pan_remainder += delta;
+            let dx = self.pan_remainder.x.trunc() as i32;
+            let dy = self.pan_remainder.y.trunc() as i32;
+            self.pan_remainder.x -= dx as f32;
+            self.pan_remainder.y -= dy as f32;
             if dx != 0 || dy != 0 {
                 camera.pan_by(dx, dy);
                 interactions.pan_by = (dx, dy);
             }
+        } else {
+            self.pan_remainder = egui::Vec2::ZERO;
         }
 
         // Wheel handling, routed to the topmost surface: Shift+scroll resizes
@@ -2241,7 +2282,7 @@ fn paint_ants_under_rect(
         (max, bottom_left),
         (bottom_left, min),
     ] {
-        painter.line_segment([a, b], egui::Stroke::new(1.0, color));
+        painter.line_segment([a, b], egui::Stroke::new(2.0, color));
     }
 }
 
@@ -2263,7 +2304,7 @@ fn paint_ants_rect(
             origin.x + pan.0 as f32 + x1 * scale,
             origin.y + pan.1 as f32 + y1 * scale,
         );
-        painter.line_segment([p0, p1], egui::Stroke::new(1.0, color));
+        painter.line_segment([p0, p1], egui::Stroke::new(1.5, color));
     }
 }
 
@@ -2314,13 +2355,20 @@ fn paint_ants_mask(
             origin.y + pan.1 as f32 + (y / subdiv) * scale,
         )
     };
-    // Theme-tinted dashes only: the construction keeps the channels on one line
-    // (`color.r, color.g, color.b`) so no hard-coded chrome colour is added.
-    let color = ant_stroke_color(theme.marching_ants_core(), time_ms);
-    let ant_color = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
-    for edge in pixel_ant_edges_from_polylines(polylines, time_ms) {
-        // ON runs are dashes; OFF runs are gaps, so the border reads as small
-        // alternating sub-pixel segments rather than a continuous line.
+    let dark_under = theme.marching_ants_contrast_dark32();
+    let bright_ant = crate::ui::theme::SKIN_TINT;
+    let edges = pixel_ant_edges_from_polylines(polylines, time_ms);
+    for edge in &edges {
+        painter.line_segment(
+            [
+                to_screen(edge.start.0 as f32, edge.start.1 as f32),
+                to_screen(edge.end.0 as f32, edge.end.1 as f32),
+            ],
+            egui::Stroke::new(2.0, dark_under),
+        );
+    }
+    for edge in edges {
+        // ON runs are bright white dashes over the dark backing stroke.
         if !edge.on {
             continue;
         }
@@ -2329,7 +2377,7 @@ fn paint_ants_mask(
                 to_screen(edge.start.0 as f32, edge.start.1 as f32),
                 to_screen(edge.end.0 as f32, edge.end.1 as f32),
             ],
-            egui::Stroke::new(1.0, ant_color),
+            egui::Stroke::new(1.5, bright_ant),
         );
     }
 }

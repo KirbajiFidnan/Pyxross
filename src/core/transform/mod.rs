@@ -31,6 +31,7 @@ pub mod clean_edge;
 mod curve;
 mod exact;
 mod object;
+pub mod pyx_rot;
 mod rot_sprite;
 pub mod rotxel;
 mod scale;
@@ -63,6 +64,8 @@ pub enum TransformAlgorithm {
     CleanEdge,
     /// Rotxel (Azagaya / Pixelorama) subcell-EPX rotation.
     Rotxel,
+    /// PyxRot crisp center-weighted subpixel + L-corner cleanup rotation.
+    PyxRot,
 }
 
 /// Rotates an RGBA8 buffer by `angle_deg` degrees **clockwise** about its
@@ -111,6 +114,7 @@ pub fn rotate_with(
         TransformAlgorithm::RotSprite => rot_sprite::rotate(buf, w, h, angle_deg),
         TransformAlgorithm::CleanEdge => clean_edge::clean_edge_rotate(buf, w, h, angle_deg),
         TransformAlgorithm::Rotxel => rotxel::rotxel_rotate(buf, w, h, angle_deg),
+        TransformAlgorithm::PyxRot => pyx_rot::pyx_rot_rotate(buf, w, h, angle_deg),
     }
 }
 

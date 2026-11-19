@@ -39,6 +39,7 @@ pub fn show_static(nest: &mut NestContent, ui: &mut Ui, chrome: &PanelChrome) {
     let mut content_size = Vec2::ZERO;
     let mut offset = nest.offset;
     ui.scope_builder(UiBuilder::new().max_rect(viewport), |inner| {
+        inner.set_clip_rect(viewport.intersect(inner.clip_rect()));
         let output = egui::ScrollArea::both()
             .id_salt(id)
             .auto_shrink([false, false])
@@ -47,6 +48,7 @@ pub fn show_static(nest: &mut NestContent, ui: &mut Ui, chrome: &PanelChrome) {
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .scroll_offset(offset)
             .show(inner, |scroll| {
+                scroll.set_clip_rect(viewport.intersect(scroll.clip_rect()));
                 for component in &mut nest.components {
                     match component.placement() {
                         ComponentPlacement::Content => {
@@ -90,7 +92,7 @@ pub fn show_static(nest: &mut NestContent, ui: &mut Ui, chrome: &PanelChrome) {
     // Overlay components paint in screen space, pinned to the viewport and
     // clipped to it; they do not scroll with the content.
     ui.scope_builder(UiBuilder::new().max_rect(viewport), |overlay| {
-        overlay.set_clip_rect(viewport);
+        overlay.set_clip_rect(viewport.intersect(overlay.clip_rect()));
         for component in &mut nest.components {
             match component.placement() {
                 ComponentPlacement::Content => {}

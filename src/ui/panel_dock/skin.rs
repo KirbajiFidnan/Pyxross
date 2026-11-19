@@ -211,6 +211,7 @@ pub struct PanelChrome<'a> {
     pub atlases: Option<&'a AtlasCache>,
     pub capture: &'a InputCapture,
     pub surface: SurfaceId,
+    pub rounding: f32,
 }
 
 impl<'a> PanelChrome<'a> {
@@ -223,7 +224,14 @@ impl<'a> PanelChrome<'a> {
             atlases: None,
             capture,
             surface,
+            rounding: 0.0,
         }
+    }
+
+    /// Sets the corner rounding (in points) used for flat chrome shapes.
+    pub fn with_rounding(mut self, rounding: f32) -> Self {
+        self.rounding = rounding.max(0.0);
+        self
     }
 
     /// The same chrome bound to another surface.
@@ -231,11 +239,10 @@ impl<'a> PanelChrome<'a> {
         Self { surface, ..self }
     }
 
-    /// The named skin plus its loaded atlas, if both exist.
-    pub fn skin(&self, name: &str) -> Option<(&'a Skin, &'a SkinAtlas)> {
-        let skin = self.theme.skin(name)?;
-        let atlas = self.atlases?.get(Path::new(&skin.atlas_path))?;
-        Some((skin, atlas))
+    /// Nine-slice skins are retired; always returns `None` so callers paint
+    /// clean flat vector chrome using [`Self::colors`] and [`Self::rounding`].
+    pub fn skin(&self, _name: &str) -> Option<(&'a Skin, &'a SkinAtlas)> {
+        None
     }
 
     /// Paints one skin state stretched over `dest` with the given corner size
@@ -263,19 +270,12 @@ impl<'a> PanelChrome<'a> {
     /// atlas is not loaded — the caller then paints the flat fallback.
     pub fn paint_slice(
         &self,
-        painter: &egui::Painter,
-        name: &str,
-        state: SkinState,
-        dest: Rect,
+        _painter: &egui::Painter,
+        _name: &str,
+        _state: SkinState,
+        _dest: Rect,
     ) -> bool {
-        let Some((skin, atlas)) = self.skin(name) else {
-            return false;
-        };
-        let corner = NineSlice::from_source(skin.source_for(state), atlas.size())
-            .top_left
-            .width();
-        self.paint_nine_slice(painter, skin, atlas, state, dest, corner);
-        true
+        false
     }
 
     /// Paints a button labelled `label` and returns its response.
@@ -288,30 +288,76 @@ impl<'a> PanelChrome<'a> {
     /// unskinned. The button sizes to its label plus the standard padding and
     /// never exceeds the available width, so a narrow panel is not widened.
     pub fn button(&self, ui: &mut egui::Ui, label: &str, style: ButtonStyle) -> Response {
-        if self.skin("button").is_none() {
-            return ui.add_enabled(
-                style.enabled,
-                egui::Button::selectable(style.selected, label),
-            );
+        self.button_with_font_size(ui, label, None, style)
+    }
+
+    pub fn button_with_font_size(
+        &self,
+        ui: &mut egui::Ui,
+        label: &str,
+        font_size: Option<f32>,
+        style: ButtonStyle,
+    ) -> Response {
+        let mut font = egui::TextStyle::Button.resolve(ui.style());
+        if let Some(size) = font_size {
+            font.size = size;
         }
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        let text_color = ui.visuals().text_color();
+        let base_text = ui.visuals().text_color();
+        let text_color = if style.enabled {
+            base_text
+        } else {
+            base_text.gamma_multiply(0.45)
+        };
         let galley = ui
             .painter()
             .layout_no_wrap(label.to_owned(), font.clone(), text_color);
         let size = vec2(
-            (galley.size().x + 8.0).min(ui.available_width().max(1.0)),
-            ui.spacing().interact_size.y.max(galley.size().y + 4.0),
+            (galley.size().x + 12.0).min(ui.available_width().max(1.0)),
+            ui.spacing().interact_size.y.max(galley.size().y + 6.0),
         );
         ui.add_enabled_ui(style.enabled, |ui| {
             let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
             let state = button_skin_state(&response);
-            self.paint_slice(ui.painter(), "button", state, rect);
-            if style.selected {
-                let wash = self.colors.selection_bg_fill32().gamma_multiply(0.5);
-                ui.painter().rect_filled(rect, 2.0, wash);
-            }
-            ui.painter().with_clip_rect(rect).text(
+            let (fill, stroke_color) = match state {
+                SkinState::Disabled => (
+                    self.colors.panel_bg32(),
+                    self.colors.panel_border32().gamma_multiply(0.5),
+                ),
+                SkinState::Pressed => (
+                    self.colors.selection_bg_fill32(),
+                    self.colors.selection_stroke_color32(),
+                ),
+                SkinState::Hover => (
+                    if style.selected {
+                        self.colors.selection_bg_fill32()
+                    } else {
+                        self.colors.selection_bg_fill32().gamma_multiply(0.55)
+                    },
+                    self.colors.selection_stroke_color32(),
+                ),
+                SkinState::Normal => {
+                    if style.selected {
+                        (
+                            self.colors.selection_bg_fill32(),
+                            self.colors.selection_stroke_color32(),
+                        )
+                    } else {
+                        (
+                            self.colors.panel_header_bg32(),
+                            self.colors.panel_border32(),
+                        )
+                    }
+                }
+            };
+            let painter = ui.painter();
+            painter.rect_filled(rect, self.rounding, fill);
+            painter.rect_stroke(
+                rect,
+                self.rounding,
+                egui::Stroke::new(1.0, stroke_color),
+                egui::StrokeKind::Inside,
+            );
+            painter.with_clip_rect(rect).text(
                 rect.center(),
                 Align2::CENTER_CENTER,
                 label,
@@ -321,6 +367,48 @@ impl<'a> PanelChrome<'a> {
             response
         })
         .inner
+    }
+
+    /// Paints a fixed-height, left-aligned dropdown item that never changes size
+    /// or border thickness on hover (preventing scrollbar/layout jitter).
+    pub fn combo_item(&self, ui: &mut egui::Ui, selected: bool, label: &str) -> Response {
+        let width = ui.available_width().max(64.0);
+        let height = ui.spacing().interact_size.y;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, height), egui::Sense::click());
+        let (fill, stroke) = if selected {
+            (
+                self.colors.selection_bg_fill32(),
+                Some(self.colors.selection_stroke_color32()),
+            )
+        } else if response.hovered() {
+            (
+                self.colors.selection_bg_fill32().gamma_multiply(0.55),
+                Some(self.colors.selection_stroke_color32()),
+            )
+        } else {
+            (Color32::TRANSPARENT, None)
+        };
+        let painter = ui.painter();
+        if fill != Color32::TRANSPARENT {
+            painter.rect_filled(rect, self.rounding, fill);
+        }
+        if let Some(stroke_color) = stroke {
+            painter.rect_stroke(
+                rect,
+                self.rounding,
+                egui::Stroke::new(1.0, stroke_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        painter.with_clip_rect(rect).text(
+            pos2(rect.left() + 8.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            font,
+            ui.visuals().text_color(),
+        );
+        response
     }
 }
 

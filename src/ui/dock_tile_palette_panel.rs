@@ -14,6 +14,7 @@
 //! never mutates the model.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use egui::vec2;
@@ -195,6 +196,98 @@ fn thumbnail_pixel_rgba(
     ])
 }
 
+const INLINE_RECT_PIXEL_LIMIT: usize = 64;
+
+fn hash_tile_pixels(tile: &Tile, pixel_overrides: &TilePixelOverrides) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mix = |h: &mut u64, byte: u8| {
+        *h ^= byte as u64;
+        *h = h.wrapping_mul(0x100000001b3);
+    };
+    for b in tile.w.to_le_bytes() {
+        mix(&mut h, b);
+    }
+    for b in tile.h.to_le_bytes() {
+        mix(&mut h, b);
+    }
+    if pixel_overrides.is_empty() {
+        for &b in &tile.pixels {
+            mix(&mut h, b);
+        }
+    } else {
+        for y in 0..tile.h as u32 {
+            for x in 0..tile.w as u32 {
+                let rgba = thumbnail_pixel_rgba(tile, pixel_overrides, x, y);
+                for b in rgba {
+                    mix(&mut h, b);
+                }
+            }
+        }
+    }
+    h
+}
+
+fn ensure_tile_texture(
+    ctx: &egui::Context,
+    cache: &mut HashMap<TileId, (u64, egui::TextureHandle)>,
+    tile: &Tile,
+    pixel_overrides: &TilePixelOverrides,
+) -> egui::TextureId {
+    let hash = hash_tile_pixels(tile, pixel_overrides);
+    if let Some((cached_hash, tex)) = cache.get(&tile.id) {
+        if *cached_hash == hash {
+            return tex.id();
+        }
+    }
+    let w = tile.w as usize;
+    let h = tile.h as usize;
+    let rgba = if pixel_overrides.is_empty() {
+        tile.pixels.clone()
+    } else {
+        let mut buf = Vec::with_capacity(w * h * 4);
+        for y in 0..tile.h as u32 {
+            for x in 0..tile.w as u32 {
+                buf.extend_from_slice(&thumbnail_pixel_rgba(tile, pixel_overrides, x, y));
+            }
+        }
+        buf
+    };
+    let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+    let tex = ctx.load_texture(
+        format!("tile-thumb-{}", tile.id.0),
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+    let id = tex.id();
+    cache.insert(tile.id, (hash, tex));
+    id
+}
+
+fn paint_coarse_checkerboard(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    check_a: egui::Color32,
+    check_b: egui::Color32,
+) {
+    let cols = 8usize;
+    let rows = 8usize;
+    let cw = rect.width() / cols as f32;
+    let ch = rect.height() / rows as f32;
+    for y in 0..rows {
+        for x in 0..cols {
+            let checker = if (x + y) % 2 == 0 { check_a } else { check_b };
+            let px = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + x as f32 * cw, rect.min.y + y as f32 * ch),
+                egui::pos2(
+                    rect.min.x + (x + 1) as f32 * cw,
+                    rect.min.y + (y + 1) as f32 * ch,
+                ),
+            );
+            painter.rect_filled(px, 0.0, checker);
+        }
+    }
+}
+
 /// One thumbnail: the tile's pixels drawn scaled-up, with a highlight border
 /// when selected. A click emits `Select(tile.id)`.
 ///
@@ -208,6 +301,7 @@ fn thumbnail_ui(
     selected: bool,
     pixel_overrides: &TilePixelOverrides,
     chrome: &PanelChrome,
+    thumb_cache: &mut HashMap<TileId, (u64, egui::TextureHandle)>,
 ) {
     let scale = thumb_scale(tile);
     let size = vec2(tile.w as f32 * scale, tile.h as f32 * scale);
@@ -218,38 +312,48 @@ fn thumbnail_ui(
         egui::Sense::click(),
     );
     let painter = ui.painter();
-    // Checkerboard backdrop behind transparent pixels (theme colors only, no
-    // hard-coded chrome): a checker cell spans one tile pixel scaled up.
     let check_a = chrome.colors.panel_bg32();
     let check_b = chrome.colors.panel_border32();
-    for y in 0..tile.h as usize {
-        for x in 0..tile.w as usize {
-            let checker = if (x + y) % 2 == 0 { check_a } else { check_b };
-            let px = egui::Rect::from_min_size(
-                egui::pos2(rect.min.x + x as f32 * scale, rect.min.y + y as f32 * scale),
-                vec2(scale, scale),
-            );
-            painter.rect_filled(px, 0.0, checker);
+    let pixel_count = (tile.w as usize).saturating_mul(tile.h as usize);
+    if pixel_count <= INLINE_RECT_PIXEL_LIMIT {
+        // Small tiles: keep exact per-pixel rect painting.
+        for y in 0..tile.h as usize {
+            for x in 0..tile.w as usize {
+                let checker = if (x + y) % 2 == 0 { check_a } else { check_b };
+                let px = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + x as f32 * scale, rect.min.y + y as f32 * scale),
+                    vec2(scale, scale),
+                );
+                painter.rect_filled(px, 0.0, checker);
+            }
         }
-    }
-    // Draw each tile pixel as a scaled rect (palette-pure, deterministic).
-    // The pixel colour is the tile's raw straight-alpha RGBA data (document
-    // content), routed through Rgba so no chrome-colour constructor appears.
-    for y in 0..tile.h as usize {
-        for x in 0..tile.w as usize {
-            let rgba = thumbnail_pixel_rgba(tile, pixel_overrides, x as u32, y as u32);
-            let color = egui::Color32::from(egui::Rgba::from_rgba_unmultiplied(
-                rgba[0] as f32 / 255.0,
-                rgba[1] as f32 / 255.0,
-                rgba[2] as f32 / 255.0,
-                rgba[3] as f32 / 255.0,
-            ));
-            let px = egui::Rect::from_min_size(
-                egui::pos2(rect.min.x + x as f32 * scale, rect.min.y + y as f32 * scale),
-                vec2(scale, scale),
-            );
-            painter.rect_filled(px, 0.0, color);
+        for y in 0..tile.h as usize {
+            for x in 0..tile.w as usize {
+                let rgba = thumbnail_pixel_rgba(tile, pixel_overrides, x as u32, y as u32);
+                let color = egui::Color32::from(egui::Rgba::from_rgba_unmultiplied(
+                    rgba[0] as f32 / 255.0,
+                    rgba[1] as f32 / 255.0,
+                    rgba[2] as f32 / 255.0,
+                    rgba[3] as f32 / 255.0,
+                ));
+                let px = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + x as f32 * scale, rect.min.y + y as f32 * scale),
+                    vec2(scale, scale),
+                );
+                painter.rect_filled(px, 0.0, color);
+            }
         }
+    } else {
+        // Large tiles: draw a coarse 8x8 checkerboard + one cached GPU texture quad
+        // so adding many large tiles never tessellates thousands of RectShapes/frame.
+        paint_coarse_checkerboard(painter, rect, check_a, check_b);
+        let tex_id = ensure_tile_texture(ui.ctx(), thumb_cache, tile, pixel_overrides);
+        painter.image(
+            tex_id,
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            crate::ui::theme::SKIN_TINT,
+        );
     }
     painter.rect_stroke(
         rect,
@@ -285,6 +389,7 @@ fn tile_is_empty(tile: &Tile) -> bool {
 /// Scrollable thumbnail grid: wrapping rows that follow the panel width.
 struct TilePaletteGridComponent {
     host: TilePaletteHost,
+    thumb_cache: HashMap<TileId, (u64, egui::TextureHandle)>,
 }
 
 impl Component for TilePaletteGridComponent {
@@ -292,9 +397,12 @@ impl Component for TilePaletteGridComponent {
         let view = self.host.view.borrow();
         ui.add_space(HEADER_HEIGHT);
         if view.tiles.is_empty() {
+            self.thumb_cache.clear();
             ui.weak("No tiles yet — add a tile with “+ Empty”.");
             return;
         }
+        self.thumb_cache
+            .retain(|id, _| view.tiles.iter().any(|t| t.id == *id));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = THUMB_GAP;
             ui.spacing_mut().item_spacing.y = THUMB_GAP;
@@ -307,6 +415,7 @@ impl Component for TilePaletteGridComponent {
                     selected,
                     &view.pixel_overrides,
                     chrome,
+                    &mut self.thumb_cache,
                 );
             }
         });
@@ -342,8 +451,11 @@ impl PanelContent for TilePalettePanelContent {
 /// (overlay).
 pub(crate) fn build_tile_palette_nest(host: &TilePaletteHost) -> NestContent {
     let mut nest = NestContent::new(NestMode::Static);
-    nest.push(TilePaletteGridComponent { host: host.clone() })
-        .push(TilePaletteHeaderComponent { host: host.clone() });
+    nest.push(TilePaletteGridComponent {
+        host: host.clone(),
+        thumb_cache: HashMap::new(),
+    })
+    .push(TilePaletteHeaderComponent { host: host.clone() });
     nest
 }
 
@@ -469,5 +581,40 @@ mod tests {
             "without an override the thumbnail falls back to committed tile bytes"
         );
         assert_eq!(tile.pixels, committed.repeat(2), "preview never mutates the tile");
+    }
+
+    #[test]
+    fn large_tile_thumbnail_uses_cached_texture_instead_of_per_pixel_rects() {
+        let host = TilePaletteHost::default();
+        host.view.borrow_mut().tiles = vec![sample_tile(1, 128, 128, [255, 0, 0, 255])];
+        let mut grid = TilePaletteGridComponent {
+            host: host.clone(),
+            thumb_cache: HashMap::new(),
+        };
+        let ctx = egui::Context::default();
+        let theme = crate::ui::theme::Theme::default_dark();
+        let capture = crate::ui::input_capture::InputCapture::new();
+        let chrome = PanelChrome {
+            colors: &theme.colors,
+            theme: &theme,
+            atlases: None,
+            capture: &capture,
+            surface: crate::ui::SurfaceId::Canvas,
+            rounding: 3.0,
+        };
+        let view = NestView::new(
+            egui::pos2(0.0, 0.0),
+            1.0,
+            egui::Vec2::ZERO,
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(260.0, 260.0)),
+        );
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| grid.ui(ui, &view, &chrome));
+        assert_eq!(grid.thumb_cache.len(), 1);
+        assert!(
+            out.shapes.len() < 100,
+            "128x128 tile should render via 1 cached texture + coarse backdrop, got {} shapes",
+            out.shapes.len()
+        );
+        out.textures_delta.clear();
     }
 }

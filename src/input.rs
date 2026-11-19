@@ -39,6 +39,7 @@ pub enum Action {
     SelectFill,
     SelectTileTool,
     SelectAnimationPlacer,
+    SelectText,
     /// Save the active project (default key: Ctrl/Cmd+S).
     SaveProject,
     /// Save the active project under a new directory (Ctrl/Cmd+Shift+S).
@@ -48,7 +49,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Undo,
         Self::Redo,
         Self::Copy,
@@ -77,6 +78,7 @@ impl Action {
         Self::SelectFill,
         Self::SelectTileTool,
         Self::SelectAnimationPlacer,
+        Self::SelectText,
         Self::SaveProject,
         Self::SaveProjectAs,
         Self::OpenProject,
@@ -110,6 +112,7 @@ pub enum LogicalKey {
     T,
     A,
     O,
+    Q,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
@@ -129,6 +132,55 @@ pub struct KeyBinding {
     pub key: LogicalKey,
     #[serde(default)]
     pub modifiers: Modifiers,
+}
+
+impl LogicalKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Z => "Z",
+            Self::Y => "Y",
+            Self::C => "C",
+            Self::X => "X",
+            Self::V => "V",
+            Self::R => "R",
+            Self::Plus => "+",
+            Self::Equals => "=",
+            Self::Minus => "-",
+            Self::H => "H",
+            Self::Escape => "Esc",
+            Self::G => "G",
+            Self::D => "D",
+            Self::E => "E",
+            Self::Delete => "Del",
+            Self::I => "I",
+            Self::F => "F",
+            Self::S => "S",
+            Self::W => "W",
+            Self::L => "L",
+            Self::B => "B",
+            Self::T => "T",
+            Self::A => "A",
+            Self::O => "O",
+            Self::Q => "Q",
+        }
+    }
+}
+
+impl KeyBinding {
+    pub fn display_label(self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.command || self.modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.modifiers.alt {
+            parts.push("Alt");
+        }
+        if self.modifiers.shift {
+            parts.push("Shift");
+        }
+        parts.push(self.key.label());
+        parts.join("+")
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -195,6 +247,12 @@ impl Keymap {
         self.bindings.get(&action).copied()
     }
 
+    pub fn display_label(&self, action: Action) -> String {
+        self.binding(action)
+            .map(KeyBinding::display_label)
+            .unwrap_or_else(|| "Unbound".to_string())
+    }
+
     pub fn pressed(&self, action: Action, input: &egui::InputState) -> bool {
         let Some(binding) = self.binding(action) else {
             return false;
@@ -245,6 +303,7 @@ impl Keymap {
             LogicalKey::T => egui::Key::T,
             LogicalKey::A => egui::Key::A,
             LogicalKey::O => egui::Key::O,
+            LogicalKey::Q => egui::Key::Q,
         };
         hit(key)
     }
@@ -510,6 +569,10 @@ pub enum Tool {
     /// toolbox. A primary drag defines the rectangle and on release its cells
     /// are walked row-major into the ACTIVE animation; a bare click is a no-op.
     AnimationPlacer,
+    /// Pixel-art Text tool: click on canvas to type crisp non-antialiased text
+    /// inside a live transform session (font, size, and rotation algorithm in
+    /// Tool Property).
+    Text,
 }
 
 /// The active Fieldier child: which selection behaviour the Fieldier performs.

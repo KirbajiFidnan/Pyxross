@@ -46,10 +46,14 @@ ARCHIVE="$DIST_DIR/${PACKAGE}-${VERSION}-linux-x86_64.tar.gz"
 APPIMAGE="$DIST_DIR/${PACKAGE}-${VERSION}-linux-x86_64.AppImage"
 mkdir -p "$DIST_DIR"
 rm -rf "$PACKAGE_ROOT" "$APPDIR"
-mkdir -p "$PACKAGE_ROOT/themes/builtin" "$APPDIR/usr/bin" "$APPDIR/usr/share/$PACKAGE/themes/builtin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/64x64/apps" "$APPDIR/assets"
+mkdir -p "$PACKAGE_ROOT/themes/builtin" "$PACKAGE_ROOT/banners" "$APPDIR/usr/bin" "$APPDIR/usr/share/$PACKAGE/themes/builtin" "$APPDIR/usr/share/$PACKAGE/banners" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/64x64/apps" "$APPDIR/assets"
 cp "$BINARY" "$PACKAGE_ROOT/$PACKAGE"
 cp "$SOURCE_THEME" "$PACKAGE_ROOT/themes/builtin/theme.json"
 cp "$SOURCE_ATLAS" "$PACKAGE_ROOT/themes/builtin/atlas.png"
+if [ -d "$REPO_ROOT/banners" ]; then
+  cp -r "$REPO_ROOT/banners/." "$PACKAGE_ROOT/banners/" 2>/dev/null || true
+  cp -r "$REPO_ROOT/banners/." "$APPDIR/usr/share/$PACKAGE/banners/" 2>/dev/null || true
+fi
 cp "$REPO_ROOT/packaging/package-README.md" "$PACKAGE_ROOT/README.md"
 cp "$REPO_ROOT/LICENSE" "$PACKAGE_ROOT/LICENSE"
 cp "$BINARY" "$APPDIR/usr/bin/$PACKAGE"

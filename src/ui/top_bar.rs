@@ -80,6 +80,10 @@ pub enum TopBarEvent {
     CloseProject(ProjectId),
     /// Open (or raise) the "create new document" floating panel.
     OpenCreateDocument,
+    /// Toggle the floating Color Picker (clicking the FG swatch in the top bar).
+    ToggleColorPicker,
+    /// Swap foreground and background colors (clicking the BG swatch in the top bar).
+    SwapColors,
     /// A menu-bar item was activated.
     MenuAction(MenuAction),
 }
@@ -93,8 +97,13 @@ pub enum MenuAction {
     OpenProject,
     ImportImages,
     ImportGif,
+    ImportPyxel,
+    ImportAseprite,
+    ImportImage2Pixel,
     ExportSpriteSheet,
     ExportGif,
+    ExportPyxel,
+    ExportAseprite,
     ExportSelected,
     Undo,
     Redo,
@@ -109,17 +118,45 @@ pub enum MenuAction {
     FlipSelectionVertical,
     RotateSelection,
     ResizeCanvas,
+    LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind),
+    Style,
+    KeyBindings,
+    EditorOptions,
+    Credits,
 }
 
 /// One selectable entry in a menu dropdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MenuItem {
+    /// Optional section header rendered above this item (with a divider line
+    /// when not the first item in the dropdown).
+    pub group: Option<&'static str>,
     pub label: &'static str,
     pub action: MenuAction,
 }
 
+const fn item(label: &'static str, action: MenuAction) -> MenuItem {
+    MenuItem {
+        group: None,
+        label,
+        action,
+    }
+}
+
+const fn grouped_item(
+    group: &'static str,
+    label: &'static str,
+    action: MenuAction,
+) -> MenuItem {
+    MenuItem {
+        group: Some(group),
+        label,
+        action,
+    }
+}
+
 /// A menu-bar title plus its dropdown. `dropdown_title` is an optional centered
-/// header line (the File menu shows "document").
+/// header line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MenuDef {
     pub title: &'static str,
@@ -127,108 +164,87 @@ pub struct MenuDef {
     pub items: &'static [MenuItem],
 }
 
-/// The centered header shown at the top of the File dropdown.
-pub const FILE_MENU_TITLE: &str = "document";
-
-static FILE_ITEMS: [MenuItem; 9] = [
-    MenuItem {
-        label: "new project",
-        action: MenuAction::NewProject,
-    },
-    MenuItem {
-        label: "save project",
-        action: MenuAction::SaveProject,
-    },
-    MenuItem {
-        label: "save project as",
-        action: MenuAction::SaveProjectAs,
-    },
-    MenuItem {
-        label: "open project",
-        action: MenuAction::OpenProject,
-    },
-    MenuItem {
-        label: "import images",
-        action: MenuAction::ImportImages,
-    },
-    MenuItem {
-        label: "import gif",
-        action: MenuAction::ImportGif,
-    },
-    MenuItem {
-        label: "export sprite sheet",
-        action: MenuAction::ExportSpriteSheet,
-    },
-    MenuItem {
-        label: "export gif",
-        action: MenuAction::ExportGif,
-    },
-    MenuItem {
-        label: "export selection",
-        action: MenuAction::ExportSelected,
-    },
+static FILE_ITEMS: [MenuItem; 14] = [
+    grouped_item("Document", "New Project...", MenuAction::NewProject),
+    item("Save Project", MenuAction::SaveProject),
+    item("Save Project As...", MenuAction::SaveProjectAs),
+    item("Open Project...", MenuAction::OpenProject),
+    grouped_item("Import", "Import Images...", MenuAction::ImportImages),
+    item("Import GIF...", MenuAction::ImportGif),
+    item("Import Pyxel...", MenuAction::ImportPyxel),
+    item("Import Aseprite...", MenuAction::ImportAseprite),
+    item("Image to Pixel...", MenuAction::ImportImage2Pixel),
+    grouped_item("Export", "Export Sprite Sheet...", MenuAction::ExportSpriteSheet),
+    item("Export GIF...", MenuAction::ExportGif),
+    item("Export .pyxel...", MenuAction::ExportPyxel),
+    item("Export .ase...", MenuAction::ExportAseprite),
+    item("Export Selection...", MenuAction::ExportSelected),
 ];
 
 static EDIT_ITEMS: [MenuItem; 12] = [
-    MenuItem {
-        label: "undo (Ctrl+Z)",
-        action: MenuAction::Undo,
-    },
-    MenuItem {
-        label: "redo (Ctrl+Y)",
-        action: MenuAction::Redo,
-    },
-    MenuItem {
-        label: "cut (Ctrl+X)",
-        action: MenuAction::Cut,
-    },
-    MenuItem {
-        label: "copy (Ctrl+C)",
-        action: MenuAction::Copy,
-    },
-    MenuItem {
-        label: "paste (Ctrl+V)",
-        action: MenuAction::Paste,
-    },
-    MenuItem {
-        label: "delete (Del)",
-        action: MenuAction::DeleteSelection,
-    },
-    MenuItem {
-        label: "select all",
-        action: MenuAction::SelectAll,
-    },
-    MenuItem {
-        label: "deselect (Esc)",
-        action: MenuAction::Deselect,
-    },
-    MenuItem {
-        label: "invert selection (Ctrl+I)",
-        action: MenuAction::InvertSelection,
-    },
-    MenuItem {
-        label: "flip horizontal (Ctrl+F)",
-        action: MenuAction::FlipSelectionHorizontal,
-    },
-    MenuItem {
-        label: "flip vertical (Shift+F)",
-        action: MenuAction::FlipSelectionVertical,
-    },
-    MenuItem {
-        label: "rotate 90° (Alt+F)",
-        action: MenuAction::RotateSelection,
-    },
+    grouped_item("History", "Undo", MenuAction::Undo),
+    item("Redo", MenuAction::Redo),
+    grouped_item("Clipboard", "Cut", MenuAction::Cut),
+    item("Copy", MenuAction::Copy),
+    item("Paste", MenuAction::Paste),
+    item("Delete", MenuAction::DeleteSelection),
+    grouped_item("Selection", "Select All", MenuAction::SelectAll),
+    item("Deselect", MenuAction::Deselect),
+    item("Invert Selection", MenuAction::InvertSelection),
+    grouped_item("Transform", "Flip Horizontal", MenuAction::FlipSelectionHorizontal),
+    item("Flip Vertical", MenuAction::FlipSelectionVertical),
+    item("Rotate 90°", MenuAction::RotateSelection),
 ];
 
-static CANVAS_ITEMS: [MenuItem; 1] = [MenuItem {
-    label: "resize canvas",
-    action: MenuAction::ResizeCanvas,
-}];
+static CANVAS_ITEMS: [MenuItem; 1] = [grouped_item(
+    "Canvas",
+    "Resize Canvas...",
+    MenuAction::ResizeCanvas,
+)];
 
-static MENUS: [MenuDef; 3] = [
+static PALETTE_ITEMS: [MenuItem; 7] = [
+    grouped_item(
+        "Builtin Presets",
+        "Ross (32)",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Ross),
+    ),
+    item(
+        "PICO-8 (16)",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Pico8),
+    ),
+    item(
+        "Sweetie 16",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Sweetie16),
+    ),
+    item(
+        "DB16",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Db16),
+    ),
+    item(
+        "DB32",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Db32),
+    ),
+    item(
+        "Endesga 32",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Endesga32),
+    ),
+    item(
+        "AAP-64",
+        MenuAction::LoadBuiltinPalette(crate::core::palette::BuiltinPaletteKind::Aap64),
+    ),
+];
+
+static OPTIONS_ITEMS: [MenuItem; 4] = [
+    grouped_item("Preferences", "Style...", MenuAction::Style),
+    item("Key Bindings...", MenuAction::KeyBindings),
+    item("Editor Options...", MenuAction::EditorOptions),
+    grouped_item("About", "Credits", MenuAction::Credits),
+];
+
+static MENUS: [MenuDef; 5] = [
     MenuDef {
         title: "File",
-        dropdown_title: Some(FILE_MENU_TITLE),
+        dropdown_title: None,
         items: &FILE_ITEMS,
     },
     MenuDef {
@@ -240,6 +256,16 @@ static MENUS: [MenuDef; 3] = [
         title: "Canvas",
         dropdown_title: None,
         items: &CANVAS_ITEMS,
+    },
+    MenuDef {
+        title: "Palette",
+        dropdown_title: None,
+        items: &PALETTE_ITEMS,
+    },
+    MenuDef {
+        title: "Options",
+        dropdown_title: None,
+        items: &OPTIONS_ITEMS,
     },
 ];
 
@@ -290,17 +316,30 @@ pub fn split_frame(frame: Rect) -> TopBarLayout {
 /// width.
 const CREATE_BUTTON_LEFT_INSET: f32 = 20.0;
 
-/// The square "create new document" button in the middle slice: a square whose
-/// side length approximates the (grown) middle slice height, set a small fixed inset
-/// from the slice's LEFT edge. Pure, so tests can target it.
+/// The square "create new document" button in the middle slice: pinned to the
+/// RIGHT edge of `middle_rect`. Pure, so tests can target it.
 pub fn create_document_button_rect(layout: &TopBarLayout) -> Rect {
     let side = (layout.middle_rect.height() - 2.0 * SLICE_INSET).max(8.0);
     let inset = CREATE_BUTTON_LEFT_INSET.max(SLICE_INSET);
     let center = pos2(
-        layout.middle_rect.left() + inset + side * 0.5,
+        layout.middle_rect.right() - inset - side * 0.5,
         layout.middle_rect.center().y,
     );
     Rect::from_center_size(center, vec2(side, side))
+}
+
+/// The Foreground/Background color swatch cluster in the middle slice, placed
+/// on the LEFT edge where the create-document button used to sit.
+pub fn fg_bg_swatch_rects(layout: &TopBarLayout) -> (Rect, Rect) {
+    let inset = CREATE_BUTTON_LEFT_INSET.max(SLICE_INSET);
+    let side = ((layout.middle_rect.height() - 2.0 * SLICE_INSET) * 0.62).clamp(16.0, 32.0);
+    let offset = (side * 0.42).round();
+    let total = side + offset;
+    let x0 = layout.middle_rect.left() + inset;
+    let y0 = layout.middle_rect.center().y - total * 0.5;
+    let fg = Rect::from_min_size(pos2(x0, y0), vec2(side, side));
+    let bg = Rect::from_min_size(pos2(x0 + offset, y0 + offset), vec2(side, side));
+    (fg, bg)
 }
 
 /// The trailing "×" close button inside a project tab: a small square pinned to
@@ -316,10 +355,64 @@ pub fn tab_close_button_rect(tab_rect: Rect) -> Rect {
 
 /// Menu-bar metrics: title width, dropdown width, item height and padding.
 const MENU_TITLE_WIDTH: f32 = 72.0;
-const MENU_DROPDOWN_WIDTH: f32 = 204.0;
+const MENU_DROPDOWN_WIDTH: f32 = 236.0;
 const MENU_ITEM_HEIGHT: f32 = 22.0;
-const MENU_DROPDOWN_PAD: f32 = 4.0;
+const MENU_DROPDOWN_PAD: f32 = 6.0;
 const MENU_HEADER_HEIGHT: f32 = 20.0;
+const MENU_GROUP_HEIGHT: f32 = 18.0;
+const MENU_SEPARATOR_HEIGHT: f32 = 7.0;
+const MENU_ITEM_TEXT_INSET: f32 = 10.0;
+
+/// Layout rows computed for a menu dropdown: section dividers/headers and item rects.
+#[derive(Clone, Debug)]
+struct DropdownRowLayout {
+    separator_y: Option<f32>,
+    group_rect: Option<Rect>,
+    item: MenuItem,
+    item_rect: Rect,
+}
+
+fn compute_dropdown_rows(
+    left: f32,
+    top: f32,
+    def: &MenuDef,
+) -> (f32, Vec<DropdownRowLayout>) {
+    let mut y = top + MENU_DROPDOWN_PAD;
+    if def.dropdown_title.is_some() {
+        y += MENU_HEADER_HEIGHT;
+    }
+    let row_left = left + MENU_DROPDOWN_PAD;
+    let row_right = left + MENU_DROPDOWN_WIDTH - MENU_DROPDOWN_PAD;
+    let mut rows = Vec::with_capacity(def.items.len());
+    for (i, &item) in def.items.iter().enumerate() {
+        let mut separator_y = None;
+        let mut group_rect = None;
+        if item.group.is_some() {
+            if i > 0 {
+                separator_y = Some(y + MENU_SEPARATOR_HEIGHT * 0.5);
+                y += MENU_SEPARATOR_HEIGHT;
+            }
+            group_rect = Some(Rect::from_min_max(
+                pos2(row_left, y),
+                pos2(row_right, y + MENU_GROUP_HEIGHT),
+            ));
+            y += MENU_GROUP_HEIGHT;
+        }
+        let item_rect = Rect::from_min_max(
+            pos2(row_left, y),
+            pos2(row_right, y + MENU_ITEM_HEIGHT),
+        );
+        y += MENU_ITEM_HEIGHT;
+        rows.push(DropdownRowLayout {
+            separator_y,
+            group_rect,
+            item,
+            item_rect,
+        });
+    }
+    y += MENU_DROPDOWN_PAD;
+    (y - top, rows)
+}
 
 /// The clickable title rects of the menu bar, in order (File, Canvas, …).
 pub fn menu_title_rects(layout: &TopBarLayout) -> Vec<(usize, Rect)> {
@@ -345,45 +438,67 @@ pub fn menu_dropdown_rect(layout: &TopBarLayout, index: usize) -> Option<Rect> {
         .into_iter()
         .find(|(i, _)| *i == index)
         .map(|(_, r)| r)?;
-    let header = if def.dropdown_title.is_some() {
-        MENU_HEADER_HEIGHT
-    } else {
-        0.0
-    };
-    let height = header + def.items.len() as f32 * MENU_ITEM_HEIGHT + 2.0 * MENU_DROPDOWN_PAD;
+    let top = layout.menu_rect.bottom() + 1.0;
+    let (height, _) = compute_dropdown_rows(title.left(), top, def);
     Some(Rect::from_min_size(
-        pos2(title.left(), layout.menu_rect.bottom() + 1.0),
+        pos2(title.left(), top),
         vec2(MENU_DROPDOWN_WIDTH, height),
     ))
 }
 
 /// The clickable rects of a dropdown's items, in order. Pure.
 pub fn menu_item_rects(layout: &TopBarLayout, index: usize) -> Vec<(MenuItem, Rect)> {
-    let def = match menu_bar().get(index) {
-        Some(def) => def,
-        None => return Vec::new(),
+    let Some(def) = menu_bar().get(index) else {
+        return Vec::new();
     };
-    let dropdown = match menu_dropdown_rect(layout, index) {
-        Some(rect) => rect,
-        None => return Vec::new(),
+    let Some(dropdown) = menu_dropdown_rect(layout, index) else {
+        return Vec::new();
     };
-    let header = if def.dropdown_title.is_some() {
-        MENU_HEADER_HEIGHT
-    } else {
-        0.0
-    };
-    def.items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let top = dropdown.top() + MENU_DROPDOWN_PAD + header + i as f32 * MENU_ITEM_HEIGHT;
-            let rect = Rect::from_min_max(
-                pos2(dropdown.left() + MENU_DROPDOWN_PAD, top),
-                pos2(dropdown.right() - MENU_DROPDOWN_PAD, top + MENU_ITEM_HEIGHT),
-            );
-            (*item, rect)
-        })
+    let (_, rows) = compute_dropdown_rows(dropdown.left(), dropdown.top(), def);
+    rows.into_iter()
+        .map(|row| (row.item, row.item_rect))
         .collect()
+}
+
+/// Dynamic shortcut strings displayed alongside Edit menu entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditMenuShortcuts {
+    pub undo: String,
+    pub redo: String,
+    pub cut: String,
+    pub copy: String,
+    pub paste: String,
+    pub delete: String,
+    pub deselect: String,
+    pub invert_selection: String,
+    pub flip_h: String,
+    pub flip_v: String,
+    pub rotate: String,
+}
+
+impl EditMenuShortcuts {
+    pub fn from_keymap(keymap: &crate::input::Keymap) -> Self {
+        use crate::input::Action;
+        Self {
+            undo: keymap.display_label(Action::Undo),
+            redo: keymap.display_label(Action::Redo),
+            cut: keymap.display_label(Action::Cut),
+            copy: keymap.display_label(Action::Copy),
+            paste: keymap.display_label(Action::Paste),
+            delete: keymap.display_label(Action::SelectDelete),
+            deselect: "Esc".to_string(),
+            invert_selection: keymap.display_label(Action::InvertSelection),
+            flip_h: keymap.display_label(Action::FlipSelectionHorizontal),
+            flip_v: keymap.display_label(Action::FlipSelectionVertical),
+            rotate: keymap.display_label(Action::RotateSelection),
+        }
+    }
+}
+
+impl Default for EditMenuShortcuts {
+    fn default() -> Self {
+        Self::from_keymap(&crate::input::Keymap::defaults())
+    }
 }
 
 /// Per-frame top-bar host: the App writes the menu labels and the open-project
@@ -399,11 +514,57 @@ pub struct TopBarHost {
     events: Vec<TopBarEvent>,
     /// Index into [`menu_bar`] of the currently open dropdown, if any.
     open_menu: Option<usize>,
+    /// Dynamic shortcut labels for the Edit menu.
+    edit_shortcuts: EditMenuShortcuts,
+    /// Optional right-aligned pixel-art banner rendered in the middle slice.
+    banner: Option<(egui::TextureId, [u32; 2])>,
+    /// Global foreground / background colors displayed in the middle slice.
+    fg_color: crate::core::color::Color,
+    bg_color: crate::core::color::Color,
 }
 
 impl TopBarHost {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            fg_color: crate::core::color::Color::BLACK,
+            bg_color: crate::core::color::Color::WHITE,
+            ..Self::default()
+        }
+    }
+
+    pub fn set_colors(
+        &mut self,
+        fg: crate::core::color::Color,
+        bg: crate::core::color::Color,
+    ) {
+        self.fg_color = fg;
+        self.bg_color = bg;
+    }
+
+    pub fn set_edit_shortcuts(&mut self, shortcuts: EditMenuShortcuts) {
+        self.edit_shortcuts = shortcuts;
+    }
+
+    pub fn set_banner(&mut self, banner: Option<(egui::TextureId, [u32; 2])>) {
+        self.banner = banner;
+    }
+
+    fn item_label_and_shortcut(&self, item: MenuItem) -> (&'static str, Option<&str>) {
+        let shortcut = match item.action {
+            MenuAction::Undo => Some(self.edit_shortcuts.undo.as_str()),
+            MenuAction::Redo => Some(self.edit_shortcuts.redo.as_str()),
+            MenuAction::Cut => Some(self.edit_shortcuts.cut.as_str()),
+            MenuAction::Copy => Some(self.edit_shortcuts.copy.as_str()),
+            MenuAction::Paste => Some(self.edit_shortcuts.paste.as_str()),
+            MenuAction::DeleteSelection => Some(self.edit_shortcuts.delete.as_str()),
+            MenuAction::Deselect => Some(self.edit_shortcuts.deselect.as_str()),
+            MenuAction::InvertSelection => Some(self.edit_shortcuts.invert_selection.as_str()),
+            MenuAction::FlipSelectionHorizontal => Some(self.edit_shortcuts.flip_h.as_str()),
+            MenuAction::FlipSelectionVertical => Some(self.edit_shortcuts.flip_v.as_str()),
+            MenuAction::RotateSelection => Some(self.edit_shortcuts.rotate.as_str()),
+            _ => None,
+        };
+        (item.label, shortcut.filter(|s| !s.is_empty()))
     }
 
     /// Legacy extension seam for extra menu labels, retained for API
@@ -450,6 +611,43 @@ impl TopBarHost {
         painter.rect_filled(layout.menu_rect, 0.0, colors.panel_header_bg32());
         painter.rect_filled(layout.middle_rect, 0.0, colors.panel_bg32());
         painter.rect_filled(layout.tabs_rect, 0.0, colors.panel_header_bg32());
+        if let Some((tex_id, [bw, bh])) = self.banner {
+            if bw > 0 && bh > 0 && layout.middle_rect.height() > 0.0 {
+                let target_h = layout.middle_rect.height();
+                let draw_w = target_h * (bw as f32 / bh as f32);
+                let banner_rect = Rect::from_min_max(
+                    pos2(layout.middle_rect.right() - draw_w, layout.middle_rect.top()),
+                    layout.middle_rect.right_bottom(),
+                );
+                let fade_frac = 0.38_f32;
+                let fade_x = banner_rect.left() + banner_rect.width() * fade_frac;
+                let mut mesh = egui::Mesh::with_texture(tex_id);
+                let transparent = egui::Color32::TRANSPARENT;
+                let opaque = crate::ui::theme::SKIN_TINT;
+                // Left fade strip: transparent -> opaque.
+                let v0 = mesh.vertices.len() as u32;
+                let push_v = |m: &mut egui::Mesh, pos: egui::Pos2, uv: egui::Pos2, color: egui::Color32| {
+                    m.vertices.push(egui::epaint::Vertex { pos, uv, color });
+                };
+                push_v(&mut mesh, banner_rect.left_top(), pos2(0.0, 0.0), transparent);
+                push_v(&mut mesh, pos2(fade_x, banner_rect.top()), pos2(fade_frac, 0.0), opaque);
+                push_v(&mut mesh, pos2(fade_x, banner_rect.bottom()), pos2(fade_frac, 1.0), opaque);
+                push_v(&mut mesh, banner_rect.left_bottom(), pos2(0.0, 1.0), transparent);
+                mesh.add_triangle(v0, v0 + 1, v0 + 2);
+                mesh.add_triangle(v0, v0 + 2, v0 + 3);
+                // Right solid strip: opaque -> opaque.
+                let v1 = mesh.vertices.len() as u32;
+                push_v(&mut mesh, pos2(fade_x, banner_rect.top()), pos2(fade_frac, 0.0), opaque);
+                push_v(&mut mesh, banner_rect.right_top(), pos2(1.0, 0.0), opaque);
+                push_v(&mut mesh, banner_rect.right_bottom(), pos2(1.0, 1.0), opaque);
+                push_v(&mut mesh, pos2(fade_x, banner_rect.bottom()), pos2(fade_frac, 1.0), opaque);
+                mesh.add_triangle(v1, v1 + 1, v1 + 2);
+                mesh.add_triangle(v1, v1 + 2, v1 + 3);
+                painter
+                    .with_clip_rect(layout.middle_rect)
+                    .add(egui::Shape::Mesh(mesh.into()));
+            }
+        }
         // Separators under the menu slice, under the middle slice, and at the
         // very bottom of the bar (so the bar reads as a distinct frame band).
         let border = Stroke::new(1.0, colors.panel_border32());
@@ -523,15 +721,57 @@ impl TopBarHost {
             }
         }
 
-        // Middle slice: mostly an empty placeholder for future multi-purpose
-        // controls, with the square "create new document" button pinned to the
-        // right edge. Pressing it asks the App to open the create-document panel.
-        let button_rect = create_document_button_rect(layout);
-        let button = ui.interact(
-            button_rect,
-            Id::new("top-bar-create-document"),
-            Sense::click(),
+        // Middle slice: FG/BG color swatches on the LEFT, New Document button on the RIGHT.
+        let (fg_rect, bg_rect) = fg_bg_swatch_rects(layout);
+        let bg_resp = ui
+            .interact(bg_rect, Id::new("top-bar-bg-swatch"), Sense::click())
+            .on_hover_text("Background color (Click to swap FG/BG)");
+        let fg_resp = ui
+            .interact(fg_rect, Id::new("top-bar-fg-swatch"), Sense::click())
+            .on_hover_text("Foreground color (Click to open Color Picker)");
+        let bg32 = egui::Color32::from_rgba_unmultiplied(
+            self.bg_color.r,
+            self.bg_color.g,
+            self.bg_color.b,
+            self.bg_color.a,
         );
+        let fg32 = egui::Color32::from_rgba_unmultiplied(
+            self.fg_color.r,
+            self.fg_color.g,
+            self.fg_color.b,
+            self.fg_color.a,
+        );
+        painter.rect_filled(bg_rect, 2.0, bg32);
+        painter.rect_stroke(
+            bg_rect,
+            2.0,
+            Stroke::new(1.0, colors.panel_border32()),
+            StrokeKind::Inside,
+        );
+        painter.rect_filled(fg_rect, 2.0, fg32);
+        painter.rect_stroke(
+            fg_rect,
+            2.0,
+            Stroke::new(1.5, colors.selection_stroke_color32()),
+            StrokeKind::Inside,
+        );
+        if fg_resp.clicked() {
+            self.events.push(TopBarEvent::ToggleColorPicker);
+        } else if bg_resp.clicked() {
+            self.events.push(TopBarEvent::SwapColors);
+        }
+        if fg_resp.hovered() || bg_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let button_rect = create_document_button_rect(layout);
+        let button = ui
+            .interact(
+                button_rect,
+                Id::new("top-bar-create-document"),
+                Sense::click(),
+            )
+            .on_hover_text("Create new document");
         let button_fill = if button.is_pointer_button_down_on() {
             colors.selection_stroke_color32()
         } else if button.hovered() {
@@ -546,13 +786,7 @@ impl TopBarHost {
             Stroke::new(1.0, colors.panel_border32()),
             StrokeKind::Inside,
         );
-        painter.text(
-            button_rect.center(),
-            Align2::CENTER_CENTER,
-            "+",
-            FontId::proportional((button_rect.height() * 0.7).clamp(12.0, 30.0)),
-            text_color,
-        );
+        paint_new_document_pixel_icon(&painter, button_rect, colors);
         if button.clicked() {
             self.events.push(TopBarEvent::OpenCreateDocument);
         }
@@ -583,6 +817,7 @@ impl TopBarHost {
         };
         let painter = ui.painter().clone();
         let text_color = ui.visuals().text_color();
+        let weak_color = ui.visuals().weak_text_color();
         // Panel background + border.
         painter.rect_filled(dropdown, 3.0, colors.panel_header_bg32());
         painter.rect_stroke(
@@ -591,7 +826,7 @@ impl TopBarHost {
             Stroke::new(1.0, colors.panel_border32()),
             StrokeKind::Inside,
         );
-        // Optional centered header (File -> "document").
+        // Optional centered header.
         if let Some(header) = def.dropdown_title {
             let header_rect = Rect::from_min_max(
                 dropdown.min,
@@ -601,29 +836,57 @@ impl TopBarHost {
                 header_rect.center(),
                 Align2::CENTER_CENTER,
                 header,
-                FontId::proportional(12.0),
-                colors.panel_border32(),
+                FontId::proportional(11.0),
+                weak_color,
             );
         }
+        let (_, rows) = compute_dropdown_rows(dropdown.left(), dropdown.top(), def);
         let mut chosen: Option<MenuAction> = None;
-        for (item, rect) in menu_item_rects(layout, index) {
+        for row in rows {
+            if let Some(sep_y) = row.separator_y {
+                painter.hline(
+                    (dropdown.left() + MENU_DROPDOWN_PAD)..=(dropdown.right() - MENU_DROPDOWN_PAD),
+                    sep_y,
+                    Stroke::new(1.0, colors.panel_border32()),
+                );
+            }
+            if let (Some(group_name), Some(group_rect)) = (row.item.group, row.group_rect) {
+                painter.text(
+                    pos2(group_rect.left() + MENU_ITEM_TEXT_INSET, group_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    group_name,
+                    FontId::proportional(10.5),
+                    weak_color,
+                );
+            }
+            let rect = row.item_rect;
             let response = ui.interact(
                 rect,
-                Id::new(("top-bar-menu-item", index, item.label)),
+                Id::new(("top-bar-menu-item", index, row.item.label)),
                 Sense::click(),
             );
             if response.hovered() {
                 painter.rect_filled(rect, 2.0, colors.selection_bg_fill32());
             }
+            let (label, shortcut) = self.item_label_and_shortcut(row.item);
             painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                item.label,
-                FontId::proportional(13.0),
+                pos2(rect.left() + MENU_ITEM_TEXT_INSET, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(12.5),
                 text_color,
             );
+            if let Some(shortcut) = shortcut {
+                painter.text(
+                    pos2(rect.right() - MENU_ITEM_TEXT_INSET, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    shortcut,
+                    FontId::proportional(11.5),
+                    weak_color,
+                );
+            }
             if response.clicked() {
-                chosen = Some(item.action);
+                chosen = Some(row.item.action);
             }
         }
         if let Some(action) = chosen {
@@ -635,13 +898,32 @@ impl TopBarHost {
     fn paint_tabs(&mut self, ui: &mut egui::Ui, layout: &TopBarLayout, colors: &ThemeColors) {
         let painter = ui.painter().clone();
         let tabs = self.tabs.clone();
+        let version_text = format!("Pyxross Workshop {}", env!("CARGO_PKG_VERSION"));
+        let version_font = FontId::proportional(11.5);
+        let version_w = painter
+            .layout_no_wrap(
+                version_text.clone(),
+                version_font.clone(),
+                ui.visuals().weak_text_color(),
+            )
+            .size()
+            .x;
+        let tabs_right_limit = (layout.tabs_rect.right() - version_w - 18.0).max(layout.tabs_rect.left());
+        painter.text(
+            pos2(layout.tabs_rect.right() - 10.0, layout.tabs_rect.center().y),
+            Align2::RIGHT_CENTER,
+            version_text,
+            version_font,
+            ui.visuals().weak_text_color(),
+        );
+
         let y = layout.tabs_rect.top() + SLICE_INSET;
         let height = (layout.tabs_rect.height() - 2.0 * SLICE_INSET).max(1.0);
         let text_color = ui.visuals().text_color();
         let mut x = layout.tabs_rect.left() + SLICE_INSET;
         for tab in &tabs {
             let rect = Rect::from_min_size(pos2(x, y), vec2(TAB_WIDTH, height));
-            if rect.right() > layout.tabs_rect.right() - SLICE_INSET {
+            if rect.right() > tabs_right_limit {
                 break;
             }
             let response = ui.interact(
@@ -661,26 +943,29 @@ impl TopBarHost {
                 colors.panel_border32()
             };
             painter.rect_stroke(rect, 3.0, Stroke::new(1.0, stroke_color), StrokeKind::Inside);
-            // Dirty marker: a trailing bullet (no hard-coded color; text only).
-            let label = if tab.dirty {
-                format!("{} •", tab.name)
-            } else {
-                tab.name.clone()
-            };
-            // The label is centred in the space LEFT of the close button so the
-            // "×" never overlaps it.
+            // The label sits in the space LEFT of the close button so the
+            // "×" never overlaps it; long names are truncated with "...".
             let close_rect = tab_close_button_rect(rect);
-            let label_center = pos2(
-                (rect.left() + close_rect.left()) * 0.5,
-                rect.center().y,
+            let label_rect = Rect::from_min_max(
+                pos2(rect.left() + 6.0, rect.top()),
+                pos2((close_rect.left() - 4.0).max(rect.left() + 6.0), rect.bottom()),
             );
-            painter.text(
-                label_center,
+            let font = FontId::proportional(13.0);
+            let suffix = if tab.dirty { " •" } else { "" };
+            let full_label = format!("{}{}", tab.name, suffix);
+            let (display_label, was_truncated) =
+                truncate_label_to_width(&painter, &tab.name, suffix, &font, label_rect.width());
+            let label_painter = painter.with_clip_rect(label_rect.intersect(painter.clip_rect()));
+            label_painter.text(
+                label_rect.center(),
                 Align2::CENTER_CENTER,
-                label,
-                FontId::proportional(13.0),
+                display_label,
+                font,
                 text_color,
             );
+            if was_truncated {
+                response.clone().on_hover_text(full_label);
+            }
             // Select: the whole tab, but a click on the "×" is claimed by the
             // close button registered AFTER this one (egui gives the later
             // widget the hit test), so it must not also select.
@@ -714,6 +999,137 @@ impl TopBarHost {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             x += TAB_WIDTH + TAB_GAP;
+        }
+    }
+}
+
+/// 27x27 pixel-art ornament for the top bar's "New Document" button (trimmed of
+/// outer transparent margins so the icon fills the button cleanly).
+/// `#` = white (`SKIN_TINT`), `g` = theme accent (`selection_stroke_color32`),
+/// `.` = transparent.
+const NEW_DOCUMENT_PIXEL_ICON: [&str; 27] = [
+    ".............#.............",
+    "............###............",
+    "..gggggg...#####...gggggg..",
+    "..ggggggg.g##.##g.ggggggg..",
+    "..ggg.................ggg..",
+    "..gg.g####g.....g####g.gg..",
+    "..gg.#####g..#..g#####.gg..",
+    "..gg.#####..###..#####.gg..",
+    "...g.####..g#.#g..####.g...",
+    ".....###...........###.....",
+    "...g.gg...##.g.##...gg.g...",
+    "..##....g.#..#..#.#....##..",
+    ".###...##...g#g...##...###.",
+    "###...##..g#####g..##...###",
+    ".###...##...g#g...##...###.",
+    "..##....g.#..#..#.#....##..",
+    "...g.gg...##.g.##...gg.g...",
+    ".....###...........###.....",
+    "...g.####..g#.#g..####.g...",
+    "..gg.#####..###..#####.gg..",
+    "..gg.#####g..#..g#####.gg..",
+    "..gg.g####g.....g####g.gg..",
+    "..ggg.................ggg..",
+    "..ggggggg.g##.##g.ggggggg..",
+    "..gggggg...#####...gggggg..",
+    "............###............",
+    ".............#.............",
+];
+
+fn paint_new_document_pixel_icon(
+    painter: &egui::Painter,
+    button_rect: Rect,
+    colors: &ThemeColors,
+) {
+    let n = NEW_DOCUMENT_PIXEL_ICON.len() as f32;
+    let pad = (button_rect.height() * 0.06).max(1.5);
+    let inner = button_rect.shrink(pad);
+    let side = inner.width().min(inner.height()).max(n);
+    let cell = side / n;
+    let origin = pos2(
+        button_rect.center().x - side * 0.5,
+        button_rect.center().y - side * 0.5,
+    );
+    let white = crate::ui::theme::SKIN_TINT;
+    let accent = colors.selection_stroke_color32();
+    for (row_idx, row) in NEW_DOCUMENT_PIXEL_ICON.iter().enumerate() {
+        let y0 = origin.y + row_idx as f32 * cell;
+        let y1 = origin.y + (row_idx + 1) as f32 * cell;
+        for (col_idx, ch) in row.bytes().enumerate() {
+            let color = match ch {
+                b'#' => white,
+                b'g' => accent,
+                _ => continue,
+            };
+            let x0 = origin.x + col_idx as f32 * cell;
+            let x1 = origin.x + (col_idx + 1) as f32 * cell;
+            painter.rect_filled(Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)), 0.0, color);
+        }
+    }
+}
+
+/// Truncates `name` with `"..."` (keeping any `suffix` such as `" •"`) so the
+/// measured single-line text fits within `max_width`. Returns `(text, truncated)`.
+fn truncate_label_to_width(
+    painter: &egui::Painter,
+    name: &str,
+    suffix: &str,
+    font: &FontId,
+    max_width: f32,
+) -> (String, bool) {
+    let measure = |s: &str| {
+        painter
+            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    let full = format!("{name}{suffix}");
+    if max_width <= 0.0 || measure(&full) <= max_width {
+        return (full, false);
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let prefix: String = chars[..mid].iter().collect();
+        let candidate = format!("{prefix}...{suffix}");
+        if measure(&candidate) <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let prefix: String = chars[..lo].iter().collect();
+    (format!("{prefix}...{suffix}"), true)
+}
+
+/// Paints the monochrome pixel-art New Document emblem centered in `rect`
+/// at an integer pixel scale so it reads cleanly as a workspace watermark.
+pub(crate) fn paint_new_document_watermark(
+    painter: &egui::Painter,
+    rect: Rect,
+    color: egui::Color32,
+) {
+    let n = NEW_DOCUMENT_PIXEL_ICON.len() as f32;
+    let side = (rect.width().min(rect.height())).max(n);
+    let cell = (side / n).floor().max(1.0);
+    let draw_side = cell * n;
+    let origin = pos2(
+        (rect.center().x - draw_side * 0.5).round(),
+        (rect.center().y - draw_side * 0.5).round(),
+    );
+    for (row_idx, row) in NEW_DOCUMENT_PIXEL_ICON.iter().enumerate() {
+        let y0 = origin.y + row_idx as f32 * cell;
+        let y1 = origin.y + (row_idx + 1) as f32 * cell;
+        for (col_idx, ch) in row.bytes().enumerate() {
+            if ch != b'#' && ch != b'g' {
+                continue;
+            }
+            let x0 = origin.x + col_idx as f32 * cell;
+            let x1 = origin.x + (col_idx + 1) as f32 * cell;
+            painter.rect_filled(Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)), 0.0, color);
         }
     }
 }
@@ -816,24 +1232,31 @@ mod tests {
         assert!(
             (button.height() - (layout.middle_rect.height() - 2.0 * SLICE_INSET)).abs() < 1e-4
         );
-        // Offset a small FIXED inset from the LEFT edge (not glued, but close).
+        // Offset a small FIXED inset from the RIGHT edge (not glued, but close).
         assert!(layout.middle_rect.contains_rect(button), "button inside middle");
-        let left_inset = button.left() - layout.middle_rect.left();
+        let right_inset = layout.middle_rect.right() - button.right();
         assert!(
-            left_inset > SLICE_INSET + 1.0,
-            "button must NOT be glued to the left edge (inset {left_inset}): {button:?}"
+            right_inset > SLICE_INSET + 1.0,
+            "button must NOT be glued to the right edge (inset {right_inset}): {button:?}"
         );
         assert!(
-            (left_inset - CREATE_BUTTON_LEFT_INSET).abs() < 1e-3,
-            "left inset must be the small fixed {CREATE_BUTTON_LEFT_INSET}: {button:?}"
+            (right_inset - CREATE_BUTTON_LEFT_INSET).abs() < 1e-3,
+            "right inset must be the small fixed {CREATE_BUTTON_LEFT_INSET}: {button:?}"
         );
         assert!(
-            left_inset < layout.middle_rect.width() / 4.0,
-            "button should sit near the left edge, not a third over: {button:?}"
+            right_inset < layout.middle_rect.width() / 4.0,
+            "button should sit near the right edge: {button:?}"
         );
         assert!(
-            layout.middle_rect.right() - button.right() > 0.0,
-            "button must be clear of the right edge: {button:?}"
+            button.left() - layout.middle_rect.left() > 0.0,
+            "button must be clear of the left edge: {button:?}"
+        );
+        let (fg_rect, bg_rect) = fg_bg_swatch_rects(&layout);
+        assert!(layout.middle_rect.contains_rect(fg_rect), "fg swatch inside middle");
+        assert!(layout.middle_rect.contains_rect(bg_rect), "bg swatch inside middle");
+        assert!(
+            fg_rect.right() < button.left(),
+            "fg/bg swatches sit on the left while create button sits on the right"
         );
     }
 
@@ -882,19 +1305,28 @@ mod tests {
     #[test]
     fn menu_bar_is_file_then_edit_then_canvas_with_document_header() {
         let menus = menu_bar();
-        assert_eq!(menus.len(), 3, "three menu titles");
+        assert_eq!(menus.len(), 5, "five menu titles");
         assert_eq!(menus[0].title, "File");
         assert_eq!(menus[1].title, "Edit");
         assert_eq!(menus[2].title, "Canvas");
+        assert_eq!(menus[3].title, "Palette");
+        assert_eq!(menus[4].title, "Options");
         assert_eq!(
-            menus[0].dropdown_title,
-            Some("document"),
-            "the File dropdown carries the centered 'document' header"
+            menus[0].items[0].group,
+            Some("Document"),
+            "the File dropdown starts with the 'Document' group"
         );
-        assert_eq!(menus[0].items.len(), 9);
+        assert_eq!(menus[0].items.len(), 14);
         assert_eq!(menus[1].items.len(), 12);
         assert_eq!(menus[2].items.len(), 1);
-        assert_eq!(menus[2].items[0].label, "resize canvas");
+        assert_eq!(menus[2].items[0].label, "Resize Canvas...");
+        assert_eq!(menus[3].items.len(), 7);
+        assert_eq!(menus[3].items[0].label, "Ross (32)");
+        assert_eq!(menus[4].items.len(), 4);
+        assert_eq!(menus[4].items[0].label, "Style...");
+        assert_eq!(menus[4].items[1].label, "Key Bindings...");
+        assert_eq!(menus[4].items[2].label, "Editor Options...");
+        assert_eq!(menus[4].items[3].label, "Credits");
     }
 
     #[test]
@@ -912,12 +1344,17 @@ mod tests {
             MenuAction::OpenProject,
             MenuAction::ImportImages,
             MenuAction::ImportGif,
+            MenuAction::ImportPyxel,
+            MenuAction::ImportAseprite,
+            MenuAction::ImportImage2Pixel,
             MenuAction::ExportSpriteSheet,
             MenuAction::ExportGif,
+            MenuAction::ExportPyxel,
+            MenuAction::ExportAseprite,
             MenuAction::ExportSelected,
         ];
         let items = menu_item_rects(&layout, 0);
-        assert_eq!(items.len(), 9);
+        assert_eq!(items.len(), 14);
         for (i, (item, rect)) in items.iter().enumerate() {
             // Open File, then click this item.
             click_host(&ctx, &mut host, &layout, &colors, file_title);
@@ -978,13 +1415,61 @@ mod tests {
         let canvas_title = menu_title_rects(&layout)[2].1.center();
         let items = menu_item_rects(&layout, 2);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].0.label, "resize canvas");
+        assert_eq!(items[0].0.label, "Resize Canvas...");
 
         click_host(&ctx, &mut host, &layout, &colors, canvas_title);
         click_host(&ctx, &mut host, &layout, &colors, items[0].1.center());
         assert_eq!(
             host.drain_events(),
             vec![TopBarEvent::MenuAction(MenuAction::ResizeCanvas)]
+        );
+    }
+
+    #[test]
+    fn options_menu_style_item_emits_style() {
+        let ctx = egui::Context::default();
+        let colors = crate::ui::theme::Theme::default_dark().colors;
+        let layout = split_frame(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+        let mut host = TopBarHost::new();
+        let options_title = menu_title_rects(&layout)[4].1.center();
+        let items = menu_item_rects(&layout, 4);
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].0.label, "Style...");
+        assert_eq!(items[1].0.label, "Key Bindings...");
+        assert_eq!(items[2].0.label, "Editor Options...");
+        assert_eq!(items[3].0.label, "Credits");
+
+        click_host(&ctx, &mut host, &layout, &colors, options_title);
+        click_host(&ctx, &mut host, &layout, &colors, items[0].1.center());
+        assert_eq!(
+            host.drain_events(),
+            vec![TopBarEvent::MenuAction(MenuAction::Style)]
+        );
+
+        click_host(&ctx, &mut host, &layout, &colors, options_title);
+        click_host(&ctx, &mut host, &layout, &colors, items[1].1.center());
+        assert_eq!(
+            host.drain_events(),
+            vec![TopBarEvent::MenuAction(MenuAction::KeyBindings)]
+        );
+    }
+
+    #[test]
+    fn palette_menu_emits_load_builtin_palette() {
+        let ctx = egui::Context::default();
+        let colors = crate::ui::theme::Theme::default_dark().colors;
+        let layout = split_frame(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+        let mut host = TopBarHost::new();
+        let palette_title = menu_title_rects(&layout)[3].1.center();
+        let items = menu_item_rects(&layout, 3);
+        assert_eq!(items.len(), 7);
+        click_host(&ctx, &mut host, &layout, &colors, palette_title);
+        click_host(&ctx, &mut host, &layout, &colors, items[0].1.center());
+        assert_eq!(
+            host.drain_events(),
+            vec![TopBarEvent::MenuAction(MenuAction::LoadBuiltinPalette(
+                crate::core::palette::BuiltinPaletteKind::Ross
+            ))]
         );
     }
 

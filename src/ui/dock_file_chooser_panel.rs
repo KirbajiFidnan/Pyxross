@@ -44,7 +44,7 @@ pub const FILE_CHOOSER_PANEL_ID: u64 = 208;
 const FILE_CHOOSER_TITLE: &str = "File Manager";
 
 /// Fixed minimum size of the floating window (resizable).
-const FILE_CHOOSER_MIN_SIZE: egui::Vec2 = vec2(520.0, 420.0);
+const FILE_CHOOSER_MIN_SIZE: egui::Vec2 = vec2(620.0, 420.0);
 
 /// Height of one listing row (matches the Layers panel convention).
 const ROW_HEIGHT: f32 = 28.0;
@@ -59,6 +59,12 @@ pub enum FileChooserMode {
     ImportPng,
     /// Pick a `.gif` to import as an animation sheet.
     ImportGif,
+    /// Pick a `.pyxel` Pyxel Edit project to import.
+    ImportPyxel,
+    /// Pick an `.ase` / `.aseprite` file to import.
+    ImportAseprite,
+    /// Pick an image (PNG/JPG/BMP/WebP/TGA/GIF) to convert to pixel art.
+    ImportImage2Pixel,
     /// Pick a destination folder (save-as "Change…").
     ChooseFolder,
 }
@@ -71,6 +77,9 @@ impl FileChooserMode {
             FileChooserMode::OpenProject => "Open Project",
             FileChooserMode::ImportPng => "Import PNG",
             FileChooserMode::ImportGif => "Import GIF",
+            FileChooserMode::ImportPyxel => "Import Pyxel",
+            FileChooserMode::ImportAseprite => "Import Aseprite",
+            FileChooserMode::ImportImage2Pixel => "Import Image 2 Pixel",
             FileChooserMode::ChooseFolder => "Choose Folder",
         }
     }
@@ -81,6 +90,9 @@ impl FileChooserMode {
             FileChooserMode::OpenProject => "Open",
             FileChooserMode::ImportPng => "Import",
             FileChooserMode::ImportGif => "Import",
+            FileChooserMode::ImportPyxel => "Import",
+            FileChooserMode::ImportAseprite => "Import",
+            FileChooserMode::ImportImage2Pixel => "Import",
             FileChooserMode::ChooseFolder => "Choose",
         }
     }
@@ -173,6 +185,21 @@ pub fn matches_filter(mode: FileChooserMode, path: &Path) -> bool {
         FileChooserMode::ImportGif => path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("gif")),
+        FileChooserMode::ImportPyxel => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pyxel")),
+        FileChooserMode::ImportAseprite => path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("ase") || ext.eq_ignore_ascii_case("aseprite")
+        }),
+        FileChooserMode::ImportImage2Pixel => path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("png")
+                || ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("bmp")
+                || ext.eq_ignore_ascii_case("webp")
+                || ext.eq_ignore_ascii_case("tga")
+                || ext.eq_ignore_ascii_case("gif")
+        }),
     }
 }
 
@@ -367,6 +394,9 @@ pub fn confirm_selection(view: &FileChooserView) -> Result<PathBuf, String> {
         }
         return Ok(candidate);
     }
+    if view.mode == FileChooserMode::ChooseFolder && view.cwd.is_dir() {
+        return Ok(view.cwd.clone());
+    }
     Err("select an entry first".to_owned())
 }
 
@@ -392,9 +422,80 @@ impl ChooserActions {
     }
 }
 
-/// The chooser form: pinned toolbar, growing listing well, pinned footer.
+/// A sidebar shortcut entry (standard OS folder or native OS/DE bookmark).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaceItem {
+    pub label: String,
+    pub path: PathBuf,
+    pub is_bookmark: bool,
+}
+
+enum PreviewState {
+    Empty,
+    Image {
+        texture: egui::TextureHandle,
+        width: u32,
+        height: u32,
+        info: String,
+    },
+    Unavailable(String),
+}
+
+/// The chooser form: pinned toolbar, left Places/Bookmarks sidebar, growing
+/// listing well, right Preview pane, and pinned footer.
 struct FileChooserComponent {
     host: FileChooserHost,
+    places: Vec<PlaceItem>,
+    preview_path: Option<PathBuf>,
+    preview_state: PreviewState,
+}
+
+impl FileChooserComponent {
+    fn new(host: FileChooserHost) -> Self {
+        Self {
+            host,
+            places: discover_places(),
+            preview_path: None,
+            preview_state: PreviewState::Empty,
+        }
+    }
+
+    fn sync_preview(&mut self, ctx: &egui::Context, selected: Option<&Path>) {
+        let target = selected.map(Path::to_path_buf);
+        if target == self.preview_path {
+            return;
+        }
+        self.preview_path = target.clone();
+        let Some(path) = target else {
+            self.preview_state = PreviewState::Empty;
+            return;
+        };
+        match load_file_preview(&path) {
+            Some(Ok((w, h, rgba, info))) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    &rgba,
+                );
+                let texture = ctx.load_texture(
+                    "file_chooser_preview",
+                    image,
+                    egui::TextureOptions::NEAREST,
+                );
+                self.preview_state = PreviewState::Image {
+                    texture,
+                    width: w,
+                    height: h,
+                    info,
+                };
+            }
+            Some(Err(reason)) => {
+                self.preview_state = PreviewState::Unavailable(reason);
+            }
+            None => {
+                self.preview_state = PreviewState::Empty;
+            }
+        }
+    }
 }
 
 impl Component for FileChooserComponent {
@@ -470,6 +571,46 @@ impl Component for FileChooserComponent {
                 );
             });
 
+        // Left sidebar: OS standard folders + native OS/DE bookmarks.
+        if !self.places.is_empty() && ui.available_width() >= 420.0 {
+            egui::Panel::left(ui.id().with("chooser-places"))
+                .exact_size(134.0)
+                .resizable(false)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                    left: 0,
+                    right: 6,
+                    top: 4,
+                    bottom: 4,
+                }))
+                .show_separator_line(true)
+                .show(ui, |ui| {
+                    places_ui(ui, chrome, &self.places, &cwd, &mut actions);
+                });
+        }
+
+        // Right pane: live preview of selected file (images, GIF, .ase, .pyxel, .pyxross).
+        if mode != FileChooserMode::ChooseFolder && ui.available_width() >= 340.0 {
+            self.sync_preview(ui.ctx(), selected.as_deref());
+            egui::Panel::right(ui.id().with("chooser-preview"))
+                .exact_size(176.0)
+                .resizable(false)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                    left: 6,
+                    right: 0,
+                    top: 4,
+                    bottom: 4,
+                }))
+                .show_separator_line(true)
+                .show(ui, |ui| {
+                    preview_ui(
+                        ui,
+                        chrome,
+                        selected.as_deref(),
+                        &self.preview_state,
+                    );
+                });
+        }
+
         // The listing well grows/shrinks with the panel and scrolls.
         list_ui(ui, chrome, &entries, selected.as_deref(), &mut actions);
 
@@ -485,12 +626,15 @@ impl Component for FileChooserComponent {
         // Write the draft back.
         {
             let mut view = self.host.view.borrow_mut();
+            let name_edited = view.name_edit != name_edit;
             view.path_edit = path_edit.clone();
             view.name_edit = name_edit.clone();
             view.focus_requested = false;
             if let Some(path) = actions.select.clone() {
                 view.selected = Some(path.clone());
                 view.name_edit = file_name_of(&path);
+            } else if name_edited {
+                view.selected = None;
             }
         }
 
@@ -646,7 +790,11 @@ fn footer_ui(
         ui.label("File name:");
         ui.add(
             egui::TextEdit::singleline(name_edit)
-                .hint_text("selected file")
+                .hint_text(if mode == FileChooserMode::ChooseFolder {
+                    "current folder (or enter subfolder)"
+                } else {
+                    "selected file"
+                })
                 .desired_width((ui.available_width() - 40.0).max(60.0)),
         );
         egui::ComboBox::from_id_salt("chooser-name-pick")
@@ -794,8 +942,419 @@ impl PanelContent for FileChooserPanelContent {
 /// Static nest holding the file chooser form.
 pub(crate) fn build_file_chooser_nest(host: &FileChooserHost) -> NestContent {
     let mut nest = NestContent::new(NestMode::Static);
-    nest.push(FileChooserComponent { host: host.clone() });
+    nest.push(FileChooserComponent::new(host.clone()));
     nest
+}
+
+fn places_ui(
+    ui: &mut egui::Ui,
+    chrome: &PanelChrome,
+    places: &[PlaceItem],
+    cwd: &Path,
+    actions: &mut ChooserActions,
+) {
+    egui::ScrollArea::vertical()
+        .id_salt("chooser-places-scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut showed_bookmarks_header = false;
+            ui.weak("Places");
+            ui.add_space(2.0);
+            for item in places {
+                if item.is_bookmark && !showed_bookmarks_header {
+                    showed_bookmarks_header = true;
+                    ui.add_space(6.0);
+                    ui.weak("Bookmarks");
+                    ui.add_space(2.0);
+                }
+                let active = cwd == item.path;
+                let row_w = ui.available_width();
+                let (rect, resp) =
+                    ui.allocate_exact_size(vec2(row_w, 22.0), egui::Sense::click());
+                if active {
+                    ui.painter()
+                        .rect_filled(rect, 2.0, chrome.colors.selection_bg_fill32());
+                } else if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, 2.0, chrome.colors.list_stripe_bg32());
+                }
+                let text_rect = rect.shrink2(vec2(6.0, 0.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                child.add(
+                    egui::Label::new(&item.label)
+                        .truncate()
+                        .selectable(false),
+                );
+                if resp.clicked() {
+                    actions.navigate = Some(item.path.clone());
+                }
+            }
+        });
+}
+
+fn preview_ui(
+    ui: &mut egui::Ui,
+    chrome: &PanelChrome,
+    selected: Option<&Path>,
+    state: &PreviewState,
+) {
+    ui.weak("Preview");
+    ui.add_space(4.0);
+    let avail = ui.available_size();
+    let well_h = (avail.y - 46.0).max(96.0);
+    let well_rect = ui.allocate_space(vec2(avail.x, well_h)).1;
+    ui.painter()
+        .rect_filled(well_rect, 2.0, chrome.colors.list_bg32());
+    ui.painter().rect_stroke(
+        well_rect,
+        2.0,
+        egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+        egui::StrokeKind::Inside,
+    );
+
+    match state {
+        PreviewState::Image {
+            texture,
+            width,
+            height,
+            info,
+        } => {
+            let pad = 6.0;
+            let aw = (well_rect.width() - pad * 2.0).max(1.0);
+            let ah = (well_rect.height() - pad * 2.0).max(1.0);
+            let tw = (*width).max(1) as f32;
+            let th = (*height).max(1) as f32;
+            let scale = (aw / tw).min(ah / th);
+            let draw_rect =
+                egui::Rect::from_center_size(well_rect.center(), vec2(tw * scale, th * scale));
+            ui.painter().image(
+                texture.id(),
+                draw_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            ui.add_space(4.0);
+            if let Some(p) = selected {
+                ui.add(egui::Label::new(file_name_of(p)).truncate());
+            }
+            ui.weak(info);
+        }
+        PreviewState::Unavailable(msg) => {
+            ui.painter().text(
+                well_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(11.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+        PreviewState::Empty => {
+            ui.painter().text(
+                well_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No preview",
+                egui::FontId::proportional(11.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+    }
+}
+
+/// Discovers standard OS user folders and native OS/DE bookmarks (GTK3/GTK2
+/// and KDE/Dolphin XBEL) without failing on any OS or desktop environment.
+pub fn discover_places() -> Vec<PlaceItem> {
+    let mut out: Vec<PlaceItem> = Vec::new();
+    let mut push_unique = |label: String, path: PathBuf, is_bookmark: bool| {
+        if !path.is_dir() {
+            return;
+        }
+        if out.iter().any(|existing| existing.path == path) {
+            return;
+        }
+        out.push(PlaceItem {
+            label,
+            path,
+            is_bookmark,
+        });
+    };
+
+    if let Some(p) = dirs::home_dir() {
+        push_unique("Home".to_owned(), p, false);
+    }
+    if let Some(p) = dirs::desktop_dir() {
+        push_unique("Desktop".to_owned(), p, false);
+    }
+    if let Some(p) = dirs::document_dir() {
+        push_unique("Documents".to_owned(), p, false);
+    }
+    if let Some(p) = dirs::picture_dir() {
+        push_unique("Pictures".to_owned(), p, false);
+    }
+    if let Some(p) = dirs::download_dir() {
+        push_unique("Downloads".to_owned(), p, false);
+    }
+    #[cfg(windows)]
+    {
+        for letter in b'A'..=b'Z' {
+            let root = PathBuf::from(format!("{}:\\", letter as char));
+            if root.is_dir() {
+                push_unique(format!("{}:", letter as char), root, false);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        push_unique("Root (/)".to_owned(), PathBuf::from("/"), false);
+    }
+
+    // Native GTK3 / GTK2 bookmarks (GNOME, XFCE, Cinnamon, MATE, Thunar, Nemo, Nautilus).
+    if let Some(cfg) = dirs::config_dir() {
+        for (label, path) in parse_gtk_bookmarks(&cfg.join("gtk-3.0").join("bookmarks")) {
+            push_unique(label, path, true);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        for (label, path) in parse_gtk_bookmarks(&home.join(".gtk-bookmarks")) {
+            push_unique(label, path, true);
+        }
+    }
+    // Native KDE Plasma / Dolphin bookmarks (XBEL).
+    if let Some(data) = dirs::data_local_dir() {
+        for (label, path) in parse_kde_xbel_bookmarks(&data.join("user-places.xbel")) {
+            push_unique(label, path, true);
+        }
+    }
+
+    out
+}
+
+fn percent_decode_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            if let Ok(val) = u8::from_str_radix(hex, 16) {
+                decoded.push(val);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    let s = String::from_utf8(decoded).ok()?;
+    #[cfg(windows)]
+    let s = s.strip_prefix('/').unwrap_or(&s).to_owned();
+    Some(PathBuf::from(s))
+}
+
+fn parse_gtk_bookmarks(path: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (uri, custom_label) = match trimmed.split_once(' ') {
+            Some((u, l)) => (u, Some(l.trim())),
+            None => (trimmed, None),
+        };
+        let Some(p) = percent_decode_file_uri(uri) else {
+            continue;
+        };
+        let label = custom_label
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| file_name_of(&p));
+        out.push((label, p));
+    }
+    out
+}
+
+fn parse_kde_xbel_bookmarks(path: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<bookmark ") {
+        rest = &rest[start..];
+        let Some(end) = rest.find("</bookmark>") else {
+            break;
+        };
+        let block = &rest[..end];
+        rest = &rest[end + "</bookmark>".len()..];
+        if block.contains("<IsHidden>true</IsHidden>") {
+            continue;
+        }
+        let Some(href_pos) = block.find("href=\"") else {
+            continue;
+        };
+        let href_rest = &block[href_pos + 6..];
+        let Some(href_end) = href_rest.find('"') else {
+            continue;
+        };
+        let uri = &href_rest[..href_end];
+        let Some(p) = percent_decode_file_uri(uri) else {
+            continue;
+        };
+        let label = block
+            .find("<title>")
+            .and_then(|ts| {
+                let t = &block[ts + 7..];
+                t.find("</title>").map(|te| t[..te].trim().to_owned())
+            })
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| file_name_of(&p));
+        out.push((label, p));
+    }
+    out
+}
+
+fn downscale_preview_if_needed(w: u32, h: u32, rgba: Vec<u8>) -> (u32, u32, Vec<u8>) {
+    const MAX_PREVIEW_SIDE: u32 = 256;
+    if w <= MAX_PREVIEW_SIDE && h <= MAX_PREVIEW_SIDE {
+        return (w, h, rgba);
+    }
+    let scale = (MAX_PREVIEW_SIDE as f32 / w.max(h) as f32).min(1.0);
+    let nw = ((w as f32 * scale).round() as u32).max(1);
+    let nh = ((h as f32 * scale).round() as u32).max(1);
+    let mut out = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        let sy = ((y as u64 * h as u64) / nh as u64).min(h as u64 - 1) as usize;
+        for x in 0..nw {
+            let sx = ((x as u64 * w as u64) / nw as u64).min(w as u64 - 1) as usize;
+            let si = (sy * w as usize + sx) * 4;
+            let di = (y as usize * nw as usize + x as usize) * 4;
+            out[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
+        }
+    }
+    (nw, nh, out)
+}
+
+/// Decodes a preview thumbnail for any Pyxross-supported document/image:
+/// `.pyxross` (archive or folder/`manifest.json`), `.pyxel`, `.ase`/`.aseprite`
+/// (first frame), `.gif` (first frame), and raster images (`.png`/`.jpg`/`.bmp`/`.webp`/`.tga`).
+fn load_file_preview(path: &Path) -> Option<Result<(u32, u32, Vec<u8>, String), String>> {
+    let is_dir_project = path.is_dir() && path.join("manifest.json").is_file();
+    if path.is_dir() && !is_dir_project {
+        return None;
+    }
+    let is_manifest = path.file_name().is_some_and(|n| n == "manifest.json");
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if is_dir_project || is_manifest || ext == "pyxross" {
+        let target = if is_manifest {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        return Some(match crate::io::load_document(target) {
+            Ok(doc) => {
+                let w = doc.canvas_width.max(1);
+                let h = doc.canvas_height.max(1);
+                let mut session = crate::ui::project::ProjectSession::new(
+                    crate::ui::project::ProjectId::new(0),
+                    "preview",
+                    w as usize,
+                    h as usize,
+                );
+                session.load_document(&doc);
+                let comp = session.layers.composite_layers(&session.tile_palette);
+                let (pw, ph, rgba) =
+                    downscale_preview_if_needed(w, h, comp.as_bytes().to_vec());
+                Ok((pw, ph, rgba, format!("{w}x{h} • Pyxross")))
+            }
+            Err(_) => Err("Preview error".to_owned()),
+        });
+    }
+
+    if ext == "pyxel" {
+        return Some(match std::fs::read(path) {
+            Ok(bytes) => match crate::core::pyxel::import_pyxel_bytes(&bytes, "preview") {
+                Ok(imp) => {
+                    let comp = imp.layers.composite_layers(&imp.tile_palette);
+                    let w = imp.width as u32;
+                    let h = imp.height as u32;
+                    let (pw, ph, rgba) =
+                        downscale_preview_if_needed(w, h, comp.as_bytes().to_vec());
+                    Ok((pw, ph, rgba, format!("{w}x{h} • Pyxel")))
+                }
+                Err(_) => Err("Preview error".to_owned()),
+            },
+            Err(_) => Err("Unreadable".to_owned()),
+        });
+    }
+
+    if ext == "ase" || ext == "aseprite" {
+        return Some(match std::fs::read(path) {
+            Ok(bytes) => match crate::core::aseprite::parse_aseprite_bytes(&bytes) {
+                Ok(parsed) => {
+                    let frame_count = parsed.frames.len();
+                    match crate::core::aseprite::build_aseprite_import(
+                        &parsed,
+                        "preview",
+                        crate::core::aseprite::AsepriteLayoutMode::SingleRow,
+                    ) {
+                        Ok(imp) => {
+                            let comp = imp
+                                .layers
+                                .composite_layers(&crate::core::tilemap::TilePalette::default());
+                            let w = imp.frame_w.min(imp.width as u32).max(1);
+                            let h = imp.frame_h.min(imp.height as u32).max(1);
+                            let full_w = imp.width;
+                            let bytes = comp.as_bytes();
+                            let mut first_rgba = vec![0u8; (w * h * 4) as usize];
+                            for y in 0..h as usize {
+                                let src_off = y * full_w * 4;
+                                let dst_off = y * w as usize * 4;
+                                let row_len = w as usize * 4;
+                                first_rgba[dst_off..dst_off + row_len]
+                                    .copy_from_slice(&bytes[src_off..src_off + row_len]);
+                            }
+                            let (pw, ph, rgba) = downscale_preview_if_needed(w, h, first_rgba);
+                            Ok((pw, ph, rgba, format!("{w}x{h} • {frame_count}f Aseprite")))
+                        }
+                        Err(_) => Err("Preview error".to_owned()),
+                    }
+                }
+                Err(_) => Err("Preview error".to_owned()),
+            },
+            Err(_) => Err("Unreadable".to_owned()),
+        });
+    }
+
+    if matches!(
+        ext.as_str(),
+        "gif" | "png" | "jpg" | "jpeg" | "bmp" | "webp" | "tga"
+    ) {
+        return Some(match image::open(path) {
+            Ok(img) => {
+                let rgba_img = img.to_rgba8();
+                let (w, h) = rgba_img.dimensions();
+                let (pw, ph, rgba) = downscale_preview_if_needed(w, h, rgba_img.into_raw());
+                let kind = if ext == "gif" { "GIF (Frame 1)" } else { "Image" };
+                Ok((pw, ph, rgba, format!("{w}x{h} • {kind}")))
+            }
+            Err(_) => Err("Preview error".to_owned()),
+        });
+    }
+
+    None
 }
 
 /// Dock spec for the file chooser floating panel (dock id 208).
@@ -1025,6 +1584,24 @@ mod tests {
     }
 
     #[test]
+    fn confirm_selection_in_choose_folder_uses_cwd_when_name_is_empty() {
+        let base = scratch_dir("choose_cwd");
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut view = FileChooserView {
+            mode: FileChooserMode::ChooseFolder,
+            ..FileChooserView::default()
+        };
+        navigate(&mut view, base.clone()).unwrap();
+        // Empty File name -> confirms the current directory `cwd`.
+        assert_eq!(confirm_selection(&view).unwrap(), base);
+        // Filled File name -> confirms that target folder.
+        view.name_edit = "sub".to_owned();
+        assert_eq!(confirm_selection(&view).unwrap(), sub);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn create_new_folder_makes_and_selects_a_unique_directory() {
         let base = scratch_dir("newfolder");
         let mut view = FileChooserView {
@@ -1181,7 +1758,7 @@ mod tests {
         let capture = crate::ui::input_capture::InputCapture::new();
         let chrome =
             PanelChrome::flat(&theme, &capture, crate::ui::input_capture::SurfaceId::Canvas);
-        let mut component = FileChooserComponent { host: host.clone() };
+        let mut component = FileChooserComponent::new(host.clone());
         let mut output = ctx.run_ui(raw, |ui| {
             let view = NestView::screen(ui.max_rect());
             component.ui(ui, &view, &chrome);

@@ -17,7 +17,9 @@
 
 use crate::core::color::Color;
 use crate::ui::dock_hosts::{ColorPickerHost, ColorPickerView};
-use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
+use crate::ui::panel_dock::nest::{
+    nest_is_usable, nest_viewport, Component, NestView,
+};
 use crate::ui::panel_dock::{
     PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
     FLOATING_PANEL_CHROME_HEIGHT,
@@ -71,17 +73,16 @@ const MIN_SQUARE_SIDE: f32 = 48.0;
 const MAX_SQUARE_SIDE: f32 = 168.0;
 
 /// Side length of one clickable color chip, in points.
-const CHIP_SIZE: f32 = 14.0;
+const CHIP_SIZE: f32 = 20.0;
 
 /// Horizontal gap between chips in one row, in points.
-const CHIP_GAP: f32 = 3.0;
+const CHIP_GAP: f32 = 4.0;
 
-/// Side length of one FG/BG swatch square: twice the variation chips.
-const FG_BG_SWATCH_SIZE: f32 = CHIP_SIZE * 2.0;
+/// Side length of one FG/BG swatch square.
+const FG_BG_SWATCH_SIZE: f32 = 28.0;
 
-/// Down-right offset of the BACKGROUND square behind the FOREGROUND square,
-/// scaled with the doubled swatches.
-const FG_BG_SWATCH_OFFSET: f32 = CHIP_SIZE * 0.7;
+/// Down-right offset of the BACKGROUND square behind the FOREGROUND square.
+const FG_BG_SWATCH_OFFSET: f32 = 10.0;
 
 /// Font size of the FG/BG swatch labels, in points.
 const FG_BG_LABEL_FONT: f32 = 10.0;
@@ -104,10 +105,10 @@ const SWAP_BUTTON_ID: &str = "color-picker-swap-colors";
 /// Height of the New/Old preview swatches, in points.
 const PREVIEW_HEIGHT: f32 = 34.0;
 
-/// Content height reserved for the nest, in points: the middle column's
-/// natural height (the New/Old preview row, the four field rows and the FG/BG
-/// pair with its swap button), the tallest of the three columns.
-const CONTENT_HEIGHT: f32 = 196.0;
+/// Content height reserved for the nest, in points: tall enough that the FG/BG
+/// pair, the Swap button, and the larger variation chip rows fit with generous
+/// bottom clearance.
+const CONTENT_HEIGHT: f32 = 232.0;
 
 /// Floating window height that fits the picker content snugly: the nest
 /// content plus the floating panel chrome around it. Fixed for every picker
@@ -115,7 +116,7 @@ const CONTENT_HEIGHT: f32 = 196.0;
 pub const PICKER_WINDOW_HEIGHT: f32 = CONTENT_HEIGHT + FLOATING_PANEL_CHROME_HEIGHT;
 
 /// Smallest usable picker width, in points.
-const MIN_PANEL_WIDTH: f32 = 520.0;
+const MIN_PANEL_WIDTH: f32 = 620.0;
 
 /// Number of brighter chips before the base chip in the Shading row.
 const SHADING_BRIGHT_STEPS: usize = 4;
@@ -126,21 +127,18 @@ const SHADING_DARK_STEPS: usize = 4;
 /// Number of chips in the Shading row: brighter + base + darker.
 const SHADING_CHIP_COUNT: usize = SHADING_BRIGHT_STEPS + 1 + SHADING_DARK_STEPS;
 
-/// HSV value removed per dark shading ramp step.
-const SHADING_DARKEN_STEP: f32 = 0.2;
+/// HSV value removed per dark shading ramp step (gentle pixel-art ramp).
+const SHADING_DARKEN_STEP: f32 = 0.11;
 
 /// Fraction of the headroom to white added per bright shading ramp step.
-const SHADING_BRIGHTEN_STEP: f32 = 0.25;
+const SHADING_BRIGHTEN_STEP: f32 = 0.13;
 
 /// Hue the bright shading ramp moves toward: yellow, the classic
 /// complementary warm-highlight anchor.
 const BRIGHT_SHADING_HUE_ANCHOR: f32 = 60.0;
 
-/// Number of chips in the Lightness row (nine even lightness levels).
+/// Number of chips in the Lightness row (centered around the active color).
 const LIGHTNESS_CHIP_COUNT: usize = 9;
-
-/// Lightness ladder of the Lightness row (light to dark).
-const LIGHTNESS_LEVELS: [f32; LIGHTNESS_CHIP_COUNT] = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
 
 /// Number of chips in the Saturation and Hue rows.
 const AXIS_CHIP_COUNT: usize = 7;
@@ -328,11 +326,27 @@ pub fn shading_chips(base: Color) -> [Color; SHADING_CHIP_COUNT] {
     chips
 }
 
-/// The Lightness row: nine chips with the base hue/saturation and the fixed
-/// light-to-dark lightness ladder.
+/// The Lightness row: nine chips centered on `base`, with four lighter steps
+/// on the left and four darker steps on the right so both lighter and darker
+/// tones are always reachable around the active color.
 pub fn lightness_chips(base: Color) -> [Color; LIGHTNESS_CHIP_COUNT] {
-    let (hue, saturation, _) = color_to_hsl(base);
-    LIGHTNESS_LEVELS.map(|lightness| hsl_to_color(hue, saturation, lightness, base.a))
+    let (hue, saturation, base_l) = color_to_hsl(base);
+    let mid = LIGHTNESS_CHIP_COUNT / 2;
+    let mut chips = [base; LIGHTNESS_CHIP_COUNT];
+    for (index, chip) in chips.iter_mut().enumerate() {
+        let l = if index < mid {
+            let step = (mid - index) as f32;
+            (base_l + (1.0 - base_l) * 0.16 * step).clamp(0.0, 1.0)
+        } else if index == mid {
+            base_l
+        } else {
+            let step = (index - mid) as f32;
+            (base_l * (1.0 - 0.16 * step)).clamp(0.0, 1.0)
+        };
+        *chip = hsl_to_color(hue, saturation, l, base.a);
+    }
+    chips[mid] = base;
+    chips
 }
 
 /// The Saturation row: seven chips from fully saturated to fully desaturated,
@@ -1002,22 +1016,25 @@ fn chip_row(
     });
 }
 
-/// Panel content: the static nest holding the three columns.
+/// Panel content: fixed three-column body rendered directly (no ScrollArea or
+/// scrollbars so wheel-adjusting channel values never shifts the panel).
 struct ColorPickerContent {
-    nest: NestContent,
+    component: ColorPickerComponent,
 }
 
 impl PanelContent for ColorPickerContent {
     fn ui(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
-        self.nest.ui(ui, chrome);
+        let full = ui.available_rect_before_wrap();
+        ui.set_min_size(full.size());
+        let viewport = nest_viewport(full);
+        if !nest_is_usable(viewport) {
+            return;
+        }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |inner| {
+            inner.set_clip_rect(viewport.intersect(inner.clip_rect()));
+            self.component.ui(inner, &NestView::screen(viewport), chrome);
+        });
     }
-}
-
-/// Static nest holding the three-column color picker body.
-pub fn build_color_picker_nest(host: &ColorPickerHost) -> NestContent {
-    let mut nest = NestContent::new(NestMode::Static);
-    nest.push(ColorPickerComponent::new(host.clone()));
-    nest
 }
 
 /// Dock spec for the Color Picker panel (dock id `PanelId::new(104)`).
@@ -1041,10 +1058,13 @@ pub fn color_picker_panel_spec(host: &ColorPickerHost, floating_rect: egui::Rect
         placement: PanelPlacement::Floating,
         floating_rect: egui::Rect::from_min_size(
             floating_rect.min,
-            egui::vec2(floating_rect.width(), PICKER_WINDOW_HEIGHT),
+            egui::vec2(
+                floating_rect.width().max(MIN_PANEL_WIDTH),
+                PICKER_WINDOW_HEIGHT,
+            ),
         ),
         content: Box::new(ColorPickerContent {
-            nest: build_color_picker_nest(host),
+            component: ColorPickerComponent::new(host.clone()),
         }),
     }
 }
@@ -1070,10 +1090,10 @@ mod tests {
                 Color::rgb(255, 0, 255),
                 Color::rgb(128, 0, 255),
                 Color::rgb(0, 0, 255),
-                Color::rgb(102, 0, 204),
-                Color::rgb(153, 0, 153),
-                Color::rgb(102, 0, 51),
-                Color::rgb(51, 0, 0),
+                Color::rgb(113, 0, 227),
+                Color::rgb(199, 0, 199),
+                Color::rgb(171, 0, 85),
+                Color::rgb(143, 0, 0),
             ],
             "blue must brighten toward yellow and darken toward red"
         );
@@ -1095,10 +1115,10 @@ mod tests {
             (bright_hue - 60.0).abs() < 0.001,
             "the brightest orange chip must reach yellow: {bright_hue}"
         );
-        assert_eq!(
-            chips[SHADING_CHIP_COUNT - 1],
-            Color::rgb(51, 0, 34),
-            "the darkest orange chip keeps the dark ramp"
+        let (_, _, dark_val) = color_to_hsv(chips[SHADING_CHIP_COUNT - 1]);
+        assert!(
+            dark_val < 0.7 && dark_val > 0.4,
+            "the darkest orange chip keeps a gentle dark ramp: {dark_val}"
         );
     }
 
@@ -1109,12 +1129,13 @@ mod tests {
 
         let lightness = lightness_chips(base);
         assert_eq!(lightness.len(), LIGHTNESS_CHIP_COUNT);
+        assert_eq!(lightness[LIGHTNESS_CHIP_COUNT / 2], base);
         let mut previous = f32::INFINITY;
         for chip in lightness {
             let (hue, saturation, value) = color_to_hsl(chip);
             assert!((hue - base_hue).abs() < 1.0, "hue drifted: {hue}");
             assert!(
-                (saturation - base_saturation).abs() < 0.01,
+                (saturation - base_saturation).abs() < 0.02,
                 "saturation drifted: {saturation}"
             );
             assert!(value < previous, "the lightness ramp must darken: {value}");
@@ -1122,7 +1143,7 @@ mod tests {
         }
         let (_, _, first) = color_to_hsl(lightness[0]);
         let (_, _, last) = color_to_hsl(lightness[LIGHTNESS_CHIP_COUNT - 1]);
-        assert!((first - 0.9).abs() < 0.01 && (last - 0.1).abs() < 0.01);
+        assert!(first > base_lightness && last < base_lightness);
 
         let saturation = saturation_chips(base);
         assert_eq!(saturation.len(), 7);

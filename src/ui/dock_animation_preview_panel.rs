@@ -25,12 +25,12 @@ pub const ANIMATION_PREVIEW_PANEL_ID: u64 = 204;
 // Transport glyphs. Real Nerdfont wiring (registering the Nerdfont atlas with
 // the egui context) is a later step; these codepoints are stable placeholders
 // and render through the fallback font until then.
-const GLYPH_PLAY: &str = "\u{f04b}";
-const GLYPH_STOP: &str = "\u{f04d}";
+const GLYPH_PLAY: &str = crate::ui::icons::PLAY;
+const GLYPH_STOP: &str = crate::ui::icons::PAUSE;
 const GLYPH_RESET: &str = "\u{f0e2}";
-const PREV_LABEL: &str = "<";
-const NEXT_LABEL: &str = ">";
-const LOOP_LABEL: &str = "Loop";
+const PREV_LABEL: &str = crate::ui::icons::PREV;
+const NEXT_LABEL: &str = crate::ui::icons::NEXT;
+const LOOP_LABEL: &str = crate::ui::icons::LOOP;
 
 /// Height of the pinned transport bar, in points.
 const TRANSPORT_HEIGHT: f32 = 30.0;

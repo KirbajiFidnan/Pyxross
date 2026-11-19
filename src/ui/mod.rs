@@ -12,29 +12,39 @@
 //! layer panels are pure views that only emit events.
 
 mod animation_hosts;
+pub mod banners;
 pub mod canvas;
 pub mod clipboard;
 pub mod dock_animation_preview_panel;
 pub mod dock_animation_settings;
 pub mod dock_animations_panel;
+pub mod dock_banner_picker_panel;
 pub mod dock_color_palette_panel;
 pub mod dock_color_picker_panel;
 pub mod dock_create_document_panel;
+pub mod dock_credits_panel;
+pub mod dock_editor_options_panel;
 pub mod dock_file_chooser_panel;
 pub mod dock_save_as_panel;
 pub mod dock_frame_edit_panel;
 pub mod dock_hosts;
+pub mod dock_img2pixel_panel;
+pub mod dock_import_aseprite_panel;
 pub mod dock_import_gif_panel;
 pub mod dock_import_image_panel;
+pub mod dock_import_pyxel_panel;
+pub mod dock_keybindings_panel;
 pub mod dock_layers_panel;
 pub mod dock_layers_settings;
 pub mod dock_recovery_panel;
 pub mod dock_resize_canvas_panel;
+pub mod dock_style_panel;
 pub mod dock_tile_palette_panel;
 pub mod dock_tool_property_panel;
 pub mod dock_toolbox_panel;
 pub mod dock_unsaved_guard_panel;
 pub mod host_registry;
+pub mod icons;
 pub mod input_capture;
 pub mod keybindings;
 pub mod layers;
@@ -46,6 +56,7 @@ pub mod project;
 pub mod project_tabs;
 pub mod projection;
 pub mod settings;
+pub mod style;
 pub mod theme;
 pub mod toolbar;
 pub mod top_bar;
@@ -110,7 +121,7 @@ use input_capture::{InputCapture, SurfaceId};
 use keybindings::KeybindingsPanel;
 use layers::{drop_placement, DropPlacement, LayerPanel, LayerPanelEvent};
 use native_host::{NativeHostSpec, NativeWorkspaceHost};
-use panel_dock::skin::{AtlasCache, PanelChrome, SkinAtlas};
+use panel_dock::skin::{AtlasCache, PanelChrome};
 use panel_layout::PanelLayout;
 use panel_registry::{PanelId, PanelPlacement};
 use project::{
@@ -119,7 +130,7 @@ use project::{
 };
 use project_tabs::ProjectTabBar;
 use settings::SettingsPanel;
-use theme::{load_atlas_with_size, ThemeManager};
+use theme::ThemeManager;
 use toolbar::{ToolbarEvent, ToolbarWidget};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -199,6 +210,7 @@ struct TransformPreviewKey {
     scale: (u32, u32),
     flips: (bool, bool),
     dragging: bool,
+    algorithm: TransformAlgorithm,
 }
 
 impl TransformPreviewKey {
@@ -211,6 +223,7 @@ impl TransformPreviewKey {
             scale: (sx.to_bits(), sy.to_bits()),
             flips: (object.flip_h, object.flip_v),
             dragging,
+            algorithm: object.algorithm(),
         }
     }
 }
@@ -271,7 +284,7 @@ fn import_document_name(path: &std::path::Path) -> String {
 pub fn run() {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop
-        .run_app(&mut App::default())
+        .run_app(&mut App::new_empty())
         .expect("Event loop failed");
 }
 
@@ -318,10 +331,39 @@ struct App {
     /// Shared cells for the floating "Import Image" panel (id 210). The modal
     /// form (split by pixels / by regions) is validated by the panel.
     import_image_host: dock_import_image_panel::ImportImageHost,
+    /// Shared cells for the floating "Import Pyxel" panel (id 217).
+    import_pyxel_host: dock_import_pyxel_panel::ImportPyxelHost,
+    /// Shared cells for the floating "Import Aseprite" panel (id 218).
+    import_aseprite_host: dock_import_aseprite_panel::ImportAsepriteHost,
     /// Shared cells for the floating "Unsaved Changes" panel (id 211).
     unsaved_guard_host: dock_unsaved_guard_panel::UnsavedGuardHost,
     /// Shared cells for the floating "Recover Unsaved Work?" panel (id 212).
     recovery_host: dock_recovery_panel::RecoveryHost,
+    /// Shared cells for the floating "Style" panel (id 213).
+    style_host: dock_style_panel::StyleHost,
+    /// Shared cells for the floating "Select Banner" panel (id 215).
+    banner_picker_host: dock_banner_picker_panel::BannerPickerHost,
+    /// Shared cells for the floating "Key Bindings" panel (id 214).
+    keybindings_host: dock_keybindings_panel::KeybindingsHost,
+    /// Shared cells for the floating "Editor Options" panel (id 219).
+    editor_options_host: dock_editor_options_panel::EditorOptionsHost,
+    editor_options: dock_editor_options_panel::EditorOptions,
+    credits_host: dock_credits_panel::CreditsHost,
+    img2pixel_host: std::rc::Rc<std::cell::RefCell<dock_img2pixel_panel::Img2PixelHost>>,
+    dropped_file_hovering: bool,
+    discovered_fonts: Vec<crate::core::text::FontEntry>,
+    font_byte_cache: std::collections::HashMap<String, Vec<u8>>,
+    last_text_key_frame: Option<u64>,
+    save_toast: Option<(String, Instant)>,
+    last_error_seen: Option<(String, Instant)>,
+    /// Active modern UI style (preset, rounding, colors).
+    ui_style: style::UiStyle,
+    /// Cached GPU texture for the active top-bar banner (`(name_or_path, texture, [w, h])`).
+    banner_texture: Option<(String, egui::TextureHandle, [u32; 2])>,
+    /// Cached thumbnail textures for the Select Banner panel.
+    banner_thumb_cache: Vec<(String, egui::TextureHandle, [u32; 2])>,
+    pending_pyxel_import: Option<(PathBuf, crate::core::pyxel::PyxelImport)>,
+    pending_aseprite_import: Option<(PathBuf, crate::core::aseprite::ParsedAseprite)>,
     /// Decoded GIF awaiting the Import GIF panel's confirmation.
     pending_gif_import: Option<PendingGifImport>,
     /// Decoded PNG awaiting the Import Image panel's confirmation.
@@ -471,6 +513,8 @@ struct App {
     /// clipboard owner connection does not die and drop the copied image the
     /// moment a copy returns. Created lazily on first write.
     os_clipboard: crate::ui::clipboard::OsClipboard,
+    /// True once the GUI window host (`resumed`) has initialized.
+    os_clipboard_available: bool,
     /// In-flight asynchronous OS clipboard read for paste (G3 finding #6).
     /// `Some` while a background worker is reading the OS clipboard; polled
     /// once per frame so the render thread never blocks in `get_image()`.
@@ -481,11 +525,35 @@ struct App {
     /// The canvas pixel the pending async paste is centred on, captured when
     /// the read was requested so the result lands where Ctrl+V was pressed.
     os_paste_cursor: Option<(i32, i32)>,
+    /// Global foreground / background colors shared across all open documents.
+    global_fg_color: Color,
+    global_bg_color: Color,
+    /// Ordered queue of dirty documents awaiting user decision on app close.
+    exit_guard_queue: Vec<project::ProjectId>,
+    /// Total number of dirty documents when the app-close guard began.
+    exit_guard_total: usize,
+    /// True after "Save All" is chosen during app close; each remaining dirty
+    /// document is saved sequentially (opening Save As when needed).
+    exit_save_all_active: bool,
+    /// Set once the app-exit guard finishes so `about_to_wait` exits the
+    /// winit event loop immediately without requiring a second close request.
+    exit_requested: bool,
     _project_cache_generation: u64,
 }
 
 impl Default for App {
     fn default() -> Self {
+        Self::init(true)
+    }
+}
+
+impl App {
+    /// Launches the application with an empty workspace (no open document).
+    pub fn new_empty() -> Self {
+        Self::init(false)
+    }
+
+    fn init(create_initial_project: bool) -> Self {
         let keymap = load_keymap(user_keymap_path().as_deref());
         let projects = ProjectStore::new();
         let toolbox_host = dock_hosts::ToolboxHost::default();
@@ -506,6 +574,14 @@ impl Default for App {
                 panel_dock::PanelPlacement::DockedLeft,
             ))
             .expect("tool property panel id must be unique");
+        panel_dock.set_panel_extent(
+            panel_dock::PanelId::new(dock_toolbox_panel::TOOLBOX_PANEL_ID),
+            330.0,
+        );
+        panel_dock.set_panel_extent(
+            panel_dock::PanelId::new(dock_tool_property_panel::TOOL_PROPERTY_PANEL_ID),
+            450.0,
+        );
         panel_dock
             .add_spec(dock_layers_panel::layers_panel_spec(
                 &layers_host,
@@ -553,11 +629,21 @@ impl Default for App {
                 panel_dock::PanelPlacement::DockedBottom,
             ))
             .expect("animation preview panel id must be unique");
+        let ui_style = style::UiStyle::load_user_or_default();
+        let mut theme = ThemeManager::new();
+        ui_style.apply_to_theme_colors(&mut theme.current_mut().colors);
+        let ctx = egui::Context::default();
+        icons::configure_fonts(&ctx);
+        ui_style.apply_to_egui(&ctx);
+        let style_host = dock_style_panel::StyleHost::new(ui_style.clone());
+        let editor_options = dock_editor_options_panel::EditorOptions::load_user_or_default();
+        let editor_options_host =
+            dock_editor_options_panel::EditorOptionsHost::new(editor_options.clone());
         let mut app = Self {
             window: None,
             renderer: None,
             egui_state: None,
-            ctx: egui::Context::default(),
+            ctx,
             projects,
             canvas_widget: CanvasWidget::new(),
             canvas_texture: None,
@@ -576,10 +662,32 @@ impl Default for App {
             resize_canvas_host: dock_resize_canvas_panel::ResizeCanvasHost::default(),
             import_gif_host: dock_import_gif_panel::ImportGifHost::new(),
             import_image_host: dock_import_image_panel::ImportImageHost::new(),
+            import_pyxel_host: dock_import_pyxel_panel::ImportPyxelHost::new(),
+            import_aseprite_host: dock_import_aseprite_panel::ImportAsepriteHost::new(),
             unsaved_guard_host: dock_unsaved_guard_panel::UnsavedGuardHost::new(),
             recovery_host: dock_recovery_panel::RecoveryHost::new(),
+            style_host,
+            banner_picker_host: dock_banner_picker_panel::BannerPickerHost::new(),
+            keybindings_host: dock_keybindings_panel::KeybindingsHost::new(&keymap),
+            editor_options_host,
+            editor_options,
+            credits_host: dock_credits_panel::CreditsHost::default(),
+            img2pixel_host: std::rc::Rc::new(std::cell::RefCell::new(
+                dock_img2pixel_panel::Img2PixelHost::default(),
+            )),
+            dropped_file_hovering: false,
+            discovered_fonts: crate::core::text::discover_fonts(),
+            font_byte_cache: std::collections::HashMap::new(),
+            last_text_key_frame: None,
+            save_toast: None,
+            last_error_seen: None,
+            ui_style,
+            banner_texture: None,
+            banner_thumb_cache: Vec::new(),
             pending_gif_import: None,
             pending_image_import: None,
+            pending_pyxel_import: None,
+            pending_aseprite_import: None,
             last_dir: discover_last_dir(),
             tile_placer: TilePlacerGesture::default(),
             tile_placer_transform: TilePlacerTransform::default(),
@@ -606,7 +714,7 @@ impl Default for App {
             pending_native_hosts: BTreeSet::new(),
             deferred_workspace_actions: Vec::new(),
             keymap,
-            theme: ThemeManager::new(),
+            theme,
             skin_atlas_cache: None,
             gizmo_hovered: GizmoHit::None,
             lifted_selection_is_masked: false,
@@ -629,15 +737,24 @@ impl Default for App {
             line_dynamic: false,
             curve_hovered: None,
             os_clipboard: crate::ui::clipboard::OsClipboard::new(),
+            os_clipboard_available: false,
             os_paste_rx: None,
             os_paste_cursor: None,
+            global_fg_color: Color::BLACK,
+            global_bg_color: Color::WHITE,
+            exit_guard_queue: Vec::new(),
+            exit_guard_total: 0,
+            exit_save_all_active: false,
+            exit_requested: false,
             _project_cache_generation: 0,
         };
-        let project = app.new_project("Untitled", CANVAS_WIDTH, CANVAS_HEIGHT);
-        app.projects
-            .session_mut(project)
-            .expect("new project must resolve")
-            .palettes = load_palettes(user_palette_dir().as_deref());
+        if create_initial_project {
+            let project = app.new_project("Untitled", CANVAS_WIDTH, CANVAS_HEIGHT);
+            app.projects
+                .session_mut(project)
+                .expect("new project must resolve")
+                .palettes = load_palettes(user_palette_dir().as_deref());
+        }
         app
     }
 }
@@ -1582,6 +1699,12 @@ impl App {
             // flags, then re-sync the newly active animation's controller.
             // Guarded: closing the LAST project leaves no active session.
             if self.projects.active_id().is_some() {
+                if self.os_clipboard_available {
+                    self.projects.current_mut().os_clipboard_available = true;
+                }
+                let session = self.projects.current_mut();
+                session.color = self.global_fg_color;
+                session.secondary_color = self.global_bg_color;
                 self.reset_animation_view_state();
                 self.sync_anim_delays();
             }
@@ -1601,6 +1724,18 @@ impl App {
                     }
                 }
                 top_bar::TopBarEvent::OpenCreateDocument => self.open_create_document_panel(),
+                top_bar::TopBarEvent::ToggleColorPicker => {
+                    if self.projects.active_id().is_some() {
+                        self.toggle_color_picker();
+                    }
+                }
+                top_bar::TopBarEvent::SwapColors => {
+                    if self.projects.active_id().is_some() {
+                        self.apply_toolbar_events(vec![ToolbarEvent::SwapColors]);
+                    } else {
+                        std::mem::swap(&mut self.global_fg_color, &mut self.global_bg_color);
+                    }
+                }
                 top_bar::TopBarEvent::CloseProject(id) => self.request_project_close(id),
                 top_bar::TopBarEvent::MenuAction(action) => self.apply_menu_action(action),
             }
@@ -1613,6 +1748,24 @@ impl App {
     /// file ops route through [`Self::file_op_for`] to the real
     /// `file_save`/`file_save_as`/`file_open` handlers.
     fn apply_menu_action(&mut self, action: top_bar::MenuAction) {
+        if self.projects.active_id().is_none()
+            && !matches!(
+                action,
+                top_bar::MenuAction::NewProject
+                    | top_bar::MenuAction::OpenProject
+                    | top_bar::MenuAction::ImportImages
+                    | top_bar::MenuAction::ImportGif
+                    | top_bar::MenuAction::ImportPyxel
+                    | top_bar::MenuAction::ImportAseprite
+                    | top_bar::MenuAction::ImportImage2Pixel
+                    | top_bar::MenuAction::Style
+                    | top_bar::MenuAction::KeyBindings
+                    | top_bar::MenuAction::EditorOptions
+                    | top_bar::MenuAction::Credits
+            )
+        {
+            return;
+        }
         if let Some(op) = file_op_for(action) {
             match op {
                 FileOp::Save => {
@@ -1630,12 +1783,35 @@ impl App {
             // square button (`OpenCreateDocument`) shares this exact handler.
             top_bar::MenuAction::NewProject => self.open_create_document_panel(),
             top_bar::MenuAction::ResizeCanvas => self.open_resize_canvas_panel(),
+            top_bar::MenuAction::Style => self.open_style_panel(),
+            top_bar::MenuAction::KeyBindings => self.open_keybindings_panel(),
+            top_bar::MenuAction::EditorOptions => self.open_editor_options_panel(),
+            top_bar::MenuAction::Credits => self.open_credits_panel(),
+            top_bar::MenuAction::LoadBuiltinPalette(kind) => {
+                let pal = crate::core::palette::builtin_palette(kind);
+                let pal_name = pal.name.clone();
+                let session = self.projects.current_mut();
+                if let Some(pos) = session.palettes.iter().position(|p| p.name == pal.name) {
+                    session.palettes[pos] = pal;
+                    session.active_palette = pos;
+                } else {
+                    session.palettes.insert(0, pal);
+                    session.active_palette = 0;
+                }
+                self.mark_dirty();
+                self.show_status_toast(format!("Palette loaded: {pal_name}"));
+            }
             // Import flows open the file chooser; the picked file resolves in
             // `drain_file_chooser_events` → the two-step Import panels.
             top_bar::MenuAction::ImportImages => self.file_import_png(),
             top_bar::MenuAction::ImportGif => self.file_import_gif(),
+            top_bar::MenuAction::ImportPyxel => self.file_import_pyxel(),
+            top_bar::MenuAction::ImportAseprite => self.file_import_aseprite(),
+            top_bar::MenuAction::ImportImage2Pixel => self.file_import_img2pixel(),
             top_bar::MenuAction::ExportSpriteSheet => self.file_export_sprite_sheet(),
             top_bar::MenuAction::ExportGif => self.file_export_gif(),
+            top_bar::MenuAction::ExportPyxel => self.file_export_pyxel(),
+            top_bar::MenuAction::ExportAseprite => self.file_export_aseprite(),
             top_bar::MenuAction::ExportSelected => self.file_export_selected(),
             top_bar::MenuAction::Undo => self.undo_document(),
             top_bar::MenuAction::Redo => self.redo_document(),
@@ -1653,6 +1829,334 @@ impl App {
             top_bar::MenuAction::SaveProject
             | top_bar::MenuAction::SaveProjectAs
             | top_bar::MenuAction::OpenProject => {}
+        }
+    }
+
+    /// Opens or raises the floating Key Bindings panel (Options -> key bindings, id 214).
+    fn open_keybindings_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_PANEL_ID);
+        self.keybindings_host.sync_keymap(&self.keymap);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(240.0, 110.0),
+            egui::vec2(620.0, 520.0),
+        );
+        let spec = dock_keybindings_panel::keybindings_panel_spec(
+            &self.keybindings_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn open_keybindings_guard_panel(&mut self) {
+        let guard_id =
+            panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_GUARD_PANEL_ID);
+        if self.panel_dock.placement(guard_id).is_some() {
+            self.panel_dock.raise_floating(guard_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(360.0, 260.0),
+            egui::vec2(390.0, 120.0),
+        );
+        let spec = dock_keybindings_panel::keybindings_guard_panel_spec(
+            &self.keybindings_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(guard_id);
+        }
+    }
+
+    fn drain_keybindings_events(&mut self) {
+        for event in self.keybindings_host.take_events() {
+            match event {
+                keybindings::KeybindingsEvent::Reset => {
+                    self.keymap = Keymap::defaults();
+                    self.persist_keymap();
+                    self.keybindings_host.sync_keymap(&self.keymap);
+                }
+                keybindings::KeybindingsEvent::Apply(next) => {
+                    self.keymap = next;
+                    self.persist_keymap();
+                }
+            }
+        }
+        for guard_event in self.keybindings_host.take_guard_events() {
+            let guard_id =
+                panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_GUARD_PANEL_ID);
+            let kb_id = panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_PANEL_ID);
+            self.panel_dock.remove_spec(guard_id);
+            match guard_event {
+                dock_keybindings_panel::KeybindingsGuardEvent::ApplyAndClose => {
+                    let mut applied = Vec::new();
+                    let ok = self
+                        .keybindings_host
+                        .panel
+                        .borrow_mut()
+                        .try_apply(&mut applied);
+                    if ok {
+                        for ev in applied {
+                            if let keybindings::KeybindingsEvent::Apply(next) = ev {
+                                self.keymap = next;
+                                self.persist_keymap();
+                            }
+                        }
+                        self.panel_dock.remove_spec(kb_id);
+                    }
+                }
+                dock_keybindings_panel::KeybindingsGuardEvent::CloseWithoutSaving => {
+                    self.keybindings_host.sync_keymap(&self.keymap);
+                    self.panel_dock.remove_spec(kb_id);
+                }
+                dock_keybindings_panel::KeybindingsGuardEvent::Cancel => {}
+            }
+        }
+    }
+
+    fn open_editor_options_panel(&mut self) {
+        let panel_id =
+            panel_dock::PanelId::new(dock_editor_options_panel::EDITOR_OPTIONS_PANEL_ID);
+        *self.editor_options_host.options.borrow_mut() = self.editor_options.clone();
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(300.0, 160.0),
+            egui::vec2(360.0, 150.0),
+        );
+        let spec = dock_editor_options_panel::editor_options_panel_spec(
+            &self.editor_options_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_editor_options_events(&mut self) {
+        let panel_id =
+            panel_dock::PanelId::new(dock_editor_options_panel::EDITOR_OPTIONS_PANEL_ID);
+        for event in self.editor_options_host.take_events() {
+            match event {
+                dock_editor_options_panel::EditorOptionsEvent::Changed(opts) => {
+                    self.editor_options = opts;
+                    self.editor_options.save_user();
+                }
+                dock_editor_options_panel::EditorOptionsEvent::Close => {
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+            }
+        }
+    }
+
+    fn open_credits_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_credits_panel::CREDITS_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(260.0, 140.0),
+            egui::vec2(440.0, 380.0),
+        );
+        let spec = dock_credits_panel::credits_panel_spec(&self.credits_host, floating_rect);
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_credits_events(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_credits_panel::CREDITS_PANEL_ID);
+        for event in self.credits_host.take_events() {
+            match event {
+                dock_credits_panel::CreditsEvent::Close => {
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+            }
+        }
+    }
+    fn open_style_panel(&mut self) {
+        let panel_id = panel_dock::PanelId::new(dock_style_panel::STYLE_PANEL_ID);
+        self.style_host.set_style(self.ui_style.clone());
+        self.sync_banner_texture();
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(300.0, 110.0),
+            egui::vec2(460.0, 520.0),
+        );
+        let spec = dock_style_panel::style_panel_spec(&self.style_host, floating_rect);
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn refresh_banner_picker_items(&mut self) {
+        self.banner_thumb_cache.clear();
+        let entries = banners::scan_banners();
+        let mut items = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Ok((image, size)) = banners::load_banner_image(&entry.path) {
+                let texture = self.ctx.load_texture(
+                    format!("banner-thumb:{}", entry.name),
+                    image,
+                    egui::TextureOptions::NEAREST,
+                );
+                items.push(dock_banner_picker_panel::BannerThumbItem {
+                    name: entry.name.clone(),
+                    texture: texture.id(),
+                    size,
+                });
+                self.banner_thumb_cache.push((entry.name, texture, size));
+            }
+        }
+        self.banner_picker_host
+            .set_items(items, self.ui_style.banner.clone());
+    }
+
+    /// Opens or raises the floating Select Banner panel (id 215).
+    fn open_banner_picker_panel(&mut self) {
+        self.refresh_banner_picker_items();
+        let panel_id = panel_dock::PanelId::new(dock_banner_picker_panel::BANNER_PICKER_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(400.0, 180.0),
+            egui::vec2(380.0, 340.0),
+        );
+        let spec = dock_banner_picker_panel::banner_picker_panel_spec(
+            &self.banner_picker_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_banner_picker_events(&mut self) {
+        for event in self.banner_picker_host.take_events() {
+            match event {
+                dock_banner_picker_panel::BannerPickerEvent::Selected(banner) => {
+                    self.ui_style.banner = banner;
+                    self.sync_banner_texture();
+                    self.apply_active_style(true);
+                    let panel_id =
+                        panel_dock::PanelId::new(dock_banner_picker_panel::BANNER_PICKER_PANEL_ID);
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_banner_picker_panel::BannerPickerEvent::Refresh => {
+                    self.refresh_banner_picker_items();
+                }
+            }
+        }
+    }
+
+    fn sync_banner_texture(&mut self) {
+        let Some(spec) = self.ui_style.banner.clone() else {
+            self.banner_texture = None;
+            self.style_host.set_banner_preview(None);
+            return;
+        };
+        if let Some((cached_spec, tex, size)) = &self.banner_texture {
+            if cached_spec == &spec {
+                self.style_host.set_banner_preview(Some((tex.id(), *size)));
+                return;
+            }
+        }
+        let Some(entry) = banners::find_banner(&spec) else {
+            self.banner_texture = None;
+            self.style_host.set_banner_preview(None);
+            return;
+        };
+        match banners::load_banner_image(&entry.path) {
+            Ok((image, size)) => {
+                let texture = self.ctx.load_texture(
+                    format!("top-bar-banner:{}", entry.name),
+                    image,
+                    egui::TextureOptions::NEAREST,
+                );
+                let preview = (texture.id(), size);
+                self.banner_texture = Some((spec, texture, size));
+                self.style_host.set_banner_preview(Some(preview));
+            }
+            Err(err) => {
+                self.banner_texture = None;
+                self.style_host.set_banner_preview(None);
+                self.style_host.set_status(err);
+            }
+        }
+    }
+
+    fn apply_active_style(&mut self, persist_default: bool) {
+        self.ui_style
+            .apply_to_theme_colors(&mut self.theme.current_mut().colors);
+        self.ui_style.apply_to_egui(&self.ctx);
+        self.style_host.set_style(self.ui_style.clone());
+        if persist_default {
+            if let Some(path) = style::user_style_path() {
+                let _ = self.ui_style.save_to_file(&path);
+            }
+        }
+    }
+
+    fn drain_style_events(&mut self) {
+        for event in self.style_host.take_events() {
+            match event {
+                dock_style_panel::StyleEvent::SelectPreset(preset) => {
+                    let banner = self.ui_style.banner.clone();
+                    self.ui_style = preset.style();
+                    self.ui_style.banner = banner;
+                    self.apply_active_style(true);
+                    self.style_host
+                        .set_status(format!("Preset '{}' applied.", preset.name()));
+                }
+                dock_style_panel::StyleEvent::UpdateStyle(next) => {
+                    self.ui_style = next;
+                    self.apply_active_style(true);
+                }
+                dock_style_panel::StyleEvent::OpenBannerPicker => {
+                    self.open_banner_picker_panel();
+                }
+                dock_style_panel::StyleEvent::SaveFile(path) => {
+                    match self.ui_style.save_to_file(&path) {
+                        Ok(()) => {
+                            if let Some(default_path) = style::user_style_path() {
+                                let _ = self.ui_style.save_to_file(&default_path);
+                            }
+                            self.style_host
+                                .set_status(format!("Saved style to {}", path.display()));
+                        }
+                        Err(err) => {
+                            self.style_host.set_status(err);
+                        }
+                    }
+                }
+                dock_style_panel::StyleEvent::LoadFile(path) => {
+                    match style::UiStyle::load_from_file(&path) {
+                        Ok(loaded) => {
+                            self.ui_style = loaded;
+                            self.sync_banner_texture();
+                            self.apply_active_style(true);
+                            self.style_host
+                                .set_status(format!("Loaded style from {}", path.display()));
+                        }
+                        Err(err) => {
+                            self.style_host.set_status(err);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1703,8 +2207,8 @@ impl App {
             return;
         }
         let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(360.0, 160.0),
-            egui::vec2(300.0, 240.0),
+            egui::pos2(300.0, 140.0),
+            dock_create_document_panel::CREATE_DOCUMENT_MIN_SIZE,
         );
         let spec = dock_create_document_panel::create_document_panel_spec(
             &self.create_document_host,
@@ -1756,6 +2260,12 @@ impl App {
                         dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID,
                     );
                     self.panel_dock.remove_spec(panel_id);
+                }
+                dock_create_document_panel::CreateDocumentEvent::Cancel => {
+                    let panel_id = panel_dock::PanelId::new(
+                        dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID,
+                    );
+                    let _ = self.panel_dock.remove_spec(panel_id);
                 }
             }
         }
@@ -1851,8 +2361,8 @@ impl App {
             return;
         }
         let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(430.0, 300.0),
-            egui::vec2(480.0, 400.0),
+            egui::pos2(240.0, 140.0),
+            egui::vec2(760.0, 480.0),
         );
         let spec =
             dock_file_chooser_panel::file_chooser_panel_spec(&self.file_chooser_host, floating_rect);
@@ -1896,7 +2406,9 @@ impl App {
                             } else if let Some(parent) = path.parent() {
                                 self.remember_last_dir(parent);
                             }
-                            if self.projects.current().is_dirty() {
+                            if self.projects.active_id().is_some()
+                                && self.projects.current().is_dirty()
+                            {
                                 self.projects.current_mut().pending_action =
                                     Some(PendingAction::Open {
                                         project: self.projects.current().id,
@@ -1919,6 +2431,27 @@ impl App {
                                 self.remember_last_dir(parent);
                             }
                             self.file_import_gif_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ImportPyxel => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            self.file_import_pyxel_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ImportAseprite => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            self.file_import_aseprite_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ImportImage2Pixel => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            self.file_import_img2pixel_pick(&path);
                             self.close_file_chooser();
                         }
                         dock_file_chooser_panel::FileChooserMode::ChooseFolder => {
@@ -1993,8 +2526,14 @@ impl App {
                 }
                 dock_import_gif_panel::ImportGifEvent::Ok { line_length } => {
                     self.close_import_gif_panel();
-                    if let Err(msg) = self.apply_import_gif(line_length) {
-                        self.projects.current_mut().last_error = Some(msg);
+                    match self.apply_import_gif(line_length) {
+                        Ok(()) => {
+                            let name = self.projects.current().name.clone();
+                            self.show_status_toast(format!("{name} imported."));
+                        }
+                        Err(msg) => {
+                            self.projects.current_mut().last_error = Some(msg);
+                        }
                     }
                 }
             }
@@ -2058,8 +2597,14 @@ impl App {
                     regions_h: _,
                 } => {
                     self.close_import_image_panel();
-                    if let Err(msg) = self.apply_import_image(px_w, px_h) {
-                        self.projects.current_mut().last_error = Some(msg);
+                    match self.apply_import_image(px_w, px_h) {
+                        Ok(()) => {
+                            let name = self.projects.current().name.clone();
+                            self.show_status_toast(format!("{name} imported."));
+                        }
+                        Err(msg) => {
+                            self.projects.current_mut().last_error = Some(msg);
+                        }
                     }
                 }
             }
@@ -2083,6 +2628,7 @@ impl App {
             match event {
                 dock_save_as_panel::SaveAsEvent::Cancel => {
                     self.close_save_as_panel();
+                    self.cancel_exit_guard();
                     if self.projects.active_id().is_some() {
                         self.projects.current_mut().pending_action = None;
                     }
@@ -2126,9 +2672,9 @@ impl App {
     /// `last_error` cleared; on failure the inline panel error (and
     /// `last_error`) carry the message.
     fn save_as_target(&mut self, path: &Path) -> bool {
-        let (kind, payload) = {
+        let (kind, payload, aseprite_unified) = {
             let view = self.save_as_host.view.borrow();
-            (view.kind, view.payload.clone())
+            (view.kind, view.payload.clone(), view.aseprite_unified_frames)
         };
         let outcome: Result<(), String> = match (kind, payload) {
             (dock_save_as_panel::SaveAsKind::Project, _) => {
@@ -2147,6 +2693,31 @@ impl App {
             ) => std::fs::write(path, bytes)
                 .map_err(|err| format!("Failed to export GIF: {err}")),
             (
+                dock_save_as_panel::SaveAsKind::Pyxel,
+                Some(dock_save_as_panel::SavePayload::Pyxel(bytes)),
+            ) => {
+                let target = if path.extension().is_none() {
+                    path.with_extension("pyxel")
+                } else {
+                    path.to_path_buf()
+                };
+                std::fs::write(&target, bytes)
+                    .map_err(|err| format!("Failed to export .pyxel: {err}"))
+            }
+            (
+                dock_save_as_panel::SaveAsKind::Aseprite,
+                Some(dock_save_as_panel::SavePayload::Aseprite { unified, timeline }),
+            ) => {
+                let target = if path.extension().is_none() {
+                    path.with_extension("ase")
+                } else {
+                    path.to_path_buf()
+                };
+                let bytes = if aseprite_unified { unified } else { timeline };
+                std::fs::write(&target, bytes)
+                    .map_err(|err| format!("Failed to export .ase: {err}"))
+            }
+            (
                 dock_save_as_panel::SaveAsKind::SelectionPng,
                 Some(dock_save_as_panel::SavePayload::SelectionPng { w, h, rgba }),
             ) => encode_png(w, h, &rgba)
@@ -2159,19 +2730,22 @@ impl App {
         };
         match outcome {
             Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| String::from("Untitled"));
                 if kind == dock_save_as_panel::SaveAsKind::Project {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| String::from("Untitled"));
                     let session = self.projects.current_mut();
                     session.path = Some(path.to_path_buf());
-                    session.name = name;
+                    session.name = name.clone();
                     session.mark_saved();
+                    self.show_status_toast(format!("{name} saved."));
                     self.update_title();
                     if let Some(location) = path.parent() {
                         self.remember_last_dir(location);
                     }
+                } else {
+                    self.show_status_toast(format!("{name} exported."));
                 }
                 self.projects.current_mut().last_error = None;
                 true
@@ -2766,11 +3340,17 @@ impl App {
 
     fn request_project_close(&mut self, id: project::ProjectId) {
         match self.close_project(id, project::CloseProject::Discard) {
-            Ok(_) => {}
-            Err(project::CloseError::Dirty { project })
-                if self.projects.active_id() == Some(project) =>
-            {
-                self.projects.current_mut().pending_action = Some(PendingAction::Close { project });
+            Ok(_) => {
+                self.update_title();
+            }
+            Err(project::CloseError::Dirty { project }) => {
+                if self.projects.active_id() != Some(project) {
+                    let _ = self.activate_project(project);
+                }
+                if self.projects.active_id() == Some(project) {
+                    self.projects.current_mut().pending_action =
+                        Some(PendingAction::Close { project });
+                }
             }
             Err(_) => {}
         }
@@ -2947,8 +3527,22 @@ impl App {
                         self.anim_rect_dragging = false;
                     }
                 }
-                ToolbarEvent::ColorChanged(color) => self.projects.current_mut().color = color,
+                ToolbarEvent::ColorChanged(color) => {
+                    self.global_fg_color = color;
+                    self.projects.current_mut().color = color;
+                    if let Some(t) = self
+                        .projects
+                        .current_mut()
+                        .transform
+                        .as_mut()
+                        .and_then(TransformSession::text_mut)
+                    {
+                        t.color = color;
+                        self.re_rasterize_text_transform();
+                    }
+                }
                 ToolbarEvent::SecondaryColorChanged(color) => {
+                    self.global_bg_color = color;
                     self.projects.current_mut().secondary_color = color;
                 }
                 ToolbarEvent::BrushSizeChanged(size) => {
@@ -3008,12 +3602,43 @@ impl App {
                 }
                 ToolbarEvent::TransformAlgorithmChanged(algorithm) => {
                     // Store the choice on the session so a later lift seeds
-                    // from it, AND apply it to a live selection object so the
+                    // from it, AND apply it to a live selection/text object so the
                     // current rotation/commit pipeline switches immediately.
                     let session = self.projects.current_mut();
                     session.transform_algorithm = algorithm;
-                    if let Some(TransformSession::Selection(t)) = session.transform.as_mut() {
+                    if let Some(t) = session
+                        .transform
+                        .as_mut()
+                        .and_then(TransformSession::selection_mut)
+                    {
                         t.object.set_algorithm(algorithm);
+                    }
+                }
+                ToolbarEvent::TextFontChanged(font_name) => {
+                    self.projects.current_mut().text_font = font_name.clone();
+                    if let Some(t) = self
+                        .projects
+                        .current_mut()
+                        .transform
+                        .as_mut()
+                        .and_then(TransformSession::text_mut)
+                    {
+                        t.font_name = font_name;
+                        self.re_rasterize_text_transform();
+                    }
+                }
+                ToolbarEvent::TextSizeChanged(size) => {
+                    let size = size.clamp(5, 128);
+                    self.projects.current_mut().text_size = size;
+                    if let Some(t) = self
+                        .projects
+                        .current_mut()
+                        .transform
+                        .as_mut()
+                        .and_then(TransformSession::text_mut)
+                    {
+                        t.font_size = size;
+                        self.re_rasterize_text_transform();
                     }
                 }
                 ToolbarEvent::TileRotationChanged(degrees) => {
@@ -3041,6 +3666,7 @@ impl App {
                             || next_color != Some(self.projects.current_mut().color);
                         self.projects.current_mut().active_palette = index;
                         if let Some(color) = next_color {
+                            self.global_fg_color = color;
                             self.projects.current_mut().color = color;
                         }
                         if changed {
@@ -3049,8 +3675,10 @@ impl App {
                     }
                 }
                 ToolbarEvent::SwapColors => {
+                    std::mem::swap(&mut self.global_fg_color, &mut self.global_bg_color);
                     let session = self.projects.current_mut();
-                    std::mem::swap(&mut session.color, &mut session.secondary_color);
+                    session.color = self.global_fg_color;
+                    session.secondary_color = self.global_bg_color;
                 }
             }
         }
@@ -3079,7 +3707,20 @@ impl App {
         let wand_contiguous_effective = wand.contiguous && !self.ctx.input(|i| i.modifiers.alt);
         let fill = session.tool_state.fill();
         let transform_active = session.transform.is_some();
+        let text_transform_active = session
+            .transform
+            .as_ref()
+            .is_some_and(TransformSession::is_text);
         let transform_algorithm = session.transform_algorithm;
+        let (text_font, text_size) = match &session.transform {
+            Some(TransformSession::Text(t)) => (t.font_name.clone(), t.font_size),
+            _ => (session.text_font.clone(), session.text_size),
+        };
+        let available_fonts: Vec<String> = self
+            .discovered_fonts
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
         // Mirror the SINGLE Tile placement transform into the panel's view, so the
         // rotation / flip controls read exactly the state the Q/R/X/Z keys
         // write (and a panel edit is visible in the same widgets).
@@ -3099,6 +3740,11 @@ impl App {
             transform_active,
             transform_algorithm,
             tile_placer,
+            shortcuts: dock_hosts::ToolboxShortcuts::from_keymap(&self.keymap),
+            text_transform_active,
+            text_font,
+            text_size,
+            available_fonts,
         };
         let mut color_picker_view = self.color_picker_host.view.borrow_mut();
         if color_picker_view.open {
@@ -3264,6 +3910,12 @@ impl App {
     /// Closes a panel from its header's Close action: removes it from the dock
     /// and clears the host state of the panels that track their open flag.
     fn close_panel(&mut self, id: panel_dock::PanelId) {
+        if id.raw() == dock_keybindings_panel::KEYBINDINGS_PANEL_ID
+            && self.keybindings_host.panel.borrow().is_dirty()
+        {
+            self.open_keybindings_guard_panel();
+            return;
+        }
         self.panel_dock.remove_spec(id);
         if id.raw() == dock_layers_panel::LAYER_SETTINGS_PANEL_ID {
             *self.layers_host.open_settings.borrow_mut() = None;
@@ -3286,6 +3938,12 @@ impl App {
         {
             self.recovery_discard();
         }
+        if id.raw() == dock_import_pyxel_panel::IMPORT_PYXEL_PANEL_ID {
+            self.pending_pyxel_import = None;
+        }
+        if id.raw() == dock_import_aseprite_panel::IMPORT_ASEPRITE_PANEL_ID {
+            self.pending_aseprite_import = None;
+        }
     }
 
     /// Opens or closes the floating Color Picker panel (C). Opening snapshots
@@ -3299,7 +3957,7 @@ impl App {
             return;
         }
         let rect = self.panel_dock.last_floating_rect(id).unwrap_or_else(|| {
-            egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(540.0, 300.0))
+            egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(620.0, 300.0))
         });
         let spec = dock_color_picker_panel::color_picker_panel_spec(&self.color_picker_host, rect);
         if self.panel_dock.add_spec(spec).is_ok() {
@@ -3692,7 +4350,7 @@ impl App {
             for event in events {
                 match event {
                     LayerPanelEvent::Select(id) => {
-                        if session.layers.set_active(id) {
+                        if session.layers.set_active(id) && session.transform.is_none() {
                             clear_selection = true;
                         }
                     }
@@ -3903,9 +4561,18 @@ impl App {
     /// keeps the selection; Esc cancels a live selection transform (restoring
     /// the lifted pixels) before clearing it, and starting a new selection
     /// commits one too.
+    fn show_status_toast(&mut self, message: impl Into<String>) {
+        self.save_toast = Some((message.into(), Instant::now()));
+    }
+
     fn deselect(&mut self) {
+        let had_selection = self.projects.current().selection.is_some()
+            || self.projects.current().transform.is_some();
         self.transform_session_commit();
         self.clear_selection();
+        if had_selection {
+            self.show_status_toast("Deselect");
+        }
     }
 
     /// Select the entire canvas on the active layer (committing any live
@@ -3920,6 +4587,7 @@ impl App {
         let session = self.projects.current_mut();
         session.selection = captured;
         session.gesture = SelectGesture::Idle;
+        self.show_status_toast("Select All");
     }
 
     /// The current selection's marching-ants overlay.
@@ -4407,7 +5075,8 @@ impl App {
                         hovered: self.curve_hovered,
                     };
                 }
-                TransformSession::Selection(selection) => {
+                TransformSession::Selection(selection)
+                | TransformSession::Text(project::TextTransformSession { selection, .. }) => {
                     let (min_x, min_y, max_x, max_y) = selection.object.canvas_bbox();
                     // O1: the gizmo is the object's rotated quad, so outline,
                     // handles and rotation hints rotate with the content.
@@ -4518,12 +5187,21 @@ impl App {
             return;
         }
         let ctrl = self.ctx.input(|i| i.modifiers.command);
+        let shift = self.ctx.input(|i| {
+            i.modifiers.shift
+                || i.events.iter().any(|e| match e {
+                    egui::Event::Key { modifiers, .. }
+                    | egui::Event::PointerButton { modifiers, .. } => modifiers.shift,
+                    _ => false,
+                })
+        });
         let alt = alt_pressed(&self.ctx);
         let child = self.projects.current().tool_state.child();
         // Alt+left on the Rectangle child is the grid-cell region sweep, so it
         // takes precedence over the inside-hit area move (D77 item 4).
+        // Shift+left always adds to the selection rather than moving it.
         let region = child == FieldierChild::Rectangle && alt;
-        if !right_button && !region {
+        if !right_button && !region && !shift {
             let hit = self
                 .projects
                 .current()
@@ -4796,17 +5474,39 @@ impl App {
                 self.deselect();
             }
         }
-        // A double-click outside the selection dismisses it too, so a second
-        // click on empty canvas clears without reaching for Esc.
+        // In Fieldier Rectangle, double-clicking inside a region selects that
+        // region (and Shift+double-click adds the region to the selection).
+        // Outside Rectangle (e.g. Lasso), double-clicking outside the selection
+        // dismisses it.
         if let Some(pt) = interactions.double_clicked {
-            let outside = self
-                .projects
-                .current()
-                .selection
-                .as_ref()
-                .is_some_and(|sel| !sel.contains(pt.0, pt.1));
-            if outside {
-                self.deselect();
+            if self.projects.current().tool_state.child() == FieldierChild::Rectangle {
+                let ts = self.projects.current().tile_size;
+                let tw = ts.w.max(1) as i32;
+                let th = ts.h.max(1) as i32;
+                let rx = pt.0.div_euclid(tw) * tw;
+                let ry = pt.1.div_euclid(th) * th;
+                let region_rect = Rect2i::new(rx, ry, tw, th);
+                let captured = Selection::capture(
+                    &self.projects.current().layers.active_layer().buffer,
+                    region_rect,
+                );
+                let shift = self.ctx.input(|i| i.modifiers.shift);
+                let (mode, base) = if shift {
+                    (SelectMode::Add, self.projects.current().selection.clone())
+                } else {
+                    (SelectMode::Replace, None)
+                };
+                self.combine_selection(captured, mode, base);
+            } else {
+                let outside = self
+                    .projects
+                    .current()
+                    .selection
+                    .as_ref()
+                    .is_some_and(|sel| !sel.contains(pt.0, pt.1));
+                if outside {
+                    self.deselect();
+                }
             }
         }
     }
@@ -5115,62 +5815,52 @@ impl App {
                 t.preview_dragging = false;
             }
         }
-        if let Some(pt) = interactions.double_clicked {
-            self.selection_transform_double_click(pt);
+        if let Some(pt) = interactions.clicked.or(interactions.double_clicked) {
+            if !self.pointer_over_panel()
+                && self.input_capture.target() == Some(SurfaceId::Canvas)
+            {
+                self.selection_transform_double_click(pt);
+            }
         } else {
-            // The canvas widget only reports double-clicks inside its draw
-            // rect. A double-click in the letterbox / empty area around the
+            // The canvas widget only reports clicks inside its draw rect. A
+            // single click in the letterbox / empty canvas area around the
             // canvas must still commit the floating selection.
             self.commit_transform_from_global_double_click();
         }
     }
 
-    /// Global fallback for the transform commit gesture: a primary double-click
-    /// that the canvas widget did NOT already report (it landed outside the
-    /// canvas draw rect) still commits the floating selection. The point is
-    /// mapped with the CLAMP-FREE mapping so an outside-canvas click stays
-    /// outside the object's bbox and commits.
-    ///
-    /// Guards: only reached for a `TransformSession::Selection` (the curve
-    /// variant is routed to `handle_curve_transform_interactions`), and skipped
-    /// while egui is actively using the pointer for a drag
-    /// ([`egui::Context::egui_is_using_pointer`]) so a drag on another widget
-    /// cannot be hijacked. It deliberately does NOT gate on
-    /// `egui_wants_pointer_input` / pointer-over-egui: every point inside the
-    /// window is "over egui", which would disable the required letterbox /
-    /// empty-area commit.
-    fn commit_transform_from_global_double_click(&mut self) {
-        if self.ctx.egui_is_using_pointer() {
-            return;
+    fn workspace_empty_click(&self) -> Option<(i32, i32)> {
+        if self.ctx.egui_is_using_pointer() || self.pointer_over_panel() {
+            return None;
         }
-        // A panel under the pointer masks the canvas completely. The
-        // `egui_is_using_pointer` guard above only covers presses a panel
-        // WIDGET captured (a dock header band, a resize handle, a palette
-        // button); a panel's dead space — its body between widgets, which paints
-        // opaque chrome over the canvas but registers no widget — captures
-        // nothing, and a double-click there reached the canvas and committed the
-        // floating selection. `interactions.double_clicked` is blanked by this
-        // same mask for the in-draw-rect path.
-        if self.pointer_over_panel() {
-            return;
+        if self.input_capture.target() != Some(SurfaceId::Canvas) {
+            return None;
         }
-        let Some(pos) = self.ctx.input(|i| {
-            i.pointer
-                .button_double_clicked(egui::PointerButton::Primary)
-                .then(|| i.pointer.latest_pos())
-                .flatten()
-        }) else {
-            return;
-        };
+        let space_held =
+            !self.ctx.text_edit_focused() && self.ctx.input(|i| i.key_down(egui::Key::Space));
+        if space_held {
+            return None;
+        }
+        let pos = self.ctx.input(|i| {
+            (i.pointer.button_clicked(egui::PointerButton::Primary)
+                || i.pointer.button_double_clicked(egui::PointerButton::Primary))
+            .then(|| i.pointer.latest_pos())
+            .flatten()
+        })?;
+        if pos.y < top_bar::TOP_BAR_HEIGHT {
+            return None;
+        }
         let camera = self.projects.current().camera;
         let canvas_size = (
             self.projects.current().layers.width() as u32,
             self.projects.current().layers.height() as u32,
         );
-        if let Some(pt) = self
-            .canvas_widget
+        self.canvas_widget
             .screen_to_canvas_unclamped(pos, camera, canvas_size)
-        {
+    }
+
+    fn commit_transform_from_global_double_click(&mut self) {
+        if let Some(pt) = self.workspace_empty_click() {
             self.selection_transform_double_click(pt);
         }
     }
@@ -5184,6 +5874,21 @@ impl App {
             return;
         }
         let radius = GIZMO_HIT_RADIUS / self.projects.current().camera.scale() as f32;
+        if let Some(TransformSession::Text(t)) = self.projects.current_mut().transform.as_mut() {
+            let (lx, ly) = t
+                .selection
+                .object
+                .canvas_to_local((pt.0 as f32 + 0.5, pt.1 as f32 + 0.5));
+            let w = t.layout.width as f32;
+            let h = t.layout.height as f32;
+            let inside = lx >= -radius && lx <= w + radius && ly >= -radius && ly <= h + radius;
+            if inside {
+                t.caret = t.layout.hit_test_caret(lx, ly);
+                return;
+            }
+            self.transform_session_commit();
+            return;
+        }
         let on_object = self
             .projects
             .current()
@@ -5561,9 +6266,31 @@ impl App {
         let Some(session) = self.projects.current_mut().transform.take() else {
             return;
         };
-        let TransformSession::Selection(t) = session else {
-            self.projects.current_mut().transform = Some(session);
-            return;
+        let t = match session {
+            TransformSession::Selection(t) => t,
+            TransformSession::Text(text_sess) => {
+                if text_sess.text.is_empty() {
+                    return;
+                }
+                let target = self.projects.current_mut().layers.active_layer_id();
+                let commits = text_sess.selection.object.commit();
+                if let Some(cmd) = apply_layer_commits_with(
+                    &text_sess.selection.source,
+                    &commits,
+                    target,
+                    &mut self.projects.current_mut().layers,
+                    false,
+                ) {
+                    self.push_pixel_edit(Box::new(cmd));
+                    self.mark_dirty();
+                    self.show_status_toast("Text committed.");
+                }
+                return;
+            }
+            TransformSession::Curve(_) => {
+                self.projects.current_mut().transform = Some(session);
+                return;
+            }
         };
         let target = self.projects.current_mut().layers.active_layer_id();
         let commits = t.object.commit();
@@ -5605,6 +6332,7 @@ impl App {
             .layer(target)
             .and_then(|layer| Selection::capture(&layer.buffer, destination));
         project.selection = captured;
+        self.show_status_toast("Transform committed.");
     }
 
     /// Cancel the session and restore the document (Esc). Part C: the lift CUT
@@ -5616,6 +6344,10 @@ impl App {
         let Some(session) = self.projects.current_mut().transform.take() else {
             return;
         };
+        if matches!(session, TransformSession::Text(_)) {
+            self.show_status_toast("Text cancelled.");
+            return;
+        }
         let TransformSession::Selection(t) = session else {
             return;
         };
@@ -5631,6 +6363,7 @@ impl App {
                 Some(mask) => Selection::capture_mask(&layer.buffer, t.source.rect, mask.clone()),
             });
         self.projects.current_mut().selection = restored;
+        self.show_status_toast("Transform cancelled.");
     }
 
     /// Re-upload the floating-pixels preview when the selection session's
@@ -5777,7 +6510,7 @@ impl App {
             .current()
             .transform
             .as_ref()
-            .is_some_and(|t| matches!(t, TransformSession::Selection(_)));
+            .is_some_and(|t| matches!(t, TransformSession::Selection(_) | TransformSession::Text(_)));
         let stroke_size = match tool {
             Tool::Pencil | Tool::Eraser | Tool::Draw => {
                 let settings = self.projects.current().draw_settings(tool);
@@ -5787,7 +6520,7 @@ impl App {
             }
             // The other tools act on the cursor pixel itself; a 1 px footprint
             // keeps their inside test the strict point-in-draw-rect test.
-            Tool::Fill | Tool::Eyedropper | Tool::Fieldier | Tool::Tile | Tool::AnimationPlacer => 1,
+            Tool::Fill | Tool::Eyedropper | Tool::Fieldier | Tool::Tile | Tool::AnimationPlacer | Tool::Text => 1,
         };
         let pressed = ctx.input(|i| i.pointer.primary_pressed());
         let down = ctx.input(|i| i.pointer.primary_down());
@@ -6316,6 +7049,130 @@ impl App {
     /// canvas surface, or a test frame) still sees the held modifiers. Reading
     /// `App::ctx` there would always report "no modifiers" and collapse an
     /// Alt+Shift wand click to a plain contiguous Replace.
+    fn font_bytes_for(&mut self, font_name: &str) -> Option<Vec<u8>> {
+        if let Some(cached) = self.font_byte_cache.get(font_name) {
+            return Some(cached.clone());
+        }
+        let loaded = crate::core::text::load_font_bytes(font_name, &self.discovered_fonts)?;
+        self.font_byte_cache
+            .insert(font_name.to_owned(), loaded.clone());
+        Some(loaded)
+    }
+
+    fn re_rasterize_text_transform(&mut self) {
+        let params = {
+            let Some(TransformSession::Text(t)) = self.projects.current().transform.as_ref() else {
+                return;
+            };
+            crate::core::text::TextRenderParams {
+                text: t.text.clone(),
+                font_name: t.font_name.clone(),
+                font_size: t.font_size,
+                color: [t.color.r, t.color.g, t.color.b, t.color.a],
+            }
+        };
+        let font_bytes = self.font_bytes_for(&params.font_name);
+        let layout = crate::core::text::render_text(&params, font_bytes.as_deref());
+        let lid = self.projects.current().layers.active_layer_id().as_u64() as usize;
+        if let Some(TransformSession::Text(t)) = self.projects.current_mut().transform.as_mut() {
+            let buffer = LayerBuffer {
+                layer_id: lid,
+                w: layout.width as usize,
+                h: layout.height as usize,
+                buf: layout.rgba.clone(),
+            };
+            t.layout = layout;
+            t.selection.object.replace_source_layer(buffer);
+            recenter_pivot_keeping_output(&mut t.selection);
+        }
+        self.transform_preview_key = None;
+    }
+
+    fn begin_text_transform(&mut self, pt: (i32, i32)) {
+        let (font_name, font_size, color, alg, lid) = {
+            let s = self.projects.current();
+            (
+                s.text_font.clone(),
+                s.text_size,
+                s.color,
+                s.transform_algorithm,
+                s.layers.active_layer_id(),
+            )
+        };
+        let params = crate::core::text::TextRenderParams {
+            text: String::new(),
+            font_name: font_name.clone(),
+            font_size,
+            color: [color.r, color.g, color.b, color.a],
+        };
+        let font_bytes = self.font_bytes_for(&font_name);
+        let layout = crate::core::text::render_text(&params, font_bytes.as_deref());
+        let buffer = LayerBuffer {
+            layer_id: lid.as_u64() as usize,
+            w: layout.width as usize,
+            h: layout.height as usize,
+            buf: layout.rgba.clone(),
+        };
+        let mut object = TransformObject::lift(buffer, (pt.0 as f32, pt.1 as f32));
+        object.set_algorithm(alg);
+        let start_local_dims = object.local_scaled_dims();
+        let start_pivot = object.pivot();
+        let source = TransformSource {
+            layer_id: lid,
+            rect: Rect2i::new(0, 0, 0, 0),
+            snapshot: Vec::new(),
+            mask: None,
+        };
+        self.projects.current_mut().transform = Some(TransformSession::Text(
+            project::TextTransformSession {
+                selection: SelectionTransform {
+                    source,
+                    object,
+                    drag: GizmoHit::None,
+                    last_pt: (pt.0 as f32, pt.1 as f32),
+                    cut_source: false,
+                    start_angle: 0.0,
+                    start_pointer_angle: 0.0,
+                    start_drag: GizmoHit::None,
+                    start_pointer: (pt.0 as f32, pt.1 as f32),
+                    start_pos: (pt.0 as f32, pt.1 as f32),
+                    start_local_dims,
+                    start_anchor: (pt.0 as f32, pt.1 as f32),
+                    start_anchor_end: (AnchorEnd::Center, AnchorEnd::Center),
+                    start_pivot,
+                    start_flip_h: false,
+                    start_flip_v: false,
+                    start_alt: false,
+                    move_axis: None,
+                    drag_initialized: false,
+                    preview_dragging: false,
+                },
+                text: String::new(),
+                caret: 0,
+                font_name,
+                font_size,
+                color,
+                layout,
+            },
+        ));
+        self.transform_preview_key = None;
+    }
+
+    fn handle_text_interactions(&mut self, interactions: CanvasInteractions) {
+        if let Some(pt) = interactions
+            .clicked
+            .or(interactions.double_clicked)
+            .or_else(|| {
+                interactions
+                    .stroke_started
+                    .then_some(interactions.stroke_point)
+                    .flatten()
+            })
+        {
+            self.begin_text_transform(pt);
+        }
+    }
+
     fn handle_interactions_in(&mut self, ctx: &egui::Context, interactions: CanvasInteractions) {
         if self.projects.current_mut().transform.is_some() {
             self.handle_transform_interactions(interactions);
@@ -6369,6 +7226,24 @@ impl App {
                 }
             }
         }
+        // Clicking outside the canvas in the empty workplace area dismisses
+        // any active selection (when no drag/transform is in flight).
+        if self.projects.current().selection.is_some()
+            && self.projects.current().gesture.is_idle()
+            && interactions.clicked.is_none()
+            && interactions.double_clicked.is_none()
+            && !self.ctx.input(|i| i.modifiers.shift || i.modifiers.alt)
+        {
+            if let Some(pt) = self.workspace_empty_click() {
+                let canvas_w = self.projects.current().layers.width() as i32;
+                let canvas_h = self.projects.current().layers.height() as i32;
+                if pt.0 < 0 || pt.1 < 0 || pt.0 >= canvas_w || pt.1 >= canvas_h {
+                    self.deselect();
+                    return;
+                }
+            }
+        }
+
         // Selection tools own the right button: it means "subtract from the
         // selection", not the temporary eyedropper. Route them before the
         // eyedropper so the right-button gesture reaches the selection handler.
@@ -6389,6 +7264,10 @@ impl App {
         // animation on release. Route it before the generic eyedropper/match.
         if active_tool == Tool::AnimationPlacer {
             self.handle_animation_placer_interactions(interactions);
+            return;
+        }
+        if active_tool == Tool::Text {
+            self.handle_text_interactions(interactions);
             return;
         }
         if interactions.eyedropper_started {
@@ -6427,7 +7306,7 @@ impl App {
                 // Kept for exhaustiveness.
             }
             Tool::Fieldier => {}
-            Tool::AnimationPlacer => {
+            Tool::AnimationPlacer | Tool::Text => {
                 // Unreachable: `handle_interactions_in` routes
                 // Tool::AnimationPlacer to `handle_animation_placer_interactions`
                 // before the generic match. Kept for exhaustiveness.
@@ -7532,10 +8411,18 @@ impl App {
         if pt.0 < 0 || pt.1 < 0 {
             return;
         }
-        let project = self.projects.current_mut();
-        let composite = project.layers.composite_layers(&project.tile_palette);
-        if let Some(color) = composite.get_pixel(pt.0 as usize, pt.1 as usize) {
-            project.color = color;
+        let sampled = {
+            let project = self.projects.current_mut();
+            let composite = project.layers.composite_layers(&project.tile_palette);
+            if let Some(color) = composite.get_pixel(pt.0 as usize, pt.1 as usize) {
+                project.color = color;
+                Some(color)
+            } else {
+                None
+            }
+        };
+        if let Some(color) = sampled {
+            self.global_fg_color = color;
         }
     }
 
@@ -7560,6 +8447,7 @@ impl App {
         };
         self.projects.current_mut().clipboard = Some(clip.clone());
         self.push_os_clipboard_image(&clip);
+        self.show_status_toast("Copied selection.");
     }
 
     /// Cut the committed selection: copy to clipboard, clear the selected
@@ -7611,6 +8499,7 @@ impl App {
         self.push_os_clipboard_image(&clip);
         self.projects.current_mut().selection = None;
         self.mark_dirty();
+        self.show_status_toast("Cut selection.");
     }
 
     /// Clears the committed selection's pixels as one undoable step and leaves
@@ -7634,6 +8523,7 @@ impl App {
         };
         self.push_pixel_edit(Box::new(cmd));
         self.mark_dirty();
+        self.show_status_toast("Deleted selection.");
     }
 
     /// Mirrors the committed selection's pixels as one undoable step and keeps
@@ -7661,6 +8551,11 @@ impl App {
         };
         self.push_pixel_edit(Box::new(cmd));
         self.mark_dirty();
+        self.show_status_toast(if horizontal {
+            "Flipped selection horizontally."
+        } else {
+            "Flipped selection vertically."
+        });
     }
 
     /// Rotates the committed selection's pixels 90° clockwise as one undoable
@@ -7685,6 +8580,7 @@ impl App {
         };
         self.push_pixel_edit(Box::new(cmd));
         self.mark_dirty();
+        self.show_status_toast("Rotated selection 90° CW.");
     }
 
     /// Replaces the committed selection with its complement over the canvas, so
@@ -7703,6 +8599,7 @@ impl App {
             return;
         };
         self.projects.current_mut().selection = Some(inverted);
+        self.show_status_toast("Selection inverted.");
     }
 
     /// Paste the clipboard image AS A TRANSFORM OBJECT (Part B): the pasted
@@ -7722,6 +8619,7 @@ impl App {
             return;
         };
         self.begin_os_paste(cursor);
+        self.show_status_toast("Pasted as transform.");
     }
 
     /// Start an asynchronous OS clipboard read for paste (G3 finding #6).
@@ -7781,10 +8679,15 @@ impl App {
         self.start_transform_from_region(&region, cursor);
     }
 
-    /// The paste cursor in canvas coordinates: the exact pixel under the
-    /// pointer, or the nearest canvas pixel when the pointer is outside the
-    /// draw rect. `None` only when there is no pointer position at all.
+    /// The paste center in canvas coordinates: the center of the active
+    /// selection when one exists, otherwise the pixel under the pointer (or
+    /// the nearest canvas pixel when the pointer is outside the draw rect).
+    /// `None` only when there is no selection and no pointer position.
     fn paste_cursor_canvas(&self) -> Option<(i32, i32)> {
+        if let Some(sel) = &self.projects.current().selection {
+            let rect = sel.rect();
+            return Some((rect.x + rect.w / 2, rect.y + rect.h / 2));
+        }
         let pos = self.ctx.input(|i| i.pointer.latest_pos())?;
         let camera = self.projects.current().camera;
         let canvas_size = (
@@ -7895,6 +8798,7 @@ impl App {
         };
         if undone {
             self.projects.current_mut().mark_dirty();
+            self.show_status_toast("Undo");
         }
     }
 
@@ -7910,6 +8814,7 @@ impl App {
         };
         if redone {
             self.projects.current_mut().mark_dirty();
+            self.show_status_toast("Redo");
         }
     }
 
@@ -7990,6 +8895,134 @@ impl App {
     /// egui-winit maps `command = ctrl` on Linux but a backend/build where only
     /// `ctrl` is set must still work. The keymap path is kept so custom
     /// non-Command bindings work.
+    /// Keyboard handler active exclusively during a Text Transform session:
+    /// - WASD transform nudge and single-letter hotkeys are ALWAYS disabled so
+    ///   typing works uninterrupted.
+    /// - `Esc` cancels; `Ctrl+Enter` commits; `Enter` inserts a newline.
+    /// - Arrow keys / Home / End / Backspace / Delete / `Event::Text` edit the
+    ///   buffer at `caret` and re-rasterize immediately.
+    fn handle_text_transform_keys(&mut self) {
+        let frame_nr = self.ctx.cumulative_frame_nr();
+        if self.last_text_key_frame == Some(frame_nr) {
+            return;
+        }
+        self.last_text_key_frame = Some(frame_nr);
+        let mut cancel = false;
+        let mut commit = false;
+        let mut changed = false;
+
+        let events: Vec<egui::Event> = self.ctx.input(|i| i.events.clone());
+        let Some(t) = self
+            .projects
+            .current_mut()
+            .transform
+            .as_mut()
+            .and_then(TransformSession::text_mut)
+        else {
+            return;
+        };
+
+        let char_count = |s: &str| s.chars().count();
+        let byte_idx_at = |s: &str, char_pos: usize| -> usize {
+            s.char_indices()
+                .nth(char_pos)
+                .map(|(i, _)| i)
+                .unwrap_or(s.len())
+        };
+
+        for ev in events {
+            match ev {
+                egui::Event::Text(txt) => {
+                    let filtered: String = txt.chars().filter(|c| !c.is_control()).collect();
+                    if !filtered.is_empty() {
+                        let byte_i = byte_idx_at(&t.text, t.caret);
+                        t.text.insert_str(byte_i, &filtered);
+                        t.caret += filtered.chars().count();
+                        changed = true;
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => match key {
+                    egui::Key::Escape => {
+                        cancel = true;
+                    }
+                    egui::Key::Enter if modifiers.ctrl || modifiers.command => {
+                        commit = true;
+                    }
+                    egui::Key::Enter => {
+                        let byte_i = byte_idx_at(&t.text, t.caret);
+                        t.text.insert(byte_i, '\n');
+                        t.caret += 1;
+                        changed = true;
+                    }
+                    egui::Key::Backspace => {
+                        if t.caret > 0 {
+                            let b0 = byte_idx_at(&t.text, t.caret - 1);
+                            let b1 = byte_idx_at(&t.text, t.caret);
+                            t.text.replace_range(b0..b1, "");
+                            t.caret -= 1;
+                            changed = true;
+                        }
+                    }
+                    egui::Key::Delete => {
+                        if t.caret < char_count(&t.text) {
+                            let b0 = byte_idx_at(&t.text, t.caret);
+                            let b1 = byte_idx_at(&t.text, t.caret + 1);
+                            t.text.replace_range(b0..b1, "");
+                            changed = true;
+                        }
+                    }
+                    egui::Key::ArrowLeft => {
+                        t.caret = t.caret.saturating_sub(1);
+                    }
+                    egui::Key::ArrowRight => {
+                        t.caret = (t.caret + 1).min(char_count(&t.text));
+                    }
+                    egui::Key::ArrowUp => {
+                        t.caret = t.layout.move_caret_vertical(t.caret, -1);
+                    }
+                    egui::Key::ArrowDown => {
+                        t.caret = t.layout.move_caret_vertical(t.caret, 1);
+                    }
+                    egui::Key::Home => {
+                        let before: String = t.text.chars().take(t.caret).collect();
+                        let line_start = before
+                            .rfind('\n')
+                            .map(|idx| before[..=idx].chars().count())
+                            .unwrap_or(0);
+                        t.caret = line_start;
+                    }
+                    egui::Key::End => {
+                        let after: String = t.text.chars().skip(t.caret).collect();
+                        let delta = after
+                            .find('\n')
+                            .map(|idx| after[..idx].chars().count())
+                            .unwrap_or_else(|| after.chars().count());
+                        t.caret += delta;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        if cancel {
+            self.cancel_transform();
+            return;
+        }
+        if commit {
+            self.transform_session_commit();
+            return;
+        }
+        if changed {
+            self.re_rasterize_text_transform();
+        }
+    }
+
     fn handle_shortcuts(&mut self) {
         // While any in-app text input (TextEdit) holds keyboard focus, suppress
         // ALL global shortcuts (tool/panel/file/clipboard/undo) so typing in any
@@ -7999,6 +9032,43 @@ impl App {
         // focused non-text widget never blocks the hotkeys. Focus state persists
         // in egui's memory from the previous frame, so this reads correctly here.
         if self.ctx.text_edit_focused() {
+            return;
+        }
+        let new_document = self.ctx.input(|i| {
+            ((i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::N))
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::N,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.command || modifiers.ctrl
+                    )
+                })
+        });
+        if new_document {
+            self.open_create_document_panel();
+            return;
+        }
+        if self.projects.active_id().is_none() {
+            let open_project = self
+                .ctx
+                .input(|i| self.keymap.pressed(crate::input::Action::OpenProject, i));
+            if open_project {
+                self.file_open();
+            }
+            return;
+        }
+        if self
+            .projects
+            .current()
+            .transform
+            .as_ref()
+            .is_some_and(TransformSession::is_text)
+        {
+            self.handle_text_transform_keys();
             return;
         }
         if self.projects.current_mut().transform.is_some() {
@@ -8035,13 +9105,18 @@ impl App {
                     self.keymap
                         .pressed(crate::input::Action::CancelTransform, i),
                     i.key_pressed(egui::Key::Enter),
-                    i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::W),
-                    i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::S),
-                    i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::A),
-                    i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::D),
+                    i.key_pressed(egui::Key::ArrowUp)
+                        || (self.editor_options.wasd_transform_move && i.key_pressed(egui::Key::W)),
+                    i.key_pressed(egui::Key::ArrowDown)
+                        || (self.editor_options.wasd_transform_move && i.key_pressed(egui::Key::S)),
+                    i.key_pressed(egui::Key::ArrowLeft)
+                        || (self.editor_options.wasd_transform_move && i.key_pressed(egui::Key::A)),
+                    i.key_pressed(egui::Key::ArrowRight)
+                        || (self.editor_options.wasd_transform_move && i.key_pressed(egui::Key::D)),
                     i.modifiers.shift || i.modifiers.alt,
                 )
             });
+            let mut transform_toast: Option<&'static str> = None;
             if let Some(t) = self
                 .projects
                 .current_mut()
@@ -8051,25 +9126,31 @@ impl App {
             {
                 if rotate_cw {
                     t.object.rotate_by((90f32).to_radians());
+                    transform_toast = Some("Transform: Rotate 90° CW");
                 }
                 if rotate_ccw {
                     t.object.rotate_by((-90f32).to_radians());
+                    transform_toast = Some("Transform: Rotate 90° CCW");
                 }
                 if grow {
                     let (sx, sy) = t.object.scale_xy();
                     t.object
                         .resize((sx * 1.25).min(64.0), (sy * 1.25).min(64.0));
+                    transform_toast = Some("Transform: Grow");
                 }
                 if shrink {
                     let (sx, sy) = t.object.scale_xy();
                     t.object
                         .resize((sx / 1.25).max(0.01), (sy / 1.25).max(0.01));
+                    transform_toast = Some("Transform: Shrink");
                 }
                 if flip_h {
                     t.object.set_flips(!t.object.flip_h, t.object.flip_v);
+                    transform_toast = Some("Transform: Flip Horizontal");
                 }
                 if flip_v {
                     t.object.set_flips(t.object.flip_h, !t.object.flip_v);
+                    transform_toast = Some("Transform: Flip Vertical");
                 }
                 // T2-B: arrow keys / WASD translate the floating object by an
                 // integer pixel step, moving `pos` AND the pivot together so
@@ -8104,6 +9185,9 @@ impl App {
                     t.object.set_pivot((pivot.0 + dx, pivot.1 + dy));
                 }
             }
+            if let Some(msg) = transform_toast {
+                self.show_status_toast(msg);
+            }
             if esc {
                 // Esc CANCELS and restores both variants: a lifted selection
                 // goes back where it came from (nothing was cut yet, so no
@@ -8117,6 +9201,55 @@ impl App {
                 self.transform_session_commit();
             }
             return;
+        }
+        // Arrow keys on a committed selection lift it into a selection
+        // transform and nudge it by an integer pixel step, matching live
+        // transform arrow movement.
+        if let Some(rect) = self.projects.current().selection.as_ref().map(Selection::rect) {
+            let (move_up, move_down, move_left, move_right, step_large) = self.ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.shift || i.modifiers.alt,
+                )
+            });
+            let mut mdx = 0.0f32;
+            let mut mdy = 0.0f32;
+            if move_right {
+                mdx += 1.0;
+            }
+            if move_left {
+                mdx -= 1.0;
+            }
+            if move_down {
+                mdy += 1.0;
+            }
+            if move_up {
+                mdy -= 1.0;
+            }
+            if mdx != 0.0 || mdy != 0.0 {
+                self.lift_transform(rect);
+                if let Some(t) = self
+                    .projects
+                    .current_mut()
+                    .transform
+                    .as_mut()
+                    .and_then(TransformSession::selection_mut)
+                {
+                    let step = if step_large {
+                        TRANSFORM_KEY_MOVE_LARGE_STEP
+                    } else {
+                        1.0
+                    };
+                    let (dx, dy) = (mdx * step, mdy * step);
+                    t.object.pos = (t.object.pos.0 + dx, t.object.pos.1 + dy);
+                    let pivot = t.object.pivot();
+                    t.object.set_pivot((pivot.0 + dx, pivot.1 + dy));
+                }
+                return;
+            }
         }
         // UX item 2 conflict: while the Tile tool is active, X is the placer's
         // horizontal-flip modifier, so the Swap-Colors shortcut is suppressed
@@ -8145,6 +9278,7 @@ impl App {
             select_fill,
             select_tile_tool,
             select_animation_placer,
+            select_text,
             save_project,
             save_project_as,
             open_project,
@@ -8196,6 +9330,7 @@ impl App {
                 // animation placer tool.
                 self.keymap
                     .pressed(crate::input::Action::SelectAnimationPlacer, i),
+                self.keymap.pressed(crate::input::Action::SelectText, i) && !tile_tool_active,
                 // File operations (Ctrl+S / Ctrl+Shift+S / Ctrl+O). A live
                 // transform returns earlier, so these follow the existing
                 // policy of being ignored during a floating transform.
@@ -8205,6 +9340,35 @@ impl App {
                 self.keymap.pressed(crate::input::Action::OpenProject, i),
             )
         });
+        let (select_all, deselect, brush_shrink, brush_grow) = self.ctx.input(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            (
+                cmd && i.key_pressed(egui::Key::A),
+                cmd && i.key_pressed(egui::Key::D),
+                !cmd && !i.modifiers.alt && i.key_pressed(egui::Key::OpenBracket),
+                !cmd && !i.modifiers.alt && i.key_pressed(egui::Key::CloseBracket),
+            )
+        });
+        if select_all {
+            self.select_all();
+        }
+        if deselect {
+            self.deselect();
+        }
+        if brush_shrink || brush_grow {
+            let tool = self.projects.current().tool_state.tool();
+            if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
+                let current = self.projects.current().draw_settings(tool).size;
+                let next = if brush_grow {
+                    current.saturating_add(1).min(64)
+                } else {
+                    current.saturating_sub(1).max(1)
+                };
+                if next != current {
+                    self.apply_toolbar_events(vec![ToolbarEvent::BrushSizeChanged(next)]);
+                }
+            }
+        }
         if cancel_selection {
             // Esc cancels the selection.  A live transform is handled by the
             // branch above (its Esc cancels the floating object), so here the
@@ -8285,6 +9449,12 @@ impl App {
         }
         if select_animation_placer {
             self.select_animation_placer_tool();
+        }
+        if select_text {
+            self.projects
+                .current_mut()
+                .tool_state
+                .select_tool(Tool::Text);
         }
         // File shortcuts route through the SAME handlers as the menu actions.
         if save_project {
@@ -8709,9 +9879,10 @@ impl App {
                     .unwrap_or_else(|| String::from("Untitled"));
                 let session = self.projects.current_mut();
                 session.path = Some(path.clone());
-                session.name = name;
+                session.name = name.clone();
                 session.mark_saved();
                 self.projects.current_mut().last_error = None;
+                self.save_toast = Some((format!("{name} saved."), Instant::now()));
                 self.update_title();
                 self.clear_active_recovery();
                 true
@@ -8776,14 +9947,17 @@ impl App {
                     .unwrap_or_else(|| String::from("Untitled"));
                 let session = self.projects.current_mut();
                 session.path = Some(path.clone());
-                session.name = name;
+                session.name = name.clone();
                 session.mark_saved();
                 self.projects.current_mut().last_error = None;
+                self.save_toast = Some((format!("{name} saved."), Instant::now()));
                 self.update_title();
                 self.clear_active_recovery();
             }
             Err(err) => {
-                self.projects.current_mut().last_error = Some(format!("Failed to open: {err}"));
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error = Some(format!("Failed to open: {err}"));
+                }
             }
         }
     }
@@ -8876,16 +10050,92 @@ impl App {
                 if self.projects.active_id() != Some(project) {
                     return;
                 }
+                self.projects.current_mut().mark_saved();
+                self.close_project(project, project::CloseProject::Discard)
+                    .expect("saved pending close must remove its project");
+                self.update_title();
+            }
+            PendingAction::CloseWindow { project } => {
+                if self.projects.active_id() != Some(project) {
+                    return;
+                }
                 // The document is going away; clear the dirty flag so the
                 // follow-up CloseRequested skips the guard.
                 self.projects.current_mut().mark_saved();
                 self.close_project(project, project::CloseProject::Discard)
                     .expect("saved pending close must remove its project");
-                if self.projects.active_id().is_none() {
-                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                self.exit_guard_queue.retain(|&id| id != project);
+                self.advance_exit_guard();
             }
         }
+    }
+
+    /// Initiates application shutdown. Returns `true` if there are no dirty
+    /// documents and the event loop may exit immediately; returns `false` if
+    /// one or more dirty documents require user confirmation via the Unsaved
+    /// Changes guard queue.
+    fn request_app_close(&mut self) -> bool {
+        let dirty_ids: Vec<project::ProjectId> = self
+            .projects
+            .tabs()
+            .into_iter()
+            .filter(|tab| tab.dirty)
+            .map(|tab| tab.id)
+            .collect();
+        if dirty_ids.is_empty() {
+            return true;
+        }
+        self.exit_guard_queue = dirty_ids;
+        self.exit_guard_total = self.exit_guard_queue.len();
+        self.exit_save_all_active = false;
+        self.advance_exit_guard();
+        false
+    }
+
+    /// Advances the app-exit dirty-document queue to the next remaining dirty
+    /// project, or closes the window once all queued documents are handled.
+    fn advance_exit_guard(&mut self) {
+        // Drop any projects that were already closed or are no longer dirty.
+        self.exit_guard_queue.retain(|id| {
+            self.projects
+                .session(*id)
+                .is_some_and(|s| s.is_dirty())
+        });
+
+        let Some(&next_id) = self.exit_guard_queue.first() else {
+            self.exit_save_all_active = false;
+            self.exit_guard_total = 0;
+            self.exit_requested = true;
+            self.sync_workspace_layout();
+            self.save_workspace_layout();
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+            return;
+        };
+
+        if self.projects.active_id() != Some(next_id) {
+            let _ = self.activate_project(next_id);
+        }
+        if self.projects.active_id() == Some(next_id) {
+            self.projects.current_mut().pending_action =
+                Some(PendingAction::CloseWindow { project: next_id });
+            if self.exit_save_all_active {
+                // Save sequentially: if the document already has a path,
+                // `guard_save()` saves it synchronously and advances to the
+                // next queued document; otherwise Save As opens and pauses
+                // until the user saves (continuing) or cancels (aborting exit).
+                self.guard_save();
+            }
+        }
+    }
+
+    /// Cancels any active app-exit dirty-document queue.
+    fn cancel_exit_guard(&mut self) {
+        self.exit_guard_queue.clear();
+        self.exit_guard_total = 0;
+        self.exit_save_all_active = false;
     }
 
     /// Guard "Save": persist first, then run the deferred action only if the
@@ -8902,14 +10152,49 @@ impl App {
         saved
     }
 
+    /// Guard "Save All": sequentially save every remaining dirty document in
+    /// the app-exit queue (opening Save As for unsaved documents) then exit.
+    fn guard_save_all(&mut self) {
+        self.exit_save_all_active = true;
+        self.guard_save();
+    }
+
     /// Guard "Discard": drop the edits and run the deferred action.
     fn guard_discard(&mut self) {
         self.execute_pending();
     }
 
+    /// Guard "Discard All": discard all remaining dirty documents in the
+    /// app-exit queue without saving and close the application.
+    fn guard_discard_all(&mut self) {
+        let ids: Vec<project::ProjectId> = self.exit_guard_queue.drain(..).collect();
+        self.exit_guard_total = 0;
+        self.exit_save_all_active = false;
+        for id in ids {
+            if let Some(session) = self.projects.session_mut(id) {
+                session.mark_saved();
+                session.pending_action = None;
+            }
+            let _ = self.close_project(id, project::CloseProject::Discard);
+        }
+        if self.projects.active_id().is_some() {
+            self.projects.current_mut().pending_action = None;
+        }
+        self.exit_requested = true;
+        self.sync_workspace_layout();
+        self.save_workspace_layout();
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
     /// Guard "Cancel": keep the current document, drop the deferred action.
     fn guard_cancel(&mut self) {
-        self.projects.current_mut().pending_action = None;
+        self.cancel_exit_guard();
+        if self.projects.active_id().is_some() {
+            self.projects.current_mut().pending_action = None;
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -8918,12 +10203,13 @@ impl App {
     }
 
     fn update_title(&mut self) {
-        if self.projects.active_id().is_none() {
-            return;
-        }
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        if self.projects.active_id().is_none() {
+            window.set_title("Pyxross Workshop");
+            return;
+        }
         let marker = if self.projects.current().is_dirty() {
             " *"
         } else {
@@ -9002,12 +10288,21 @@ impl App {
 
         let name = self.projects.current().name.clone();
         self.unsaved_guard_host.set_document_name(name);
+        if matches!(
+            self.projects.current().pending_action,
+            Some(PendingAction::CloseWindow { .. })
+        ) {
+            self.unsaved_guard_host
+                .set_queue_progress(self.exit_guard_queue.len(), self.exit_guard_total);
+        } else {
+            self.unsaved_guard_host.set_queue_progress(1, 1);
+        }
         if self.panel_dock.placement(panel_id).is_some() {
             return;
         }
         let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(420.0, 260.0),
-            egui::vec2(320.0, 120.0),
+            egui::pos2(360.0, 260.0),
+            dock_unsaved_guard_panel::UNSAVED_GUARD_MIN_SIZE,
         );
         let spec = dock_unsaved_guard_panel::unsaved_guard_panel_spec(
             &self.unsaved_guard_host,
@@ -9024,8 +10319,14 @@ impl App {
                 dock_unsaved_guard_panel::UnsavedGuardEvent::Save => {
                     self.guard_save();
                 }
+                dock_unsaved_guard_panel::UnsavedGuardEvent::SaveAll => {
+                    self.guard_save_all();
+                }
                 dock_unsaved_guard_panel::UnsavedGuardEvent::Discard => {
                     self.guard_discard();
+                }
+                dock_unsaved_guard_panel::UnsavedGuardEvent::DiscardAll => {
+                    self.guard_discard_all();
                 }
                 dock_unsaved_guard_panel::UnsavedGuardEvent::Cancel => {
                     self.guard_cancel();
@@ -9521,8 +10822,10 @@ impl App {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to import PNG: {err}"));
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import PNG: {err}"));
+                }
                 return;
             }
         };
@@ -9537,8 +10840,10 @@ impl App {
                 self.open_import_image_panel(path.to_path_buf(), img_w, img_h);
             }
             Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to import PNG: {err}"));
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import PNG: {err}"));
+                }
             }
         }
     }
@@ -9552,8 +10857,10 @@ impl App {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to import GIF: {err}"));
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import GIF: {err}"));
+                }
                 return;
             }
         };
@@ -9569,8 +10876,10 @@ impl App {
                 self.open_import_gif_panel(path.to_path_buf(), frame_count, frame_w, frame_h);
             }
             Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to import GIF: {err}"));
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import GIF: {err}"));
+                }
             }
         }
     }
@@ -9597,6 +10906,480 @@ impl App {
         );
     }
 
+    /// Import a Pyxel Edit `.pyxel` file via the in-app file chooser.
+    fn file_import_pyxel(&mut self) {
+        self.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportPyxel,
+            self.default_save_location(),
+        );
+    }
+
+    fn file_import_pyxel_pick(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import .pyxel: {err}"));
+                }
+                return;
+            }
+        };
+        let fallback_name = import_document_name(path);
+        match crate::core::pyxel::import_pyxel_bytes(&bytes, &fallback_name) {
+            Ok(imported) => {
+                self.open_import_pyxel_panel(path.to_path_buf(), imported);
+            }
+            Err(err) => {
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import .pyxel: {err}"));
+                }
+            }
+        }
+    }
+
+    fn open_import_pyxel_panel(
+        &mut self,
+        path: PathBuf,
+        imported: crate::core::pyxel::PyxelImport,
+    ) {
+        {
+            let mut view = self.import_pyxel_host.view.borrow_mut();
+            view.file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            view.doc_name = imported.name.clone();
+            view.width = imported.width;
+            view.height = imported.height;
+            view.tile_w = imported.tile_size.w;
+            view.tile_h = imported.tile_size.h;
+            view.layer_count = imported.layers.len();
+            view.tile_count = imported.tile_palette.tiles.len();
+            view.animation_count = imported.animations.len();
+            view.palette_colors = imported.palette.as_ref().map_or(0, |p| p.colors.len());
+            view.preview_rgba = imported.preview_rgba.clone();
+            view.preview_generation = view.preview_generation.wrapping_add(1);
+            view.error = None;
+        }
+        self.pending_pyxel_import = Some((path, imported));
+        let panel_id = panel_dock::PanelId::new(dock_import_pyxel_panel::IMPORT_PYXEL_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(360.0, 140.0),
+            egui::vec2(460.0, 420.0),
+        );
+        let spec = dock_import_pyxel_panel::import_pyxel_panel_spec(
+            &self.import_pyxel_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_import_pyxel_events(&mut self) {
+        let events = self.import_pyxel_host.take_events();
+        if events.is_empty() {
+            return;
+        }
+        let panel_id = panel_dock::PanelId::new(dock_import_pyxel_panel::IMPORT_PYXEL_PANEL_ID);
+        for event in events {
+            match event {
+                dock_import_pyxel_panel::ImportPyxelEvent::Cancel => {
+                    self.pending_pyxel_import = None;
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_import_pyxel_panel::ImportPyxelEvent::Import => {
+                    if let Some((_path, imported)) = self.pending_pyxel_import.take() {
+                        let project =
+                            self.new_project(imported.name, imported.width, imported.height);
+                        if let Some(session) = self.projects.session_mut(project) {
+                            session.tile_size = imported.tile_size;
+                            session.layers = imported.layers;
+                            session.tile_palette = imported.tile_palette;
+                            session.animations = imported.animations;
+                            let mut palettes = load_palettes(user_palette_dir().as_deref());
+                            if let Some(pal) = imported.palette {
+                                if !pal.colors.is_empty() {
+                                    session.color = Color::rgba(
+                                        pal.colors[0][0],
+                                        pal.colors[0][1],
+                                        pal.colors[0][2],
+                                        pal.colors[0][3],
+                                    );
+                                }
+                                palettes.insert(0, pal);
+                                session.active_palette = 0;
+                            }
+                            session.palettes = palettes;
+                        }
+                        self.texture_dirty = true;
+                        self.canvas_cache_token = None;
+                        self.sync_anim_delays();
+                        self.update_title();
+                        let name = self.projects.current().name.clone();
+                        self.show_status_toast(format!("{name} imported."));
+                    }
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+            }
+        }
+    }
+
+    fn file_export_pyxel(&mut self) {
+        let session = self.projects.current();
+        let active_pal = session.palettes.get(session.active_palette);
+        let bytes = match crate::core::pyxel::export_pyxel_bytes(
+            &session.name,
+            session.tile_size,
+            &session.layers,
+            &session.tile_palette,
+            &session.animations,
+            active_pal,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.projects.current_mut().last_error =
+                    Some(format!("Failed to export .pyxel: {err}"));
+                return;
+            }
+        };
+        self.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::Pyxel,
+            Some(dock_save_as_panel::SavePayload::Pyxel(bytes)),
+        );
+    }
+
+    fn handle_dropped_file(&mut self, path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.remember_last_dir(parent);
+            }
+        }
+        if path.is_dir() && path.join("manifest.json").is_file() {
+            self.load_project(path);
+            return;
+        }
+        if path.file_name().is_some_and(|n| n == "manifest.json") {
+            self.load_project(path);
+            return;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "pyxross" => self.load_project(path),
+            "gif" => self.file_import_gif_pick(&path),
+            "pyxel" => self.file_import_pyxel_pick(&path),
+            "ase" | "aseprite" => self.file_import_aseprite_pick(&path),
+            "png" => self.file_import_png_pick(&path),
+            "jpg" | "jpeg" | "bmp" | "webp" | "tga" => self.file_import_img2pixel_pick(&path),
+            _ => self.show_status_toast("Unsupported file format."),
+        }
+    }
+
+    fn file_import_img2pixel(&mut self) {
+        self.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportImage2Pixel,
+            self.default_save_location(),
+        );
+    }
+
+    fn file_import_img2pixel_pick(&mut self, path: &std::path::Path) {
+        let img = match image::open(path) {
+            Ok(img) => img.to_rgba8(),
+            Err(err) => {
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to open image: {err}"));
+                }
+                return;
+            }
+        };
+        let (w, h) = img.dimensions();
+        let name = import_document_name(path);
+        let has_active = self.projects.active_id().is_some();
+        let project_palette = if has_active {
+            let s = self.projects.current();
+            s.palettes
+                .get(s.active_palette)
+                .map(|p| p.colors.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.img2pixel_host.borrow_mut().seed(
+            name,
+            w,
+            h,
+            img.into_raw(),
+            project_palette,
+            has_active,
+        );
+        let panel_id = panel_dock::PanelId::new(dock_img2pixel_panel::IMPORT_IMG2PIXEL_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(160.0, 90.0),
+            egui::vec2(720.0, 540.0),
+        );
+        let spec = dock_img2pixel_panel::img2pixel_panel_spec(
+            self.img2pixel_host.clone(),
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_img2pixel_events(&mut self) {
+        let events = self.img2pixel_host.borrow_mut().take_events();
+        if events.is_empty() {
+            return;
+        }
+        let panel_id = panel_dock::PanelId::new(dock_img2pixel_panel::IMPORT_IMG2PIXEL_PANEL_ID);
+        for event in events {
+            match event {
+                dock_img2pixel_panel::Img2PixelEvent::Cancel => {
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_img2pixel_panel::Img2PixelEvent::ImportAsNewDocument { name, output } => {
+                    let w = output.width.max(1) as usize;
+                    let h = output.height.max(1) as usize;
+                    let project = self.new_project(name.clone(), w, h);
+                    if let Some(session) = self.projects.session_mut(project) {
+                        session.tile_size = TileSize::new(output.width.max(1), output.height.max(1));
+                        let rect = Rect2i::new(0, 0, w as i32, h as i32);
+                        session
+                            .layers
+                            .active_layer_mut()
+                            .buffer
+                            .blit_region(rect, &output.rgba);
+                        if let Some(cols) = output.extracted_palette {
+                            if !cols.is_empty() {
+                                let pal = crate::core::Palette {
+                                    version: 1,
+                                    name: format!("{name} Palette"),
+                                    colors: cols,
+                                };
+                                session.color = Color::rgba(
+                                    pal.colors[0][0],
+                                    pal.colors[0][1],
+                                    pal.colors[0][2],
+                                    pal.colors[0][3],
+                                );
+                                session.palettes.insert(0, pal);
+                                session.active_palette = 0;
+                            }
+                        }
+                    }
+                    self.texture_dirty = true;
+                    self.canvas_cache_token = None;
+                    self.update_title();
+                    self.show_status_toast(format!("{name} imported."));
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_img2pixel_panel::Img2PixelEvent::ImportToActiveLayer { output } => {
+                    if self.projects.active_id().is_some() {
+                        if let Some(region) = ClipboardRegion::try_new(
+                            output.width as usize,
+                            output.height as usize,
+                            output.rgba,
+                        ) {
+                            let center = self.paste_cursor_canvas().unwrap_or_else(|| {
+                                let s = self.projects.current();
+                                (s.layers.width() as i32 / 2, s.layers.height() as i32 / 2)
+                            });
+                            self.start_transform_from_region(&region, center);
+                            self.show_status_toast("Imported to active layer.");
+                        }
+                    }
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+            }
+        }
+    }
+
+    fn file_import_aseprite(&mut self) {
+        self.open_file_chooser(
+            dock_file_chooser_panel::FileChooserMode::ImportAseprite,
+            self.default_save_location(),
+        );
+    }
+
+    fn file_import_aseprite_pick(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import .ase: {err}"));
+                }
+                return;
+            }
+        };
+        match crate::core::aseprite::parse_aseprite_bytes(&bytes) {
+            Ok(parsed) => {
+                self.open_import_aseprite_panel(path.to_path_buf(), parsed);
+            }
+            Err(err) => {
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error =
+                        Some(format!("Failed to import .ase: {err}"));
+                }
+            }
+        }
+    }
+
+    fn open_import_aseprite_panel(
+        &mut self,
+        path: PathBuf,
+        parsed: crate::core::aseprite::ParsedAseprite,
+    ) {
+        {
+            let mut view = self.import_aseprite_host.view.borrow_mut();
+            view.file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            view.mode = if parsed.tags.is_empty() {
+                dock_import_aseprite_panel::AsepriteUiMode::RowLength
+            } else {
+                dock_import_aseprite_panel::AsepriteUiMode::SplitByTags
+            };
+            view.line_length_text = parsed.frames.len().clamp(1, 8).to_string();
+            view.parsed = Some(parsed.clone());
+            view.refresh_preview();
+        }
+        self.pending_aseprite_import = Some((path, parsed));
+        let panel_id =
+            panel_dock::PanelId::new(dock_import_aseprite_panel::IMPORT_ASEPRITE_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(340.0, 120.0),
+            egui::vec2(480.0, 460.0),
+        );
+        let spec = dock_import_aseprite_panel::import_aseprite_panel_spec(
+            &self.import_aseprite_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_import_aseprite_events(&mut self) {
+        let events = self.import_aseprite_host.take_events();
+        if events.is_empty() {
+            return;
+        }
+        let panel_id =
+            panel_dock::PanelId::new(dock_import_aseprite_panel::IMPORT_ASEPRITE_PANEL_ID);
+        for event in events {
+            match event {
+                dock_import_aseprite_panel::ImportAsepriteEvent::Cancel => {
+                    self.pending_aseprite_import = None;
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_import_aseprite_panel::ImportAsepriteEvent::Import(mode) => {
+                    if let Some((path, parsed)) = self.pending_aseprite_import.take() {
+                        let name = import_document_name(&path);
+                        match crate::core::aseprite::build_aseprite_import(&parsed, &name, mode) {
+                            Ok(imp) => {
+                                let project =
+                                    self.new_project(imp.name, imp.width, imp.height);
+                                if let Some(session) = self.projects.session_mut(project) {
+                                    session.tile_size = TileSize::new(imp.frame_w, imp.frame_h);
+                                    session.layers = imp.layers;
+                                    session.animations = imp.animations;
+                                    let mut palettes =
+                                        load_palettes(user_palette_dir().as_deref());
+                                    if let Some(pal) = imp.palette {
+                                        if !pal.colors.is_empty() {
+                                            session.color = Color::rgba(
+                                                pal.colors[0][0],
+                                                pal.colors[0][1],
+                                                pal.colors[0][2],
+                                                pal.colors[0][3],
+                                            );
+                                        }
+                                        palettes.insert(0, pal);
+                                        session.active_palette = 0;
+                                    }
+                                    session.palettes = palettes;
+                                }
+                                self.texture_dirty = true;
+                                self.canvas_cache_token = None;
+                                self.sync_anim_delays();
+                                self.update_title();
+                                let name = self.projects.current().name.clone();
+                                self.show_status_toast(format!("{name} imported."));
+                            }
+                            Err(err) => {
+                                if self.projects.active_id().is_some() {
+                                    self.projects.current_mut().last_error = Some(err);
+                                }
+                            }
+                        }
+                    }
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+            }
+        }
+    }
+
+    fn file_export_aseprite(&mut self) {
+        let session = self.projects.current();
+        let active_pal = session.palettes.get(session.active_palette);
+        let timeline = match crate::core::aseprite::export_aseprite_bytes(
+            &session.layers,
+            &session.tile_palette,
+            &session.animations,
+            active_pal,
+            session.tile_size,
+            false,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.projects.current_mut().last_error =
+                    Some(format!("Failed to export .ase: {err}"));
+                return;
+            }
+        };
+        let unified = match crate::core::aseprite::export_aseprite_bytes(
+            &session.layers,
+            &session.tile_palette,
+            &session.animations,
+            active_pal,
+            session.tile_size,
+            true,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.projects.current_mut().last_error =
+                    Some(format!("Failed to export .ase: {err}"));
+                return;
+            }
+        };
+        self.save_as_host.view.borrow_mut().aseprite_unified_frames = false;
+        self.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::Aseprite,
+            Some(dock_save_as_panel::SavePayload::Aseprite { unified, timeline }),
+        );
+    }
+
     fn ui_frame(&mut self, ui: &mut egui::Ui) {
         debug_assert!(self.panel_layout.validate().is_ok());
         debug_assert!(self.workspace_layout.validate().is_ok());
@@ -9606,13 +11389,13 @@ impl App {
         if let Some(snapshot) = self.context_snapshot() {
             debug_assert!(snapshot.accepts(snapshot.project(), snapshot.generation()));
         }
-        if self.projects.active_id().is_none() {
-            return;
-        }
+        let has_active_project = self.projects.active_id().is_some();
         // Consume any async OS clipboard read (G3 finding #6) before the
         // shortcuts run, so a Ctrl+V result opens its paste session promptly
         // without the render thread ever blocking on `get_image()`.
-        self.poll_os_paste();
+        if has_active_project {
+            self.poll_os_paste();
+        }
         self.sync_skin_atlas();
         self.handle_shortcuts();
 
@@ -9643,22 +11426,104 @@ impl App {
         // canvas must own the body. The viewport is the BODY rect (the frame
         // minus the top bar) — the very rect `show_inside` lays the panels out
         // in — so a pointer inside the top bar is owned by the bar, not a panel.
-        let target = pointer
-            .filter(|p| body_rect.contains(*p))
-            .map(|p| self.surface_at_pointer(p, body_rect));
+        let target = if self.panel_dock.is_interacting() {
+            None
+        } else {
+            pointer
+                .filter(|p| body_rect.contains(*p))
+                .map(|p| self.surface_at_pointer(p, body_rect))
+        };
         self.input_capture.set_target(target);
 
-        self.refresh_transform_preview();
-        let canvas_size = (
-            self.projects.current_mut().layers.width() as u32,
-            self.projects.current_mut().layers.height() as u32,
-        );
-        let texture_id = self.canvas_texture.as_ref().map(|t| t.id());
+        if has_active_project {
+            self.refresh_transform_preview();
+        }
+        let canvas_size = if has_active_project {
+            (
+                self.projects.current_mut().layers.width() as u32,
+                self.projects.current_mut().layers.height() as u32,
+            )
+        } else {
+            (0, 0)
+        };
+        let texture_id = has_active_project
+            .then(|| self.canvas_texture.as_ref().map(|t| t.id()))
+            .flatten();
         // The canvas + dock run inside a BODY child Ui (frame minus the top
         // bar): interior `ui.max_rect()` / `available_size` see `body_rect`, so
         // the dock viewport and the canvas painter shrink below the bar and
         // never spill into it.
         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+        ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+        {
+            let left_inset = if self.panel_dock_demo
+                && !self.panel_dock.dock_order(panel_dock::DockSide::Left).is_empty()
+            {
+                self.panel_dock.dock_extent(panel_dock::DockSide::Left)
+            } else {
+                0.0
+            };
+            let right_inset = if self.panel_dock_demo
+                && !self.panel_dock.dock_order(panel_dock::DockSide::Right).is_empty()
+            {
+                self.panel_dock.dock_extent(panel_dock::DockSide::Right)
+            } else {
+                0.0
+            };
+            let bottom_inset = if self.panel_dock_demo
+                && !self.panel_dock.dock_order(panel_dock::DockSide::Bottom).is_empty()
+            {
+                self.panel_dock.dock_extent(panel_dock::DockSide::Bottom)
+            } else {
+                0.0
+            };
+            let workspace_rect = egui::Rect::from_min_max(
+                egui::pos2(body_rect.left() + left_inset, body_rect.top()),
+                egui::pos2(
+                    (body_rect.right() - right_inset).max(body_rect.left() + left_inset),
+                    (body_rect.bottom() - bottom_inset).max(body_rect.top()),
+                ),
+            );
+            if workspace_rect.width() >= 96.0 && workspace_rect.height() >= 96.0 {
+                let bg = ui.visuals().panel_fill;
+                let watermark_color = egui::Color32::from_rgba_unmultiplied(
+                    bg.r().saturating_sub(10),
+                    bg.g().saturating_sub(10),
+                    bg.b().saturating_sub(10),
+                    255,
+                );
+                let logo_side = (workspace_rect.width().min(workspace_rect.height()) * 0.28)
+                    .clamp(96.0, 208.0);
+                let logo_center_y = if has_active_project {
+                    workspace_rect.center().y
+                } else {
+                    workspace_rect.center().y - 16.0
+                };
+                let logo_rect = egui::Rect::from_center_size(
+                    egui::pos2(workspace_rect.center().x, logo_center_y),
+                    egui::vec2(logo_side, logo_side),
+                );
+                top_bar::paint_new_document_watermark(ui.painter(), logo_rect, watermark_color);
+                if !has_active_project {
+                    let shortcut = if cfg!(target_os = "macos") {
+                        "Cmd+N"
+                    } else {
+                        "Ctrl+N"
+                    };
+                    let hint = format!(
+                        "Press the New Document button or use {shortcut} to create a new document."
+                    );
+                    ui.painter().text(
+                        egui::pos2(workspace_rect.center().x, logo_rect.bottom() + 18.0),
+                        egui::Align2::CENTER_TOP,
+                        hint,
+                        egui::FontId::proportional(14.0),
+                        watermark_color,
+                    );
+                }
+            }
+        }
+        if has_active_project {
         if let Some(texture_id) = texture_id {
             let camera = self.projects.current().camera;
             let tool = self.projects.current().tool_state.tool();
@@ -9681,7 +11546,7 @@ impl App {
                 .current()
                 .transform
                 .as_ref()
-                .is_some_and(|t| matches!(t, TransformSession::Selection(_)));
+                .is_some_and(|t| matches!(t, TransformSession::Selection(_) | TransformSession::Text(_)));
             let marquee_probe = self.marquee_probe_at(ui.ctx(), camera, canvas_size);
             let view = CanvasView {
                 canvas_size,
@@ -9717,6 +11582,17 @@ impl App {
             // X/Z/R/Q transform) and the tile_id labels track the pointer
             // and the palette instantly.
             self.tile_placer_preview = self.tile_placer_preview_at(ui.ctx(), camera, canvas_size);
+            let text_caret = match &self.projects.current().transform {
+                Some(TransformSession::Text(t)) => {
+                    let (cx, cy, ch) = t.layout.caret_rect(t.caret);
+                    Some((
+                        t.selection.object.local_to_canvas((cx, cy)),
+                        t.selection.object.local_to_canvas((cx, cy + ch)),
+                    ))
+                }
+                _ => None,
+            };
+            self.canvas_widget.set_text_caret(text_caret);
             self.canvas_widget.set_overlay(self.current_overlay());
             let interactions = self.canvas_widget.ui(
                 ui,
@@ -9774,37 +11650,47 @@ impl App {
                 self.handle_interactions_in(ui.ctx(), interactions);
             }
         }
-        let preview_image = self.canvas_texture.as_ref().map(|texture| {
-            (
-                texture.id(),
-                egui::vec2(canvas_size.0 as f32, canvas_size.1 as f32),
-            )
-        });
+        let preview_image = has_active_project
+            .then(|| {
+                self.canvas_texture.as_ref().map(|texture| {
+                    (
+                        texture.id(),
+                        egui::vec2(canvas_size.0 as f32, canvas_size.1 as f32),
+                    )
+                })
+            })
+            .flatten();
         self.panel_dock.preview_feed().set(preview_image);
-        // Publish the active animation frame's region to the Preview panel
-        // (id 204): the shared canvas texture plus its full size and the frame
-        // rect, clamped to the canvas so a stale/oversized region cannot sample
-        // outside the sheet.
-        self.frame_preview_feed.set(self.active_frame_preview());
-        // Publish the Frame Edit panel's snapshot (id 203): its own camera,
-        // canvas view, onion overlay, shared texture and cursor before the dock
-        // renders it. The App drains the viewport's interactions after.
-        self.publish_frame_edit_view();
+        if has_active_project {
+            // Publish the active animation frame's region to the Preview panel
+            // (id 204): the shared canvas texture plus its full size and the frame
+            // rect, clamped to the canvas so a stale/oversized region cannot sample
+            // outside the sheet.
+            self.frame_preview_feed.set(self.active_frame_preview());
+            // Publish the Frame Edit panel's snapshot (id 203): its own camera,
+            // canvas view, onion overlay, shared texture and cursor before the dock
+            // renders it. The App drains the viewport's interactions after.
+            self.publish_frame_edit_view();
+        }
         if ui.ctx().input(|input| input.key_pressed(egui::Key::F12)) {
             self.panel_dock_demo = !self.panel_dock_demo;
         }
         // Per-frame snapshots for the dock panels (Toolbox + Layers): the
         // panels are pure views over typed cells the App writes before render.
-        self.write_dock_snapshots();
-        self.sync_layer_settings_panel();
-        self.sync_animation_settings_panel();
+        if has_active_project {
+            self.write_dock_snapshots();
+            self.sync_layer_settings_panel();
+            self.sync_animation_settings_panel();
+        }
+        }
         if self.panel_dock_demo {
             let chrome = PanelChrome {
                 colors: &self.theme.current().colors,
                 theme: self.theme.current(),
-                atlases: self.skin_atlas_cache.as_ref().map(|(_, _, cache)| cache),
+                atlases: None,
                 capture: &self.input_capture,
                 surface: SurfaceId::Canvas,
+                rounding: self.ui_style.clamped_rounding(),
             };
             self.panel_dock.show_inside(ui, &chrome);
             // Drain every frame so dock actions cannot accumulate; Close
@@ -9813,12 +11699,16 @@ impl App {
             self.handle_dock_actions(actions);
             // Drain the dock panel events into the model/undo exactly once
             // per frame (the panels only ever push into the host cells).
-            self.drain_dock_events();
+            if has_active_project {
+                self.drain_dock_events();
+            }
             // The Frame Edit viewport stores its interactions during render;
             // feed them through the same gesture pipeline as the main canvas.
             let frame_edit_interactions = self.frame_edit_host.interactions.borrow_mut().take();
-            if let Some(interactions) = frame_edit_interactions {
-                self.handle_frame_edit_interactions(interactions);
+            if has_active_project {
+                if let Some(interactions) = frame_edit_interactions {
+                    self.handle_frame_edit_interactions(interactions);
+                }
             }
         }
         });
@@ -9834,15 +11724,44 @@ impl App {
         self.drain_file_chooser_events();
         // Apply the Import GIF panel's events (sheet layout + grow canvas).
         self.drain_import_gif_events();
+        // Apply the Import Pyxel panel's events (confirm/cancel).
+        self.drain_import_pyxel_events();
+        // Apply the Import Aseprite panel's events (confirm/cancel).
+        self.drain_import_aseprite_events();
         // Apply the Import Image panel's events (grid split + grow canvas).
         self.drain_import_image_events();
+        // Apply Style panel events (presets, rounding, custom colors, save/load).
+        self.drain_style_events();
+        // Apply Select Banner panel events (thumbnail selection + refresh).
+        self.drain_banner_picker_events();
+        // Apply Key Bindings panel events (apply/reset + persist).
+        self.drain_keybindings_events();
+        // Apply Editor Options panel events.
+        self.drain_editor_options_events();
+        self.drain_credits_events();
+        self.drain_img2pixel_events();
 
         // Fixed top bar — painted LAST in the central-panel layer, after the
         // canvas and the docked panels, so it is above both. Floating dock
         // windows are `egui::Window`s in `Order::Middle` and therefore stay
         // above the bar (and are constrained to `body_rect`, so they cannot be
         // dragged into the bar's band either).
+        self.sync_banner_texture();
         self.top_bar.set_tabs(self.projects.tabs());
+        self.top_bar
+            .set_edit_shortcuts(top_bar::EditMenuShortcuts::from_keymap(&self.keymap));
+        self.top_bar.set_banner(
+            self.banner_texture
+                .as_ref()
+                .map(|(_, tex, size)| (tex.id(), *size)),
+        );
+        if self.projects.active_id().is_some() {
+            let session = self.projects.current();
+            self.global_fg_color = session.color;
+            self.global_bg_color = session.secondary_color;
+        }
+        self.top_bar
+            .set_colors(self.global_fg_color, self.global_bg_color);
         let colors = self.theme.current().colors;
         self.top_bar.ui(ui, &top_bar_layout, &colors);
         let top_bar_events = self.top_bar.drain_events();
@@ -9858,7 +11777,33 @@ impl App {
         // so silent no-ops are
         // VISIBLE instead of disappearing without a trace. Painted last so
         // it sits above the dock overlay.
-        if let Some(message) = self.projects.current().last_error.as_deref() {
+        // Re-check live active_id because top-bar / guard events above may
+        // have closed the last open document without closing the app.
+        let still_has_active_project = self.projects.active_id().is_some();
+        if still_has_active_project {
+            if let Some(msg) = self.projects.current().last_error.clone() {
+                let elapsed = match &self.last_error_seen {
+                    Some((prev, started)) if prev == &msg => started.elapsed().as_secs_f32(),
+                    _ => {
+                        self.last_error_seen = Some((msg.clone(), Instant::now()));
+                        0.0
+                    }
+                };
+                if elapsed >= 5.0 {
+                    self.projects.current_mut().last_error = None;
+                    self.last_error_seen = None;
+                }
+            } else {
+                self.last_error_seen = None;
+            }
+        } else {
+            self.last_error_seen = None;
+        }
+
+        if let Some(message) = still_has_active_project
+            .then(|| self.projects.current().last_error.as_deref())
+            .flatten()
+        {
             let status_rect = egui::Rect::from_min_size(
                 egui::pos2(frame_rect.left() + 8.0, frame_rect.bottom() - 24.0),
                 egui::vec2(frame_rect.width() - 16.0, 20.0),
@@ -9879,62 +11824,57 @@ impl App {
                 ui.visuals().text_color(),
             );
         }
+
+        // Pyxel Edit-style save toast: "<filename> saved." in white font at
+        // the bottom, fading out smoothly over 2.5 seconds.
+        if let Some((text, started)) = &self.save_toast {
+            let elapsed = started.elapsed().as_secs_f32();
+            if elapsed >= 2.5 {
+                self.save_toast = None;
+            } else {
+                let alpha = if elapsed < 1.5 {
+                    1.0
+                } else {
+                    (1.0 - (elapsed - 1.5)).clamp(0.0, 1.0)
+                };
+                let faded = crate::ui::theme::SKIN_TINT.gamma_multiply(alpha);
+                ui.painter().text(
+                    egui::pos2(frame_rect.center().x, frame_rect.bottom() - 28.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    text,
+                    egui::FontId::proportional(15.0),
+                    faded,
+                );
+                ui.ctx().request_repaint();
+            }
+        }
+
+        if self.dropped_file_hovering {
+            ui.painter().rect_filled(
+                frame_rect,
+                0.0,
+                egui::Color32::from_black_alpha(120),
+            );
+            ui.painter().rect_stroke(
+                frame_rect.shrink(12.0),
+                6.0,
+                egui::Stroke::new(2.0, self.theme.current().colors.selection_stroke_color32()),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                frame_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop file to open or import",
+                egui::FontId::proportional(18.0),
+                crate::ui::theme::SKIN_TINT,
+            );
+        }
     }
 
-    /// (Re)load the skin atlases for the active theme.
-    ///
-    /// Resolves each distinct skin atlas path against the theme dir, decodes
-    /// the PNG, and uploads it as a NEAREST texture. The cache is keyed by
-    /// (theme name, theme dir) so it is rebuilt only when the theme changes;
-    /// load failures are logged and the chrome falls back to flat colors.
+    /// Nine-slice skin atlases are retired; always clears the cache so the UI
+    /// renders exclusively with flat vector chrome and [`UiStyle`].
     fn sync_skin_atlas(&mut self) {
-        let Some(dir) = self.theme.current_dir().map(Path::to_path_buf) else {
-            self.skin_atlas_cache = None;
-            return;
-        };
-        let theme = self.theme.current();
-        let mut paths: Vec<PathBuf> = theme
-            .skins
-            .values()
-            .map(|skin| PathBuf::from(&skin.atlas_path))
-            .collect();
-        paths.sort();
-        paths.dedup();
-        if paths.is_empty() {
-            self.skin_atlas_cache = None;
-            return;
-        }
-        let key = (theme.name.clone(), dir);
-        if let Some((cached_name, cached_dir, _)) = &self.skin_atlas_cache {
-            if cached_name == &key.0 && cached_dir == &key.1 {
-                return;
-            }
-        }
-        let mut cache = AtlasCache::new();
-        for path in &paths {
-            let resolved = key.1.join(path);
-            match load_atlas_with_size(&resolved) {
-                Ok((bytes, size)) => {
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [size.0 as usize, size.1 as usize],
-                        &bytes,
-                    );
-                    let texture = self.ctx.load_texture(
-                        format!("skin-atlas:{}", resolved.display()),
-                        image,
-                        egui::TextureOptions::NEAREST,
-                    );
-                    cache.insert(path.clone(), SkinAtlas::new(texture, size));
-                }
-                Err(error) => {
-                    eprintln!(
-                        "pyxross: skin atlas load failed for {}: {error}",
-                        resolved.display()
-                    );
-                }
-            }
-        }
-        self.skin_atlas_cache = Some((key.0, key.1, cache));
+        self.skin_atlas_cache = None;
     }
 
     fn redraw(&mut self) {
@@ -10145,14 +12085,18 @@ impl ApplicationHandler for App {
             None,
         );
 
-        let composite = {
-            let session = self.projects.current();
-            session.layers.composite_layers(&session.tile_palette)
+        let image = if self.projects.active_id().is_some() {
+            let composite = {
+                let session = self.projects.current();
+                session.layers.composite_layers(&session.tile_palette)
+            };
+            egui::ColorImage::from_rgba_unmultiplied(
+                [composite.width(), composite.height()],
+                composite.as_bytes(),
+            )
+        } else {
+            egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)
         };
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [composite.width(), composite.height()],
-            composite.as_bytes(),
-        );
         let texture = self
             .ctx
             .load_texture("canvas", image, egui::TextureOptions::NEAREST);
@@ -10164,7 +12108,10 @@ impl ApplicationHandler for App {
         self.texture_dirty = false;
         // The egui-winit stack ships the `clipboard` feature (arboard), so
         // `Context::copy_image` reaches the OS image clipboard on this host.
-        self.projects.current_mut().os_clipboard_available = true;
+        self.os_clipboard_available = true;
+        if self.projects.active_id().is_some() {
+            self.projects.current_mut().os_clipboard_available = true;
+        }
         self.canvas_cache_token = self.projects.activation_token();
         if let Some(path) = workspace_layout_path() {
             if let Ok(layout) = WorkspaceLayoutV1::load_or_default(&path) {
@@ -10173,18 +12120,20 @@ impl ApplicationHandler for App {
         }
         self.update_title();
         self.autosave_base = dirs::config_dir().map(|d| d.join("pyxross"));
-        let recovery = self
-            .autosave_base
-            .as_deref()
-            .map(|base| {
-                let journal_base = recovery_base_for(base, self.projects.current().id);
-                read_recovery_journal(&journal_base)
-            })
-            .flatten();
-        let has_recovery = recovery.is_some();
-        let session = self.projects.current_mut();
-        session.recovery = recovery;
-        session.recovery_pending = has_recovery;
+        if self.projects.active_id().is_some() {
+            let recovery = self
+                .autosave_base
+                .as_deref()
+                .map(|base| {
+                    let journal_base = recovery_base_for(base, self.projects.current().id);
+                    read_recovery_journal(&journal_base)
+                })
+                .flatten();
+            let has_recovery = recovery.is_some();
+            let session = self.projects.current_mut();
+            session.recovery = recovery;
+            session.recovery_pending = has_recovery;
+        }
 
         // Event-driven redraws: sleep when idle, wake on input or when
         // `needs_continuous_redraw` schedules the next frame.
@@ -10214,20 +12163,12 @@ impl ApplicationHandler for App {
             }
             match event {
                 WindowEvent::CloseRequested => {
-                    if let Some(project) = self.projects.active_id() {
-                        if self.projects.current().is_dirty() {
-                            self.projects.current_mut().pending_action =
-                                Some(PendingAction::Close { project });
-                            self.redraw();
-                        } else {
-                            self.sync_workspace_layout();
-                            self.save_workspace_layout();
-                            event_loop.exit();
-                        }
-                    } else {
+                    if self.request_app_close() {
                         self.sync_workspace_layout();
                         self.save_workspace_layout();
                         event_loop.exit();
+                    } else {
+                        self.redraw();
                     }
                 }
                 WindowEvent::Resized(size) => {
@@ -10239,6 +12180,25 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::ScaleFactorChanged { .. } => {
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                WindowEvent::HoveredFile(_) => {
+                    self.dropped_file_hovering = true;
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                WindowEvent::HoveredFileCancelled => {
+                    self.dropped_file_hovering = false;
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                WindowEvent::DroppedFile(path) => {
+                    self.dropped_file_hovering = false;
+                    self.handle_dropped_file(path);
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
@@ -10284,6 +12244,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
         self.native_host_retirement.advance();
         self.apply_deferred_workspace_actions();
         self.service_pending_native_hosts(event_loop);
@@ -11153,6 +13117,7 @@ mod tests {
                 format!("open:{}:{path:?}", project.raw())
             }
             Some(PendingAction::Close { project }) => format!("close:{}", project.raw()),
+            Some(PendingAction::CloseWindow { project }) => format!("close-window:{}", project.raw()),
         }
     }
 
@@ -11173,6 +13138,7 @@ mod tests {
                 t.object.restore(),
             ),
             TransformSession::Curve(c) => format!("curve:{:?}:{:?}", c.drag, c.curve.points()),
+            TransformSession::Text(t) => format!("text:{:?}:{}", t.text, t.caret),
         })
     }
 
@@ -16446,7 +18412,7 @@ mod tests {
         let mut app = App::default();
         let id = color_picker_panel_id();
         send_key(&mut app, egui::Key::C, egui::Modifiers::NONE);
-        let moved = egui::Rect::from_min_size(egui::pos2(260.0, 140.0), egui::vec2(540.0, 300.0));
+        let moved = egui::Rect::from_min_size(egui::pos2(140.0, 140.0), egui::vec2(620.0, 300.0));
         app.panel_dock.set_floating_rect(id, moved);
 
         // When: the panel is closed and reopened.
@@ -16471,6 +18437,241 @@ mod tests {
             (reopened.min - moved.min).length() < 1.0,
             "reopened at {reopened:?}, expected {moved:?}"
         );
+    }
+
+    #[test]
+    fn global_fg_bg_colors_persist_across_project_switches() {
+        let mut app = App::default();
+        let first = app.projects.active_id().unwrap();
+        let second = app.new_project("Second", 16, 16);
+        app.activate_project(first).unwrap();
+
+        let sampled = Color::rgb(42, 180, 99);
+        let bg = Color::rgb(200, 120, 40);
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(1, 1, sampled);
+        app.sample_color((1, 1));
+        app.apply_toolbar_events(vec![ToolbarEvent::SecondaryColorChanged(bg)]);
+
+        app.activate_project(second).unwrap();
+        assert_eq!(app.projects.current().color, sampled);
+        assert_eq!(app.projects.current().secondary_color, bg);
+    }
+
+    #[test]
+    fn builtin_palette_menu_loads_ross_32_colors() {
+        let mut app = App::default();
+        app.apply_menu_action(top_bar::MenuAction::LoadBuiltinPalette(
+            crate::core::palette::BuiltinPaletteKind::Ross,
+        ));
+        let session = app.projects.current();
+        let active = &session.palettes[session.active_palette];
+        assert_eq!(active.name, "Ross");
+        assert_eq!(active.colors.len(), 32);
+    }
+
+    #[test]
+    fn pyxel_import_syncs_animation_playback_delays() {
+        let mut app = App::default();
+        let mut layers = LayerStack::new(32, 16);
+        layers.active_layer_mut().buffer.set_pixel(0, 0, Color::rgb(255, 0, 0));
+        let mut anims = crate::core::model::AnimationSet::new();
+        let mut seq = AnimationSequence::new("Walk");
+        seq.push(Frame::new(
+            Region::new(crate::core::math::Rect2i::new(0, 0, 16, 16), "F1"),
+            120,
+        ));
+        seq.push(Frame::new(
+            Region::new(crate::core::math::Rect2i::new(16, 0, 16, 16), "F2"),
+            150,
+        ));
+        *anims.get_mut(0).unwrap() = seq;
+        let imported = crate::core::pyxel::PyxelImport {
+            name: "walk_test".to_string(),
+            width: 32,
+            height: 16,
+            tile_size: TileSize::new(16, 16),
+            layers,
+            tile_palette: TilePalette::new(),
+            animations: anims,
+            palette: None,
+            preview_rgba: vec![0; 32 * 16 * 4],
+        };
+        app.pending_pyxel_import = Some((PathBuf::from("walk_test.pyxel"), imported));
+        app.import_pyxel_host
+            .events
+            .borrow_mut()
+            .push(dock_import_pyxel_panel::ImportPyxelEvent::Import);
+        app.drain_import_pyxel_events();
+        assert_eq!(app.projects.current().sequence().len(), 2);
+        app.projects.current_mut().animation.play();
+        assert!(app.projects.current().animation.is_playing());
+        // Advancing past 120ms must move from frame 0 to frame 1 immediately!
+        app.tick_animation(130);
+        assert_eq!(app.projects.current().animation.current_index(), 1);
+    }
+
+    #[test]
+    fn closing_last_project_leaves_app_running_with_empty_workspace() {
+        let mut app = App::default();
+        let only = app.projects.active_id().expect("initial project");
+        // Close the only document via top-bar event, then run a full UI frame.
+        app.apply_top_bar_events(vec![top_bar::TopBarEvent::CloseProject(only)]);
+        assert_eq!(app.projects.active_id(), None);
+
+        let ctx = app.ctx.clone();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| app.ui_frame(ui));
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(app.projects.active_id(), None);
+        // User can immediately create a new document afterward.
+        let fresh = app.new_project("Fresh", 32, 32);
+        assert_eq!(app.projects.active_id(), Some(fresh));
+    }
+
+    #[test]
+    fn app_close_prompts_each_dirty_document_sequentially() {
+        let mut app = App::default();
+        let a = app.projects.active_id().unwrap();
+        app.projects.current_mut().name = "DocA".to_string();
+        app.mark_dirty();
+
+        let b = app.new_project("DocB", 16, 16);
+        app.mark_dirty();
+
+        let c = app.new_project("DocC", 16, 16);
+        app.mark_dirty();
+
+        assert!(!app.request_app_close(), "dirty docs must block immediate exit");
+        assert_eq!(app.exit_guard_queue, vec![a, b, c]);
+        assert_eq!(app.projects.active_id(), Some(a));
+
+        // Discard DocA -> advances to DocB.
+        app.guard_discard();
+        assert_eq!(app.projects.active_id(), Some(b));
+        assert_eq!(app.exit_guard_queue, vec![b, c]);
+
+        // Discard DocB -> advances to DocC.
+        app.guard_discard();
+        assert_eq!(app.projects.active_id(), Some(c));
+        assert_eq!(app.exit_guard_queue, vec![c]);
+
+        // Discard DocC -> queue empty.
+        app.guard_discard();
+        assert!(app.exit_guard_queue.is_empty());
+        assert_eq!(app.projects.active_id(), None);
+    }
+
+    #[test]
+    fn app_close_discard_all_clears_all_dirty_documents() {
+        let mut app = App::default();
+        app.mark_dirty();
+        let _b = app.new_project("DocB", 16, 16);
+        app.mark_dirty();
+        let _c = app.new_project("DocC", 16, 16);
+        app.mark_dirty();
+
+        assert!(!app.request_app_close());
+        assert_eq!(app.exit_guard_queue.len(), 3);
+        app.guard_discard_all();
+        assert!(app.exit_guard_queue.is_empty());
+        assert_eq!(app.projects.active_id(), None);
+    }
+
+    #[test]
+    fn app_close_save_all_saves_pathed_then_opens_save_as_for_untitled() {
+        let mut app = App::default();
+        let tmp = std::env::temp_dir().join(format!(
+            "pyxross_save_all_test_{}.pyxross",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        app.projects.current_mut().name = "Pathed".to_string();
+        app.projects.current_mut().path = Some(tmp.clone());
+        app.mark_dirty();
+
+        let untitled = app.new_project("UntitledDoc", 16, 16);
+        app.mark_dirty();
+
+        assert!(!app.request_app_close());
+        app.guard_save_all();
+
+        // First doc had a path -> saved to disk and closed; second doc has no
+        // path -> Save As panel is now open for `untitled`.
+        assert!(tmp.exists(), "pathed document must be saved by Save All");
+        assert_eq!(app.projects.active_id(), Some(untitled));
+        let save_as_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(
+            app.panel_dock.placement(save_as_id).is_some(),
+            "Save As panel must open for the untitled document during Save All"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn app_close_save_all_prompts_save_as_sequentially_for_multiple_untitled_docs() {
+        let mut app = App::default();
+        let first = app.projects.current().id;
+        app.projects.current_mut().name = "UntitledA".to_string();
+        app.mark_dirty();
+
+        let second = app.new_project("UntitledB", 16, 16);
+        app.mark_dirty();
+
+        assert!(!app.request_app_close());
+        app.guard_save_all();
+
+        let save_as_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert_eq!(app.projects.active_id(), Some(first));
+        assert!(app.panel_dock.placement(save_as_id).is_some());
+
+        let dir = TempDir::new("save_all_multi_untitled");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let path_a = dir.path().join("UntitledA.pyxross");
+        let path_b = dir.path().join("UntitledB.pyxross");
+
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Save {
+                path: path_a.clone(),
+                name: "UntitledA.pyxross".to_owned(),
+            });
+        app.drain_save_as_events();
+
+        // First document saved and closed; Save As immediately opens for second.
+        assert!(path_a.exists());
+        assert_eq!(app.projects.active_id(), Some(second));
+        assert!(app.panel_dock.placement(save_as_id).is_some());
+
+        app.save_as_host
+            .events
+            .borrow_mut()
+            .push(dock_save_as_panel::SaveAsEvent::Save {
+                path: path_b.clone(),
+                name: "UntitledB.pyxross".to_owned(),
+            });
+        app.drain_save_as_events();
+
+        assert!(path_b.exists());
+        assert!(app.exit_guard_queue.is_empty());
+        assert_eq!(app.projects.active_id(), None);
+        assert!(app.exit_requested);
     }
 
     /// The Palette panel's dock id.
@@ -22847,6 +25048,35 @@ mod tests {
         assert!(
             app.panel_dock.placement(save_panel_id).is_some(),
             "the save-as modal is raised back above the closed chooser"
+        );
+    }
+
+    #[test]
+    fn keybindings_panel_updates_dynamic_shortcut_labels() {
+        let mut app = App::default();
+        app.apply_menu_action(top_bar::MenuAction::KeyBindings);
+        let kb_id = panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_PANEL_ID);
+        assert!(app.panel_dock.placement(kb_id).is_some());
+
+        let mut next = Keymap::defaults();
+        next.bindings.insert(
+            crate::input::Action::SelectPen,
+            crate::input::KeyBinding {
+                key: crate::input::LogicalKey::B,
+                modifiers: crate::input::Modifiers::default(),
+            },
+        );
+        app.keybindings_host
+            .events
+            .borrow_mut()
+            .push(keybindings::KeybindingsEvent::Apply(next));
+        app.drain_keybindings_events();
+        app.write_dock_snapshots();
+
+        assert_eq!(app.toolbox_host.view.borrow().shortcuts.pencil, "B");
+        assert_eq!(
+            top_bar::EditMenuShortcuts::from_keymap(&app.keymap).undo,
+            "Ctrl+Z"
         );
     }
 
@@ -31337,5 +33567,411 @@ mod tests {
         assert!(target.exists());
         assert!(app.panel_dock.placement(save_as_id).is_none());
         assert!(app.projects.active_id().is_none());
+    }
+
+    #[test]
+    fn selection_arrow_key_lifts_and_nudges_committed_selection_by_one_pixel() {
+        let mut app = App::default();
+        marquee(&mut app, (4, 4), (7, 7));
+        assert!(app.projects.current().selection.is_some());
+        assert!(app.projects.current().transform.is_none());
+
+        send_key(&mut app, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert!(
+            app.projects.current().selection.is_none(),
+            "committed selection should lift into a transform"
+        );
+        let t = app
+            .projects
+            .current()
+            .transform
+            .as_ref()
+            .and_then(TransformSession::selection)
+            .expect("selection transform should be active");
+        assert_eq!(t.object.pos, (5.0, 4.0));
+    }
+
+    #[test]
+    fn app_new_empty_starts_without_active_document_and_renders_ui_frame() {
+        let mut app = App::new_empty();
+        assert!(app.projects.active_id().is_none());
+
+        let ctx = app.ctx.clone();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1024.0, 768.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_frame(ui));
+        out.textures_delta.clear();
+        send_key(&mut app, egui::Key::N, egui::Modifiers::CTRL);
+        let create_id = panel_dock::PanelId::new(dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID);
+        assert!(
+            app.panel_dock.placement(create_id).is_some(),
+            "Ctrl+N on empty startup should open Create Document panel"
+        );
+    }
+
+    #[test]
+    fn toolbox_and_tool_property_default_proportions_favor_tool_property() {
+        let app = App::default();
+        let viewport = egui::vec2(1280.0, 827.0);
+        let tb = app
+            .panel_dock
+            .dock_panel_size(
+                panel_dock::DockSide::Left,
+                panel_dock::PanelId::new(dock_toolbox_panel::TOOLBOX_PANEL_ID),
+            )
+            .expect("toolbox docked left")
+            .y;
+        let tp = app
+            .panel_dock
+            .dock_panel_size(
+                panel_dock::DockSide::Left,
+                panel_dock::PanelId::new(dock_tool_property_panel::TOOL_PROPERTY_PANEL_ID),
+            )
+            .expect("tool property docked left")
+            .y;
+        let _ = viewport;
+        assert!(
+            tp > tb,
+            "tool property ({tp}) should be taller than toolbox ({tb}) by default"
+        );
+    }
+
+    #[test]
+    fn closing_dirty_keybindings_opens_unsaved_guard_and_handles_discard() {
+        let mut app = App::default();
+        app.open_keybindings_panel();
+        let kb_id = panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_PANEL_ID);
+        let guard_id =
+            panel_dock::PanelId::new(dock_keybindings_panel::KEYBINDINGS_GUARD_PANEL_ID);
+        app.keybindings_host.panel.borrow_mut().draft_mut().bindings.insert(
+            crate::input::Action::Undo,
+            crate::input::KeyBinding {
+                key: crate::input::LogicalKey::G,
+                modifiers: crate::input::Modifiers::default(),
+            },
+        );
+
+        app.close_panel(kb_id);
+        assert!(app.panel_dock.placement(kb_id).is_some());
+        assert!(app.panel_dock.placement(guard_id).is_some());
+
+        app.keybindings_host
+            .guard_events
+            .borrow_mut()
+            .push(dock_keybindings_panel::KeybindingsGuardEvent::CloseWithoutSaving);
+        app.drain_keybindings_events();
+        assert!(app.panel_dock.placement(guard_id).is_none());
+        assert!(app.panel_dock.placement(kb_id).is_none());
+    }
+
+    #[test]
+    fn import_pyxel_opens_preview_panel_and_creates_project_then_exports_pyxel() {
+        let mut app = App::new_empty();
+        app.file_import_pyxel_pick(std::path::Path::new("example.pyxel"));
+        let pyxel_panel =
+            panel_dock::PanelId::new(dock_import_pyxel_panel::IMPORT_PYXEL_PANEL_ID);
+        assert!(app.panel_dock.placement(pyxel_panel).is_some());
+        {
+            let view = app.import_pyxel_host.view.borrow();
+            assert_eq!(view.width, 256);
+            assert_eq!(view.height, 256);
+            assert_eq!(view.tile_count, 3);
+            assert_eq!(view.preview_rgba.len(), 256 * 256 * 4);
+        }
+
+        app.import_pyxel_host
+            .events
+            .borrow_mut()
+            .push(dock_import_pyxel_panel::ImportPyxelEvent::Import);
+        app.drain_import_pyxel_events();
+        assert!(app.panel_dock.placement(pyxel_panel).is_none());
+        assert!(app.projects.active_id().is_some());
+        {
+            let s = app.projects.current();
+            assert_eq!(s.layers.width(), 256);
+            assert_eq!(s.layers.height(), 256);
+            assert_eq!(s.layers.len(), 3);
+            assert_eq!(s.tile_palette.tiles.len(), 3);
+            assert_eq!(s.tile_size, TileSize::new(16, 16));
+        }
+
+        app.file_export_pyxel();
+        let save_as_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+        assert!(app.panel_dock.placement(save_as_id).is_some());
+        assert_eq!(
+            app.save_as_host.view.borrow().kind,
+            dock_save_as_panel::SaveAsKind::Pyxel
+        );
+    }
+
+    #[test]
+    fn new_project_after_host_resume_inherits_os_clipboard_availability() {
+        let mut app = App::new_empty();
+        app.os_clipboard_available = true;
+        app.new_project("Doc", 16, 16);
+        assert!(app.projects.current().os_clipboard_available);
+    }
+
+    #[test]
+    fn opening_pyxross_from_empty_startup_loads_without_panic() {
+        let dir = TempDir::new("open_pyxross_empty");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("sample.pyxross");
+        {
+            let mut maker = App::default();
+            assert!(maker.save_to(file.clone()));
+        }
+
+        let mut app = App::new_empty();
+        assert!(app.projects.active_id().is_none());
+        app.file_open();
+        app.file_chooser_host
+            .events
+            .borrow_mut()
+            .push(dock_file_chooser_panel::FileChooserEvent::Chosen(file));
+        app.drain_file_chooser_events();
+        assert!(app.projects.active_id().is_some());
+    }
+
+    #[test]
+    fn shift_drag_inside_selection_starts_additive_gesture_instead_of_moving() {
+        let mut app = App::default();
+        marquee(&mut app, (2, 2), (6, 6));
+        assert!(app.projects.current().selection.is_some());
+
+        // Simulate Shift held during select_press inside (4, 4).
+        let ctx = app.ctx.clone();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |_ui| {
+            app.select_press((4, 4), false);
+        });
+        out.textures_delta.clear();
+        assert!(
+            matches!(app.projects.current().gesture, SelectGesture::Marquee { .. }),
+            "Shift+press inside selection should start Marquee add, not AreaMove"
+        );
+    }
+
+    #[test]
+    fn single_click_on_empty_canvas_commits_transform_to_currently_active_layer() {
+        let mut app = App::default();
+        let l1 = app.projects.current().layers.active_layer_id();
+        let l2 = app.projects.current_mut().layers.add_layer("Layer 2");
+        let _ = app.projects.current_mut().layers.set_active(l1);
+
+        seed_red_rect(&mut app, Rect2i::new(4, 4, 2, 2));
+        marquee(&mut app, (4, 4), (5, 5));
+        app.lift_transform(Rect2i::new(4, 4, 2, 2));
+
+        // Switch active layer to Layer 2 BEFORE committing.
+        let _ = app.projects.current_mut().layers.set_active(l2);
+        app.gizmo_hovered = GizmoHit::None;
+        let mut interactions = CanvasInteractions {
+            updated_camera: app.projects.current().camera,
+            clicked: Some((20, 20)),
+            ..CanvasInteractions::default()
+        };
+        let _ = &mut interactions;
+        app.handle_interactions_in(&app.ctx.clone(), interactions);
+
+        assert!(app.projects.current().transform.is_none());
+        let l2_px = app
+            .projects
+            .current()
+            .layers
+            .layer(l2)
+            .unwrap()
+            .buffer
+            .get_pixel(4, 4);
+        assert_eq!(l2_px, Some(RED), "committed pixels should land on active Layer 2");
+    }
+
+    #[test]
+    fn editor_options_can_disable_wasd_transform_move() {
+        let mut app = App::default();
+        marquee(&mut app, (4, 4), (6, 6));
+        app.lift_transform(Rect2i::new(4, 4, 3, 3));
+        app.editor_options.wasd_transform_move = false;
+
+        send_key(&mut app, egui::Key::D, egui::Modifiers::NONE);
+        let t = app
+            .projects
+            .current()
+            .transform
+            .as_ref()
+            .and_then(TransformSession::selection)
+            .unwrap();
+        assert_eq!(t.object.pos, (4.0, 4.0), "D must not nudge when WASD disabled");
+
+        send_key(&mut app, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        let t = app
+            .projects
+            .current()
+            .transform
+            .as_ref()
+            .and_then(TransformSession::selection)
+            .unwrap();
+        assert_eq!(t.object.pos, (5.0, 4.0), "ArrowRight still nudges");
+    }
+
+    #[test]
+    fn save_to_sets_save_toast_with_filename() {
+        let dir = TempDir::new("save_toast");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("my_sprite.pyxross");
+        let mut app = App::default();
+        assert!(app.save_to(file));
+        let toast = app.save_toast.as_ref().expect("save_toast should be set");
+        assert_eq!(toast.0, "my_sprite.pyxross saved.");
+    }
+
+    #[test]
+    fn fieldier_rectangle_double_click_selects_region_and_shift_adds() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = TileSize::square(8);
+        app.select_fieldier_child(FieldierChild::Rectangle);
+        let ctx = app.ctx.clone();
+        // Double-click inside region (0, 0)..(8, 8).
+        app.handle_select_interactions(
+            &ctx,
+            CanvasInteractions {
+                double_clicked: Some((3, 5)),
+                ..CanvasInteractions::default()
+            },
+        );
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("double-click in region selects the region");
+        assert_eq!(sel.rect(), Rect2i::new(0, 0, 8, 8));
+
+        // Shift+double-click inside region (8, 0)..(16, 8) adds it to selection.
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::ModifiersChanged(egui::Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+        app.handle_select_interactions(
+            &ctx,
+            CanvasInteractions {
+                double_clicked: Some((10, 2)),
+                ..CanvasInteractions::default()
+            },
+        );
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("shift+double-click unions the second region");
+        assert_eq!(sel.rect(), Rect2i::new(0, 0, 16, 8));
+        assert!(sel.contains(3, 5));
+        assert!(sel.contains(10, 2));
+    }
+
+    #[test]
+    fn paste_cursor_canvas_uses_selection_center_when_selection_exists() {
+        let mut app = App::default();
+        app.projects.current_mut().selection = Some(
+            Selection::capture(
+                &app.projects.current().layers.active_layer().buffer,
+                Rect2i::new(10, 20, 8, 12),
+            )
+            .unwrap(),
+        );
+        assert_eq!(app.paste_cursor_canvas(), Some((14, 26)));
+
+        // Without selection and without pointer, falls back to None.
+        app.projects.current_mut().selection = None;
+        assert_eq!(app.paste_cursor_canvas(), None);
+    }
+
+    #[test]
+    fn text_tool_typing_disables_wasd_rotates_and_commits() {
+        let mut app = App::default();
+        app.editor_options.wasd_transform_move = true;
+        app.projects.current_mut().color = Color::rgb(255, 0, 0);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Text)]);
+        let ctx = app.ctx.clone();
+
+        // Click on canvas at (4, 4) -> opens TransformSession::Text.
+        app.handle_text_interactions(CanvasInteractions {
+            clicked: Some((4, 4)),
+            ..CanvasInteractions::default()
+        });
+        assert!(app
+            .projects
+            .current()
+            .transform
+            .as_ref()
+            .is_some_and(TransformSession::is_text));
+
+        // Typing 'w' must insert 'w' and NOT nudge pos even with WASD enabled.
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Text("w".to_owned()),
+                    egui::Event::Key {
+                        key: egui::Key::W,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Text("a".to_owned()),
+                ],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+        app.handle_text_transform_keys();
+
+        let (text, pos) = match app.projects.current().transform.as_ref().unwrap() {
+            TransformSession::Text(t) => (t.text.clone(), t.selection.object.pos),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "wa");
+        assert_eq!(pos, (4.0, 4.0), "WASD must stay disabled in Text Transform");
+
+        // Rotate 90 deg and click outside -> commits crisp red pixels to layer.
+        app.projects
+            .current_mut()
+            .transform
+            .as_mut()
+            .and_then(TransformSession::selection_mut)
+            .unwrap()
+            .object
+            .rotate_by(90f32.to_radians());
+        app.transform_session_commit();
+        assert!(app.projects.current().transform.is_none());
+        let buf = &app.projects.current().layers.active_layer().buffer;
+        assert!(buf
+            .as_bytes()
+            .chunks_exact(4)
+            .any(|px| px == [255, 0, 0, 255]));
     }
 }

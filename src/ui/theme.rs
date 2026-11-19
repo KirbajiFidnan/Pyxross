@@ -25,6 +25,11 @@ const BUILTIN_THEME_NAME: &str = "Dark";
 /// tokens); this constant is the single tint the skin renderer may use.
 pub const SKIN_TINT: egui::Color32 = egui::Color32::WHITE;
 
+/// Converts a straight-alpha `[r, g, b, a]` token to [`egui::Color32`].
+pub fn rgba32(c: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
+}
+
 /// All color tokens the UI needs, replacing hardcoded `egui::Color32` values.
 ///
 /// Tokens are stored as straight-alpha `[r, g, b, a]` bytes so they serialize
@@ -216,6 +221,11 @@ impl ThemeColors {
         (selection_stroke_color, selection_stroke_color32, selection_stroke_color_core),
         (list_bg, list_bg32, list_bg_core),
         (list_stripe_bg, list_stripe_bg32, list_stripe_bg_core),
+    }
+
+    /// High-contrast dark backing colour for selection marching-ants borders.
+    pub const fn marching_ants_contrast_dark32(&self) -> egui::Color32 {
+        egui::Color32::from_rgb(10, 10, 14)
     }
 
     /// The `onion_skin_prev_tint` token as a core [`Color`] — OPAQUE light
@@ -475,6 +485,11 @@ impl ThemeManager {
     /// The active theme.
     pub fn current(&self) -> &Theme {
         &self.current
+    }
+
+    /// Mutable access to the active theme (used to project `UiStyle` colors).
+    pub fn current_mut(&mut self) -> &mut Theme {
+        &mut self.current
     }
 
     /// Directory containing the active theme's file, if it was loaded from

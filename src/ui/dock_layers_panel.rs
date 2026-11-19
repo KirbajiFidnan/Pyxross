@@ -158,7 +158,8 @@ fn row_ui(
         egui::Color32::TRANSPARENT
     };
     let (_, dropped) = ui.dnd_drop_zone::<LayerId, _>(egui::Frame::NONE, |ui| {
-        egui::Frame::NONE
+        let mut child_clicked = false;
+        let frame_resp = egui::Frame::NONE
             .fill(row_bg)
             .inner_margin(egui::Margin::symmetric(4, 2))
             .show(ui, |ui| {
@@ -175,6 +176,7 @@ fn row_ui(
                         // depth; pad out whatever the button did not use.
                         ui.add_space((ARROW_SLOT - arrow.rect.width()).max(0.0));
                         if arrow.clicked() {
+                            child_clicked = true;
                             host.events
                                 .borrow_mut()
                                 .push(LayerPanelEvent::ToggleExpanded(id));
@@ -187,6 +189,7 @@ fn row_ui(
                         .on_hover_text("Toggle visibility")
                         .clicked()
                     {
+                        child_clicked = true;
                         host.events
                             .borrow_mut()
                             .push(LayerPanelEvent::ToggleVisible(id));
@@ -199,6 +202,7 @@ fn row_ui(
                             .selected(is_active),
                     );
                     if name.clicked() {
+                        child_clicked = true;
                         host.events.borrow_mut().push(LayerPanelEvent::Select(id));
                     }
                     if name.drag_started() {
@@ -212,6 +216,7 @@ fn row_ui(
                             .on_hover_text("Layer settings")
                             .clicked()
                         {
+                            child_clicked = true;
                             host.events
                                 .borrow_mut()
                                 .push(LayerPanelEvent::SettingsToggle(id));
@@ -219,6 +224,19 @@ fn row_ui(
                     });
                 });
             });
+        // Allow clicking anywhere on the row (not just the name button) to
+        // select the layer or group, without interfering with child buttons.
+        let row_rect = frame_resp.response.rect;
+        if !child_clicked
+            && ui.input(|i| {
+                i.pointer.primary_clicked()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|pos| row_rect.contains(pos))
+            })
+        {
+            host.events.borrow_mut().push(LayerPanelEvent::Select(id));
+        }
     });
     if let Some(dragged) = dropped {
         host.events
@@ -273,5 +291,87 @@ pub fn layer_settings_panel_spec(host: &LayerPanelHost, floating_rect: egui::Rec
         placement: PanelPlacement::Floating,
         floating_rect,
         content: Box::new(LayerSettingsContent::new(host.clone())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::dock_hosts::LayerRow;
+    use crate::ui::theme::Theme;
+    use crate::ui::SurfaceId;
+
+    #[test]
+    fn clicking_empty_row_area_selects_layer() {
+        let host = LayerPanelHost::default();
+        let layer_id = LayerId::new(7);
+        {
+            let mut view = host.view.borrow_mut();
+            view.rows.push(LayerRow {
+                id: layer_id,
+                name: "Layer 7".to_owned(),
+                visible: true,
+                opacity: 1.0,
+                blend: crate::core::model::BlendMode::Normal,
+                is_group: false,
+                depth: 0,
+                has_children: false,
+                expanded: false,
+            });
+            view.active = Some(LayerId::new(1));
+        }
+
+        let ctx = egui::Context::default();
+        let theme = Theme::default_dark();
+        let capture = crate::ui::input_capture::InputCapture::new();
+        let chrome = PanelChrome {
+            colors: &theme.colors,
+            theme: &theme,
+            atlases: None,
+            capture: &capture,
+            surface: SurfaceId::Canvas,
+            rounding: 3.0,
+        };
+        let view = NestView::new(
+            egui::pos2(0.0, 0.0),
+            1.0,
+            egui::Vec2::ZERO,
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(260.0, 200.0)),
+        );
+        let mut comp = LayersListComponent { host: host.clone() };
+        let click_pos = egui::pos2(160.0, HEADER_HEIGHT + 12.0);
+        for ev in [
+            vec![egui::Event::PointerMoved(click_pos)],
+            vec![egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(260.0, 200.0),
+                )),
+                events: ev,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| comp.ui(ui, &view, &chrome));
+            out.textures_delta.clear();
+        }
+        assert!(
+            host.events
+                .borrow()
+                .contains(&LayerPanelEvent::Select(layer_id)),
+            "clicking empty row area should emit Select(7), got {:?}",
+            host.events.borrow()
+        );
     }
 }

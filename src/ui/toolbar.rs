@@ -17,7 +17,7 @@ use crate::ui::theme::ThemeColors;
 ///
 /// The App shell owns the tool/color/brush state and applies these events; the
 /// widget itself is a pure view and never mutates the inputs it is given.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ToolbarEvent {
     /// The user clicked a tool button (a deliberate switch, D62).
     ToolSelected(Tool),
@@ -67,10 +67,14 @@ pub enum ToolbarEvent {
     PaletteSelected(usize),
     /// The user swapped the primary and secondary colors (swap button / X key).
     SwapColors,
+    /// The user picked a font in the Text tool's Tool Property panel.
+    TextFontChanged(String),
+    /// The user changed the Text tool's font size in the Tool Property panel.
+    TextSizeChanged(u32),
 }
 
 /// All tools in toolbox display order.
-pub(crate) const TOOLS: [Tool; 7] = [
+pub(crate) const TOOLS: [Tool; 8] = [
     Tool::Pencil,
     Tool::Eraser,
     Tool::Fill,
@@ -78,6 +82,7 @@ pub(crate) const TOOLS: [Tool; 7] = [
     Tool::Fieldier,
     Tool::Tile,
     Tool::AnimationPlacer,
+    Tool::Text,
 ];
 
 /// Display label for a tool.
@@ -91,6 +96,7 @@ pub(crate) fn tool_label(tool: Tool) -> &'static str {
         Tool::Tile => "Tile",
         Tool::Draw => "Draw",
         Tool::AnimationPlacer => "Animation",
+        Tool::Text => "Text",
     }
 }
 
@@ -740,7 +746,7 @@ mod tests {
 
     #[test]
     fn toolbox_lists_only_the_real_tools() {
-        assert_eq!(TOOLS.len(), 7);
+        assert_eq!(TOOLS.len(), 8);
         assert!(
             !TOOLS.contains(&Tool::Draw),
             "the hidden Draw tool must never be selectable from the toolbox"
@@ -754,9 +760,10 @@ mod tests {
             TOOLS.contains(&Tool::AnimationPlacer),
             "the animation placer is a real toolbox tool"
         );
+        assert!(TOOLS.contains(&Tool::Text));
         assert_eq!(
             TOOLS.len(),
-            7,
+            8,
             "rectangle/wand/lasso are Fieldier children, not separate toolbox entries"
         );
     }

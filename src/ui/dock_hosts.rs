@@ -59,6 +59,57 @@ pub struct TilePlacerView {
     pub tile_eraser: bool,
 }
 
+/// Dynamic shortcut labels projected from the active [`crate::input::Keymap`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolboxShortcuts {
+    pub pencil: String,
+    pub eraser: String,
+    pub rectangle: String,
+    pub wand: String,
+    pub lasso: String,
+    pub fill: String,
+    pub tile: String,
+    pub animation_placer: String,
+    pub text: String,
+    pub transform_rotate_cw: String,
+    pub transform_rotate_ccw: String,
+    pub transform_grow: String,
+    pub transform_shrink: String,
+    pub flip_h: String,
+    pub flip_v: String,
+    pub cancel_transform: String,
+}
+
+impl ToolboxShortcuts {
+    pub fn from_keymap(keymap: &crate::input::Keymap) -> Self {
+        use crate::input::Action;
+        Self {
+            pencil: keymap.display_label(Action::SelectPen),
+            eraser: keymap.display_label(Action::SelectEraser),
+            rectangle: keymap.display_label(Action::SelectRectangle),
+            wand: keymap.display_label(Action::SelectWand),
+            lasso: keymap.display_label(Action::SelectLasso),
+            fill: keymap.display_label(Action::SelectFill),
+            tile: keymap.display_label(Action::SelectTileTool),
+            animation_placer: keymap.display_label(Action::SelectAnimationPlacer),
+            text: keymap.display_label(Action::SelectText),
+            transform_rotate_cw: keymap.display_label(Action::TransformRotateCw),
+            transform_rotate_ccw: keymap.display_label(Action::TransformRotateCcw),
+            transform_grow: keymap.display_label(Action::TransformGrow),
+            transform_shrink: keymap.display_label(Action::TransformShrink),
+            flip_h: keymap.display_label(Action::FlipHorizontal),
+            flip_v: keymap.display_label(Action::FlipVertical),
+            cancel_transform: keymap.display_label(Action::CancelTransform),
+        }
+    }
+}
+
+impl Default for ToolboxShortcuts {
+    fn default() -> Self {
+        Self::from_keymap(&crate::input::Keymap::defaults())
+    }
+}
+
 /// Snapshot of the toolbox state for one frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolboxView {
@@ -85,6 +136,16 @@ pub struct ToolboxView {
     /// The Tile tool's sticky placement transform, mirrored for the rotation /
     /// flip controls.
     pub tile_placer: TilePlacerView,
+    /// Dynamic shortcut labels read from the active keymap.
+    pub shortcuts: ToolboxShortcuts,
+    /// True when the active transform session is a Text Transform.
+    pub text_transform_active: bool,
+    /// Active Text tool / Text Transform font name.
+    pub text_font: String,
+    /// Active Text tool / Text Transform font size (px).
+    pub text_size: u32,
+    /// Discovered font names (built-in + bundled + system fonts).
+    pub available_fonts: Vec<String>,
 }
 
 impl Default for ToolboxView {
@@ -100,6 +161,11 @@ impl Default for ToolboxView {
             transform_active: false,
             transform_algorithm: TransformAlgorithm::default(),
             tile_placer: TilePlacerView::default(),
+            shortcuts: ToolboxShortcuts::default(),
+            text_transform_active: false,
+            text_font: crate::core::text::BUILTIN_PIXEL_FONT_NAME.to_owned(),
+            text_size: 14,
+            available_fonts: vec![crate::core::text::BUILTIN_PIXEL_FONT_NAME.to_owned()],
         }
     }
 }

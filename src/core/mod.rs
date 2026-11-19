@@ -5,6 +5,7 @@
 
 pub mod anim;
 pub mod archive;
+pub mod aseprite;
 pub mod brush;
 pub mod buffer;
 pub mod camera;
@@ -15,6 +16,7 @@ pub mod color;
 pub mod document;
 pub mod fill;
 pub mod group_commands;
+pub mod img2pixel;
 pub mod import;
 pub mod layer_commands;
 pub mod math;
@@ -23,9 +25,11 @@ pub mod model;
 pub mod palette;
 pub mod png_codec;
 pub mod projection;
+pub mod pyxel;
 pub mod select;
 pub mod selection_ops;
 pub mod stroke_command;
+pub mod text;
 pub mod tile_edit;
 pub mod tilemap;
 pub mod transform;

@@ -35,14 +35,16 @@ use egui::vec2;
 use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
 use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
+    FLOATING_PANEL_CHROME_HEIGHT,
 };
 
 /// Dock id for the save-as/export floating panel.
 pub const SAVE_AS_PANEL_ID: u64 = 207;
 
-/// Fixed minimum size of the (non-resizable) floating window. Tall enough for
-/// the vertical stack (path, Browse, name, format, actions).
-const SAVE_AS_MIN_SIZE: egui::Vec2 = vec2(380.0, 210.0);
+/// Fixed minimum size of the (non-resizable) floating window. Sized so the
+/// path/name rows, optional inline error, and bottom actions fit cleanly
+/// with zero scrollbars.
+const SAVE_AS_MIN_SIZE: egui::Vec2 = vec2(440.0, 176.0 + FLOATING_PANEL_CHROME_HEIGHT);
 
 /// What kind of save/export the modal is currently drafting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +55,10 @@ pub enum SaveAsKind {
     SpriteSheet,
     /// GIF animation export.
     Gif,
+    /// Pyxel Edit `.pyxel` project export.
+    Pyxel,
+    /// Aseprite `.ase` project export.
+    Aseprite,
     /// Selection PNG export.
     SelectionPng,
 }
@@ -64,6 +70,8 @@ impl SaveAsKind {
             SaveAsKind::Project => "Save As",
             SaveAsKind::SpriteSheet => "Export Sprite Sheet",
             SaveAsKind::Gif => "Export GIF",
+            SaveAsKind::Pyxel => "Export .pyxel",
+            SaveAsKind::Aseprite => "Export .ase",
             SaveAsKind::SelectionPng => "Export Selection PNG",
         }
     }
@@ -76,6 +84,8 @@ impl SaveAsKind {
             SaveAsKind::Project => "project",
             SaveAsKind::SpriteSheet => "sprite_sheet.png",
             SaveAsKind::Gif => "animation.gif",
+            SaveAsKind::Pyxel => "project.pyxel",
+            SaveAsKind::Aseprite => "project.ase",
             SaveAsKind::SelectionPng => "selection.png",
         }
     }
@@ -88,7 +98,11 @@ pub fn formats_for(kind: SaveAsKind) -> &'static [&'static str] {
     const PROJECT: &[&str] = &[".pyxross"];
     match kind {
         SaveAsKind::Project => PROJECT,
-        SaveAsKind::SpriteSheet | SaveAsKind::Gif | SaveAsKind::SelectionPng => &[],
+        SaveAsKind::SpriteSheet
+        | SaveAsKind::Gif
+        | SaveAsKind::Pyxel
+        | SaveAsKind::Aseprite
+        | SaveAsKind::SelectionPng => &[],
     }
 }
 
@@ -100,6 +114,11 @@ pub enum SavePayload {
     /// PNG bytes + the sibling `.json` meta bytes.
     SpriteSheet { png: Vec<u8>, meta: Vec<u8> },
     Gif(Vec<u8>),
+    Pyxel(Vec<u8>),
+    Aseprite {
+        unified: Vec<u8>,
+        timeline: Vec<u8>,
+    },
     SelectionPng { w: usize, h: usize, rgba: Vec<u8> },
 }
 
@@ -127,6 +146,8 @@ pub struct SaveAsView {
     pub error: Option<String>,
     /// Set by the opener so the panel focuses the name field once.
     pub focus_requested: bool,
+    /// When true on `SaveAsKind::Aseprite`, exports the entire canvas as a single frame.
+    pub aseprite_unified_frames: bool,
 }
 
 impl Default for SaveAsView {
@@ -140,6 +161,7 @@ impl Default for SaveAsView {
             payload: None,
             error: None,
             focus_requested: false,
+            aseprite_unified_frames: false,
         }
     }
 }
@@ -252,7 +274,16 @@ impl Component for SaveAsComponent {
     fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
         // Copy the form out of the host cell so the borrow is released before
         // the widgets run; edited values are written back at the end.
-        let (kind, location, mut name, error, focus_requested, mut location_edit, mut synced) = {
+        let (
+            kind,
+            location,
+            mut name,
+            error,
+            focus_requested,
+            mut location_edit,
+            mut synced,
+            mut aseprite_unified_frames,
+        ) = {
             let v = self.host.view.borrow();
             (
                 v.kind,
@@ -262,6 +293,7 @@ impl Component for SaveAsComponent {
                 v.focus_requested,
                 v.location_edit.clone(),
                 v.synced_location.clone(),
+                v.aseprite_unified_frames,
             )
         };
 
@@ -274,67 +306,91 @@ impl Component for SaveAsComponent {
             synced = location.clone();
         }
 
-        // Destination path: a real, full-width editable box, with a label
-        // above it matching the File Manager's "File name:" styling.
-        ui.label("Save path:");
-        ui.add(
-            egui::TextEdit::singleline(&mut location_edit)
-                .hint_text("destination folder")
-                .desired_width(f32::INFINITY),
-        );
+        // Destination path: label above, path input + Browse button on one aligned row.
+        ui.strong("Save path:");
+        ui.add_space(4.0);
+        let mut browse_clicked = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                browse_clicked = chrome
+                    .button(ui, "Browse", ButtonStyle::plain())
+                    .on_hover_text("Choose the destination folder")
+                    .clicked();
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut location_edit)
+                        .hint_text("destination folder")
+                        .desired_width(ui.available_width()),
+                );
+            });
+        });
 
-        // Folder picker on its own line, left-aligned. Emits BrowseLocation so
-        // the App shell opens the File Manager in ChooseFolder mode; when it
-        // returns, the shell updates `location` and the box re-syncs.
-        let browse_clicked = chrome
-            .button(ui, "Browse", ButtonStyle::plain())
-            .on_hover_text("Choose the destination folder")
-            .clicked();
+        ui.add_space(10.0);
 
-        // Document-name box (full width), focused once when the modal opens.
-        ui.label("Document name:");
-        let name_response = ui.add(
-            egui::TextEdit::singleline(&mut name)
-                .hint_text(if kind == SaveAsKind::Project {
-                    "project or document name"
-                } else {
-                    "file name"
+        // Document-name row: label above, name input + format badge on one aligned row.
+        ui.strong("Document name:");
+        ui.add_space(4.0);
+        let formats = formats_for(kind);
+        let name_hint = if kind == SaveAsKind::Project {
+            "project or document name"
+        } else {
+            "file name"
+        };
+        let name_response = if !formats.is_empty() {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (index, label) in formats.iter().enumerate() {
+                        let _ = chrome.button(ui, label, ButtonStyle::toggled(index == 0));
+                    }
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .hint_text(name_hint)
+                            .desired_width(ui.available_width()),
+                    )
                 })
-                .desired_width(f32::INFINITY),
-        );
+                .inner
+            })
+            .inner
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut name)
+                    .hint_text(name_hint)
+                    .desired_width(f32::INFINITY),
+            )
+        };
         if focus_requested {
             name_response.request_focus();
         }
 
-        // Format row: the mandatory (sole, selected) format per D82. The row
-        // iterates `formats_for` so future formats can be added without
-        // restructuring.
-        let formats = formats_for(kind);
-        if !formats.is_empty() {
-            ui.horizontal(|ui| {
-                for (index, label) in formats.iter().enumerate() {
-                    let _ = chrome.button(ui, label, ButtonStyle::toggled(index == 0));
-                }
-            });
+        if kind == SaveAsKind::Aseprite {
+            ui.add_space(6.0);
+            ui.checkbox(&mut aseprite_unified_frames, "Unified frames")
+                .on_hover_text("Export the entire canvas as a single frame");
         }
 
         // Inline error line (theme error color, panel stays open).
         if let Some(err) = &error {
+            ui.add_space(6.0);
             ui.label(egui::RichText::new(err).color(ui.visuals().error_fg_color));
         }
 
-        // Bottom action row: a symmetric pair centred on the panel — Save hugs
-        // the centre from the left half, Cancel from the right half, so the
-        // spacing around the panel centre is equal.
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Bottom action row: right-aligned primary Save + Cancel matching Create New Document.
         let mut save_clicked = false;
         let mut cancel_clicked = false;
-        ui.columns(2, |columns| {
-            columns[0].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if chrome.button(ui, "Save", ButtonStyle::plain()).clicked() {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chrome
+                    .button(ui, "Save", ButtonStyle::toggled(true))
+                    .clicked()
+                {
                     save_clicked = true;
                 }
-            });
-            columns[1].with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
                 if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
                     cancel_clicked = true;
                 }
@@ -352,6 +408,7 @@ impl Component for SaveAsComponent {
         view.synced_location = synced;
         view.name = name;
         view.focus_requested = false;
+        view.aseprite_unified_frames = aseprite_unified_frames;
 
         if browse_clicked {
             // Seed the chooser at the path currently in the box.
@@ -407,6 +464,13 @@ pub(crate) fn build_save_as_nest(host: &SaveAsHost) -> NestContent {
 /// header. The title follows the kind the host is drafting.
 pub fn save_as_panel_spec(host: &SaveAsHost, floating_rect: egui::Rect) -> PanelSpec {
     let title = host.view.borrow().kind.title();
+    let floating_rect = egui::Rect::from_min_size(
+        floating_rect.min,
+        vec2(
+            floating_rect.width().max(SAVE_AS_MIN_SIZE.x),
+            floating_rect.height().max(SAVE_AS_MIN_SIZE.y),
+        ),
+    );
     PanelSpec {
         id: PanelId::new(SAVE_AS_PANEL_ID),
         metadata: PanelMetadata {
@@ -446,6 +510,7 @@ mod tests {
             payload: None,
             error: None,
             focus_requested: false,
+            aseprite_unified_frames: false,
         }
     }
 
@@ -699,26 +764,95 @@ mod tests {
             "the action row is painted"
         );
 
-        // Save and Cancel form a centred pair: both sit in the middle band of
-        // the panel (regression against the old Save-left / Cancel-far-right).
-        let width = 420.0;
-        let save_x = text_positions(&output, "Save")
+        // Save and Cancel are right-aligned on the bottom action row (Cancel
+        // left of Save) matching the Create New Document dialog.
+        let save_pos = text_positions(&output, "Save")
             .into_iter()
             .next()
-            .expect("Save is painted")
-            .x;
-        let cancel_x = text_positions(&output, "Cancel")
+            .expect("Save is painted");
+        let cancel_pos = text_positions(&output, "Cancel")
             .into_iter()
             .next()
-            .expect("Cancel is painted")
-            .x;
+            .expect("Cancel is painted");
         assert!(
-            save_x > width * 0.25 && save_x < width * 0.75,
-            "Save sits near the panel centre (x = {save_x})"
+            save_pos.x > cancel_pos.x,
+            "Save ({}) sits to the right of Cancel ({})",
+            save_pos.x,
+            cancel_pos.x
         );
         assert!(
-            cancel_x > width * 0.25 && cancel_x < width * 0.75,
-            "Cancel sits near the panel centre (x = {cancel_x})"
+            (save_pos.y - cancel_pos.y).abs() <= 4.0,
+            "Save ({}) and Cancel ({}) share the same action row",
+            save_pos.y,
+            cancel_pos.y
+        );
+    }
+
+    #[test]
+    fn save_as_panel_fits_without_overflow() {
+        let host = SaveAsHost::default();
+        {
+            let mut v = host.view.borrow_mut();
+            v.kind = SaveAsKind::Project;
+            v.location = std::env::temp_dir();
+            v.location_edit = std::env::temp_dir().display().to_string();
+            v.name = "Untitled".to_owned();
+            v.error = Some("Sample validation message".to_owned());
+        }
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), SAVE_AS_MIN_SIZE);
+        let ctx = egui::Context::default();
+        let theme = crate::ui::theme::Theme::default_dark();
+        let capture = crate::ui::input_capture::InputCapture::new();
+        let chrome = PanelChrome::flat(
+            &theme,
+            &capture,
+            crate::ui::input_capture::SurfaceId::Panel(PanelId::new(SAVE_AS_PANEL_ID)),
+        );
+        let chrome_h = FLOATING_PANEL_CHROME_HEIGHT;
+        let viewport_size = vec2(rect.width() - 22.0, rect.height() - chrome_h);
+        let body_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            vec2(
+                viewport_size.x + 2.0 * crate::ui::panel_dock::nest::NEST_PADDING,
+                viewport_size.y + 2.0 * crate::ui::panel_dock::nest::NEST_PADDING,
+            ),
+        );
+        let mut measured_content_size = egui::Vec2::ZERO;
+        let raw = egui::RawInput {
+            screen_rect: Some(rect),
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |body| {
+                let nest_vp =
+                    crate::ui::panel_dock::nest::nest_viewport(body.available_rect_before_wrap());
+                body.scope_builder(egui::UiBuilder::new().max_rect(nest_vp), |inner| {
+                    let out = egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .min_scrolled_width(0.0)
+                        .min_scrolled_height(0.0)
+                        .show(inner, |scroll| {
+                            let view = NestView::screen(nest_vp);
+                            let mut comp = SaveAsComponent { host: host.clone() };
+                            comp.ui(scroll, &view, &chrome);
+                        });
+                    measured_content_size = out.content_size;
+                });
+            });
+        })
+        .textures_delta
+        .clear();
+        assert!(
+            measured_content_size.y <= viewport_size.y,
+            "Save As content height ({}) must fit inside viewport ({}) without vertical scrollbar",
+            measured_content_size.y,
+            viewport_size.y
+        );
+        assert!(
+            measured_content_size.x <= viewport_size.x,
+            "Save As content width ({}) must fit inside viewport ({}) without horizontal scrollbar",
+            measured_content_size.x,
+            viewport_size.x
         );
     }
 

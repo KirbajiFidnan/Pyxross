@@ -123,34 +123,86 @@ impl DockManager {
         let Some((_, current)) = extents.iter().find(|(candidate, _)| *candidate == id) else {
             return;
         };
-        let Some((_, next_current)) = extents.iter().find(|(candidate, _)| *candidate == next_id)
-        else {
-            return;
-        };
-        let minimum = panel_minimum(&id, &self.panels, side).unwrap_or(0.0);
-        let next_minimum = panel_minimum(&next_id, &self.panels, side).unwrap_or(0.0);
         let used: f32 = extents.iter().map(|(_, extent)| *extent).sum();
         let free = (available - used).max(0.0);
-        let maximum_delta = free + (*next_current - next_minimum);
-        // On a thin dock resolved extents can sit below their minimums, so the
-        // lower bound may exceed `maximum_delta`; clamp it into range.
-        let lower = (minimum - *current).min(maximum_delta);
-        let actual_delta = delta.clamp(lower, maximum_delta);
-        let next_delta = if actual_delta > free {
-            -(actual_delta - free)
-        } else if actual_delta < 0.0 {
-            -actual_delta
+
+        let mut updates: Vec<(PanelId, f32)> = Vec::new();
+        if delta >= 0.0 {
+            // Domino resize downstream: sum the shrinkable slack across all panels
+            // after `index` so that once `index + 1` hits its minimum, `index + 2`..
+            // continue shrinking.
+            let mut downstream_slack = 0.0f32;
+            for (cid, cext) in extents.iter().skip(index + 1) {
+                let cmin = panel_minimum(cid, &self.panels, side).unwrap_or(0.0);
+                downstream_slack += (*cext - cmin).max(0.0);
+            }
+            let maximum_delta = free + downstream_slack;
+            let actual_delta = delta.clamp(0.0, maximum_delta);
+            updates.push((id, *current + actual_delta));
+            if actual_delta > free {
+                let mut remaining = actual_delta - free;
+                for (cid, cext) in extents.iter().skip(index + 1) {
+                    if remaining <= 0.0 {
+                        break;
+                    }
+                    let cmin = panel_minimum(cid, &self.panels, side).unwrap_or(0.0);
+                    let slack = (*cext - cmin).max(0.0);
+                    let take = remaining.min(slack);
+                    updates.push((*cid, *cext - take));
+                    remaining -= take;
+                }
+            }
         } else {
-            0.0
-        };
+            // Domino resize upstream: sum the shrinkable slack across `0..=index`
+            // in reverse order so that once `index` hits its minimum, `index - 1`..
+            // continue shrinking while `index + 1` grows.
+            let mut upstream_slack = 0.0f32;
+            for (cid, cext) in extents[..=index].iter().rev() {
+                let cmin = panel_minimum(cid, &self.panels, side).unwrap_or(0.0);
+                upstream_slack += (*cext - cmin).max(0.0);
+            }
+            let shrink_amount = (-delta).min(upstream_slack);
+            if shrink_amount > 0.0 {
+                let mut remaining = shrink_amount;
+                for (cid, cext) in extents[..=index].iter().rev() {
+                    if remaining <= 0.0 {
+                        break;
+                    }
+                    let cmin = panel_minimum(cid, &self.panels, side).unwrap_or(0.0);
+                    let slack = (*cext - cmin).max(0.0);
+                    let take = remaining.min(slack);
+                    updates.push((*cid, *cext - take));
+                    remaining -= take;
+                }
+                let (_, next_current) = extents[index + 1];
+                updates.push((next_id, next_current + shrink_amount));
+            }
+        }
         let area = self.area_mut(side);
-        area.panel_extents.insert(id, *current + actual_delta);
-        area.panel_extents
-            .insert(next_id, *next_current + next_delta);
+        for (uid, uext) in updates {
+            area.panel_extents.insert(uid, uext);
+        }
     }
 
     pub fn dock_extent(&self, side: DockSide) -> f32 {
         self.area(side).extent
+    }
+
+    /// Sets the preferred extent (height for Left/Right, width for Bottom) of a
+    /// docked panel when it is registered in `side`.
+    pub fn set_panel_extent(&mut self, id: PanelId, extent: f32) {
+        let Some(side) = self
+            .panels
+            .get(&id)
+            .and_then(|entry| entry.placement.dock_side())
+        else {
+            return;
+        };
+        let min_extent = panel_minimum(&id, &self.panels, side).unwrap_or(0.0);
+        let area = self.area_mut(side);
+        if area.panel_ids.contains(&id) {
+            area.panel_extents.insert(id, extent.max(min_extent));
+        }
     }
 
     pub fn dock_order(&self, side: DockSide) -> &[PanelId] {
@@ -357,5 +409,80 @@ mod tests {
         let before = manager.dock_extent(DockSide::Left);
         manager.resize_dock_area(DockSide::Left, 40.0, viewport);
         assert_eq!(manager.dock_extent(DockSide::Left), before + 40.0);
+    }
+
+    #[test]
+    fn domino_resize_shrinks_downstream_panel_when_neighbor_is_at_minimum() {
+        let mut manager = DockManager::demo_with_dummies();
+        let viewport = vec2(800.0, 480.0);
+        // Right dock has panels [1, 2, 4]. Force panel 2 to its minimum (100px)
+        // and grow panel 1 by 80px -> panel 4 must shrink to accommodate.
+        let dock = Rect::from_min_max(pos2(0.0, 0.0), pos2(240.0, 480.0));
+        manager.set_panel_extent(PanelId::new(1), 120.0);
+        manager.set_panel_extent(PanelId::new(2), 0.0);
+        let p4_before = manager
+            .panel_rects(DockSide::Right, dock)
+            .into_iter()
+            .find(|(id, _)| *id == PanelId::new(4))
+            .unwrap()
+            .1
+            .height();
+        manager.resize_dock_panel(PanelId::new(1), 80.0, viewport);
+        let rects_after = manager.panel_rects(DockSide::Right, dock);
+        let p1_after = rects_after
+            .iter()
+            .find(|(id, _)| *id == PanelId::new(1))
+            .unwrap()
+            .1
+            .height();
+        let p4_after = rects_after
+            .iter()
+            .find(|(id, _)| *id == PanelId::new(4))
+            .unwrap()
+            .1
+            .height();
+        assert!(p1_after > 120.0, "panel 1 should grow via domino resize");
+        assert!(p4_after < p4_before, "panel 4 should shrink via domino");
+    }
+
+    #[test]
+    fn domino_resize_shrinks_upstream_panel_when_neighbor_is_at_minimum() {
+        let mut manager = DockManager::demo_with_dummies();
+        let viewport = vec2(800.0, 480.0);
+        // Right dock has panels [1, 2, 4]. Force panel 2 to its minimum (100px)
+        // and drag divider between 2 and 4 upward (negative delta on panel 2)
+        // -> panel 4 grows while panel 1 shrinks upstream!
+        let dock = Rect::from_min_max(pos2(0.0, 0.0), pos2(240.0, 480.0));
+        manager.set_panel_extent(PanelId::new(1), 220.0);
+        manager.set_panel_extent(PanelId::new(2), 0.0);
+        let rects_before = manager.panel_rects(DockSide::Right, dock);
+        let p1_before = rects_before
+            .iter()
+            .find(|(id, _)| *id == PanelId::new(1))
+            .unwrap()
+            .1
+            .height();
+        let p4_before = rects_before
+            .iter()
+            .find(|(id, _)| *id == PanelId::new(4))
+            .unwrap()
+            .1
+            .height();
+        manager.resize_dock_panel(PanelId::new(2), -60.0, viewport);
+        let rects_after = manager.panel_rects(DockSide::Right, dock);
+        let p1_after = rects_after
+            .iter()
+            .find(|(id, _)| *id == PanelId::new(1))
+            .unwrap()
+            .1
+            .height();
+        let p4_after = rects_after
+            .iter()
+            .find(|(id, _)| *id == PanelId::new(4))
+            .unwrap()
+            .1
+            .height();
+        assert!(p4_after > p4_before, "panel 4 should grow via reverse domino resize");
+        assert!(p1_after < p1_before, "panel 1 should shrink upstream via domino");
     }
 }

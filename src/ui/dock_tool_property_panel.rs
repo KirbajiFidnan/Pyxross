@@ -21,7 +21,7 @@ use crate::ui::panel_dock::{
 use crate::ui::toolbar::{tool_label, ToolbarEvent};
 
 /// The dock id for the Tool Property panel.
-const TOOL_PROPERTY_PANEL_ID: u64 = 103;
+pub const TOOL_PROPERTY_PANEL_ID: u64 = 103;
 
 /// Content height: the tool name plus the property area. The width follows the
 /// panel so a narrow dock never overflows horizontally.
@@ -52,6 +52,11 @@ impl Component for ToolPropertyComponent {
         // A live transform takes over the panel: its rotation algorithm is the
         // only property, and the tool's own controls are suspended (mirroring
         // the transform-session input contract).
+        if view.text_transform_active {
+            ui.strong("Text Transform");
+            self.text_properties(ui, &view, chrome);
+            return;
+        }
         if view.transform_active {
             ui.strong("Transform");
             self.transform_properties(ui, &view, chrome);
@@ -70,6 +75,9 @@ impl Component for ToolPropertyComponent {
             }
             Tool::Tile => {
                 self.tile_properties(ui, &view);
+            }
+            Tool::Text => {
+                self.text_properties(ui, &view, chrome);
             }
             Tool::Eyedropper | Tool::Draw | Tool::AnimationPlacer => {
                 ui.weak(TOOL_PROPERTY_PLACEHOLDER);
@@ -118,26 +126,26 @@ impl ToolPropertyComponent {
             }
         });
         property_row(ui, "Shape (Ctrl+Scroll)", |ui| {
-            let square = chrome.button(
-                ui,
-                "Square",
-                ButtonStyle::toggled(view.draw.shape == BrushShape::Square),
-            );
-            let circle = chrome.button(
-                ui,
-                "Circle",
-                ButtonStyle::toggled(view.draw.shape == BrushShape::Round),
-            );
-            if square.clicked() {
-                events
-                    .borrow_mut()
-                    .push(ToolbarEvent::BrushShapeChanged(BrushShape::Square));
-            }
-            if circle.clicked() {
-                events
-                    .borrow_mut()
-                    .push(ToolbarEvent::BrushShapeChanged(BrushShape::Round));
-            }
+            let current = match view.draw.shape {
+                BrushShape::Square => "Square",
+                BrushShape::Round => "Circle",
+            };
+            egui::ComboBox::from_id_salt("tool_prop_brush_shape")
+                .width(ui.available_width().clamp(96.0, 180.0))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (shape, label) in [
+                        (BrushShape::Square, "Square"),
+                        (BrushShape::Round, "Circle"),
+                    ] {
+                        let selected = view.draw.shape == shape;
+                        if chrome.combo_item(ui, selected, label).clicked() && !selected {
+                            events
+                                .borrow_mut()
+                                .push(ToolbarEvent::BrushShapeChanged(shape));
+                        }
+                    }
+                });
         });
         property_row(ui, "Tail", |ui| {
             let mut tail = view
@@ -185,20 +193,24 @@ impl ToolPropertyComponent {
                 (ScatterShape::Circle, "Circle"),
                 (ScatterShape::Diamond, "Diamond"),
             ];
-            for (shape, label) in shapes {
-                if chrome
-                    .button(
-                        ui,
-                        label,
-                        ButtonStyle::toggled(view.draw.scatter_shape == shape),
-                    )
-                    .clicked()
-                {
-                    events
-                        .borrow_mut()
-                        .push(ToolbarEvent::BrushScatterShapeChanged(shape));
-                }
-            }
+            let current = shapes
+                .iter()
+                .find(|(s, _)| *s == view.draw.scatter_shape)
+                .map(|(_, l)| *l)
+                .unwrap_or("Square");
+            egui::ComboBox::from_id_salt("tool_prop_scatter_shape")
+                .width(ui.available_width().clamp(96.0, 180.0))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (shape, label) in shapes {
+                        let selected = view.draw.scatter_shape == shape;
+                        if chrome.combo_item(ui, selected, label).clicked() && !selected {
+                            events
+                                .borrow_mut()
+                                .push(ToolbarEvent::BrushScatterShapeChanged(shape));
+                        }
+                    }
+                });
         });
     }
 
@@ -210,20 +222,37 @@ impl ToolPropertyComponent {
         let events = &self.host.events;
         property_row(ui, "Child", |ui| {
             let children = [
-                (FieldierChild::Rectangle, "Rectangle (S)"),
-                (FieldierChild::Wand, "Wand (W)"),
-                (FieldierChild::Lasso, "Lasso (L)"),
+                (
+                    FieldierChild::Rectangle,
+                    format!("Rectangle ({})", view.shortcuts.rectangle),
+                ),
+                (
+                    FieldierChild::Wand,
+                    format!("Wand ({})", view.shortcuts.wand),
+                ),
+                (
+                    FieldierChild::Lasso,
+                    format!("Lasso ({})", view.shortcuts.lasso),
+                ),
             ];
-            for (child, label) in children {
-                if chrome
-                    .button(ui, label, ButtonStyle::toggled(view.child == child))
-                    .clicked()
-                {
-                    events
-                        .borrow_mut()
-                        .push(ToolbarEvent::FieldierChildChanged(child));
-                }
-            }
+            let current = children
+                .iter()
+                .find(|(c, _)| *c == view.child)
+                .map(|(_, l)| l.as_str())
+                .unwrap_or("Rectangle");
+            egui::ComboBox::from_id_salt("tool_prop_fieldier_child")
+                .width(ui.available_width().clamp(110.0, 180.0))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (child, label) in &children {
+                        let selected = view.child == *child;
+                        if chrome.combo_item(ui, selected, label).clicked() && !selected {
+                            events
+                                .borrow_mut()
+                                .push(ToolbarEvent::FieldierChildChanged(*child));
+                        }
+                    }
+                });
         });
         if view.child != FieldierChild::Wand {
             return;
@@ -293,6 +322,47 @@ impl ToolPropertyComponent {
         }
     }
 
+    fn text_properties(&self, ui: &mut egui::Ui, view: &ToolboxView, chrome: &PanelChrome) {
+        let events = &self.host.events;
+        property_row(ui, "Font", |ui| {
+            let mut selected = view.text_font.clone();
+            egui::ComboBox::from_id_salt("text-tool-font")
+                .width((ui.available_width() - 8.0).max(120.0))
+                .selected_text(&selected)
+                .show_ui(ui, |ui| {
+                    for font_name in &view.available_fonts {
+                        if ui
+                            .selectable_value(&mut selected, font_name.clone(), font_name)
+                            .changed()
+                        {
+                            events
+                                .borrow_mut()
+                                .push(ToolbarEvent::TextFontChanged(selected.clone()));
+                        }
+                    }
+                });
+        });
+        ui.add_space(4.0);
+        property_row(ui, "Size", |ui| {
+            let mut size = view.text_size;
+            let input = ui.add(egui::DragValue::new(&mut size).range(5..=128));
+            let slider = ui.add(egui::Slider::new(&mut size, 5..=128).show_value(false));
+            let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+            if (input.changed() || slider.changed()) && size != view.text_size {
+                events
+                    .borrow_mut()
+                    .push(ToolbarEvent::TextSizeChanged(size));
+            }
+            if reset.clicked() && view.text_size != 14 {
+                events
+                    .borrow_mut()
+                    .push(ToolbarEvent::TextSizeChanged(14));
+            }
+        });
+        ui.add_space(4.0);
+        self.transform_properties(ui, view, chrome);
+    }
+
     /// The Tile (placer) tool's properties: the placement transform that BOTH the
     /// Q/R/X/Z shortcuts and these controls drive.
     ///
@@ -356,24 +426,38 @@ impl ToolPropertyComponent {
                 (TransformAlgorithm::RotSprite, "RotSprite"),
                 (TransformAlgorithm::CleanEdge, "CleanEdge"),
                 (TransformAlgorithm::Rotxel, "Rotxel"),
+                (TransformAlgorithm::PyxRot, "PyxRot"),
             ];
-            for (algorithm, label) in algorithms {
-                if chrome
-                    .button(
-                        ui,
-                        label,
-                        ButtonStyle::toggled(view.transform_algorithm == algorithm),
-                    )
-                    .clicked()
-                {
-                    events
-                        .borrow_mut()
-                        .push(ToolbarEvent::TransformAlgorithmChanged(algorithm));
-                }
-            }
+            let current = algorithms
+                .iter()
+                .find(|(a, _)| *a == view.transform_algorithm)
+                .map(|(_, l)| *l)
+                .unwrap_or("RotSprite");
+            egui::ComboBox::from_id_salt("tool_prop_transform_algorithm")
+                .width(ui.available_width().clamp(110.0, 180.0))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (algorithm, label) in algorithms {
+                        let selected = view.transform_algorithm == algorithm;
+                        if chrome.combo_item(ui, selected, label).clicked() && !selected {
+                            events
+                                .borrow_mut()
+                                .push(ToolbarEvent::TransformAlgorithmChanged(algorithm));
+                        }
+                    }
+                });
         });
         ui.add_space(4.0);
-        ui.weak("Rotate (R / Shift+R) · Scale (+ / -) · Flip (H / V) · Cancel (Esc)");
+        ui.weak(format!(
+            "Rotate ({} / {}) · Scale ({} / {}) · Flip ({} / {}) · Cancel ({})",
+            view.shortcuts.transform_rotate_cw,
+            view.shortcuts.transform_rotate_ccw,
+            view.shortcuts.transform_grow,
+            view.shortcuts.transform_shrink,
+            view.shortcuts.flip_h,
+            view.shortcuts.flip_v,
+            view.shortcuts.cancel_transform,
+        ));
     }
 }
 
