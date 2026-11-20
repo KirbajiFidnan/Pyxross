@@ -173,5 +173,5 @@ Pyxross Workshop would not exist without the incredible open-source community an
 
 ## 📜 License
 
-**Pyxross Workshop** is created by **Hacı Can "Kuzg" Güngör** and distributed under the **[MIT License](LICENSE)**.
+**Pyxross Workshop** is created by **Kuzg-Pixel (Hacı Can Güngör)** and distributed under the **[MIT License](LICENSE)**.
 The embedded JetBrains Mono Nerd Font is licensed under the **[SIL Open Font License 1.1](assets/fonts/OFL.txt)**.
