@@ -1,0 +1,28 @@
+name: Feature Request
+description: Suggest a new tool, workflow improvement, or format support
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What workflow or game-asset problem does this solve?
+      description: Describe what you are trying to create or streamline.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: How would you like this feature to work in Pyxross Workshop?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context / References
+      description: Optional screenshots, mockups, or examples from other pixel art tools.
+    validations:
+      required: false

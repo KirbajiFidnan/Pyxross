@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64, GLIBC 2.35)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            curl \
+            file \
+            libwayland-dev \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            pkg-config \
+            python3 \
+            squashfs-tools
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install appimagetool
+        run: |
+          curl -fsSL -o /tmp/appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool.AppImage
+          sudo mkdir -p /opt
+          (cd /opt && sudo /tmp/appimagetool.AppImage --appimage-extract)
+          sudo mv /opt/squashfs-root /opt/appimagetool
+          sudo chmod -R a+rX /opt/appimagetool
+          sudo ln -sf /opt/appimagetool/AppRun /usr/local/bin/appimagetool
+          rm -f /tmp/appimagetool.AppImage
+
+      - name: Verify core purity and unit tests
+        run: |
+          ./scripts/check-core-purity.sh
+          cargo test --locked
+
+      - name: Package Linux tar.gz and AppImage
+        env:
+          ARCH: x86_64
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          ./scripts/package-linux.sh
+          (cd dist && sha256sum -c SHA256SUMS)
+          objdump -T target/x86_64-unknown-linux-gnu/release/pyxross \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 5
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/pyxross-*-linux-x86_64.tar.gz
+            dist/pyxross-*-linux-x86_64.AppImage
+            dist/SHA256SUMS
+
+  build-windows:
+    name: Build Windows (x86_64-msvc)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Run unit tests on Windows
+        shell: pwsh
+        run: cargo test --locked --lib
+
+      - name: Package Windows portable ZIP
+        shell: pwsh
+        run: |
+          $env:SOURCE_DATE_EPOCH = (git log -1 --format=%ct).Trim()
+          & .\scripts\package-windows.ps1
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/pyxross-*-windows-x86_64-portable.zip
+            dist/SHA256SUMS-windows
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/RELEASE_NOTES.md
+          files: release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: true

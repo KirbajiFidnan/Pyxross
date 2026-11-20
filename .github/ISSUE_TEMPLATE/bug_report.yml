@@ -1,0 +1,66 @@
+name: Bug Report
+description: Report a bug, crash, or platform compatibility issue in Pyxross Workshop
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Pyxross Workshop! Because Pyxross is a young, actively developed project, environment details below help us reproduce and fix issues much faster.
+
+  - type: input
+    id: version
+    attributes:
+      label: Pyxross Version
+      placeholder: e.g., v0.9.0 (AppImage / tar.gz / Windows portable / source)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux (Wayland)
+        - Linux (X11)
+        - Windows 11
+        - Windows 10
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Distro / Desktop Environment / GPU
+      description: e.g., Ubuntu 24.04 + GNOME Wayland + AMD RX 6700 XT, or Windows 11 + NVIDIA RTX 3060
+      placeholder: Distro, DE/WM, GPU driver
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug or crash.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Open Pyxross Workshop
+        2. Create a 64x64 document
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen instead.
+    validations:
+      required: false
