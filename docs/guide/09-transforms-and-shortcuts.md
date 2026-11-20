@@ -82,7 +82,7 @@ While a transform is active, the **Tool Property** panel lets you pick the pixel
 - **No Hardware Vulkan/GPU (VMs / Older Laptops):** Pyxross automatically falls back to OpenGL and software rendering (`llvmpipe`/`lavapipe`).
 
 ### Windows
-- **Windows SmartScreen Warning:** Portable builds are currently unsigned; click *More info → Run anyway* if you downloaded directly from the official GitHub Releases page and verified `SHA256SUMS-windows`.
+- **Windows SmartScreen Warning:** Portable builds are currently unsigned; click *More info → Run anyway* if you downloaded directly from the official GitHub Releases page and verified its GitHub SHA-256 digest.
 - **Keep Folder Structure Intact:** Keep `themes/` and `banners/` in the same folder as `pyxross.exe`.
 
 ### Config & Data Locations

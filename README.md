@@ -93,10 +93,6 @@ Built on an **Ubuntu 22.04 LTS (`GLIBC 2.35`)** baseline for broad compatibility
   cd pyxross-0.9.0-linux-x86_64
   ./pyxross
   ```
-- **Verify Checksums:**
-  ```sh
-  sha256sum -c SHA256SUMS
-  ```
 
 > **Linux DE Note (GNOME Wayland):** GNOME Mutter does not implement `wlr-data-control`. In-app copy/paste works normally, while OS-level image copy/paste with external apps on GNOME Wayland may fall back to the internal clipboard.
 

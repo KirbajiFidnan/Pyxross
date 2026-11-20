@@ -75,7 +75,6 @@ jobs:
           path: |
             dist/pyxross-*-linux-x86_64.tar.gz
             dist/pyxross-*-linux-x86_64.AppImage
-            dist/SHA256SUMS
 
   build-windows:
     name: Build Windows (x86_64-msvc)
@@ -105,7 +104,6 @@ jobs:
           name: release-windows
           path: |
             dist/pyxross-*-windows-x86_64-portable.zip
-            dist/SHA256SUMS-windows
 
   publish:
     name: Publish GitHub Release
