@@ -42,7 +42,7 @@ winit = "0.30.13"
 # P01 Phase 0 spike (projection PoC) — Linux-gated dev deps.
 # wayland-client/system is REQUIRED: wgpu-hal's Vulkan backend calls
 # vkCreateWaylandSurfaceKHR with raw C pointers from the system libwayland.
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 raw-window-handle = "0.6.2"
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["calloop"] }
 wayland-client = { version = "0.31.15", features = ["system"] }

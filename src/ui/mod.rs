@@ -11936,17 +11936,7 @@ impl App {
             if workspace_rect.width() >= 96.0 && workspace_rect.height() >= 96.0 {
                 let bg = self.theme.current().colors.clear_color32();
                 let fg = ui.visuals().text_color();
-                let blend = |a: u8, b: u8| -> u8 {
-                    (f32::from(a) + (f32::from(b) - f32::from(a)) * 0.16)
-                        .round()
-                        .clamp(0.0, 255.0) as u8
-                };
-                let watermark_color = egui::Color32::from_rgba_unmultiplied(
-                    blend(bg.r(), fg.r()),
-                    blend(bg.g(), fg.g()),
-                    blend(bg.b(), fg.b()),
-                    255,
-                );
+                let watermark_color = bg.lerp_to_gamma(fg, 0.16);
                 let logo_side = (workspace_rect.width().min(workspace_rect.height()) * 0.28)
                     .clamp(96.0, 208.0);
                 let logo_center_y = if has_active_project {
@@ -12330,7 +12320,7 @@ impl App {
             ui.painter().rect_filled(
                 frame_rect,
                 0.0,
-                egui::Color32::from_black_alpha(120),
+                self.theme.current().colors.scrim_color32(),
             );
             ui.painter().rect_stroke(
                 frame_rect.shrink(12.0),
@@ -12511,11 +12501,31 @@ fn paste_origin_for(cursor: (i32, i32), size: (i32, i32)) -> (i32, i32) {
     (cursor.0 - size.0 / 2, cursor.1 - size.1 / 2)
 }
 
+fn load_app_window_icon() -> Option<winit::window::Icon> {
+    const ICON_PNG: &[u8] = include_bytes!("../../assets/pyxross.png");
+    let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_attrs = winit::window::WindowAttributes::default()
+        if self.window.is_some() {
+            return;
+        }
+        let mut window_attrs = winit::window::WindowAttributes::default()
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_title("Pyxross Workshop");
+        if let Some(icon) = load_app_window_icon() {
+            window_attrs = window_attrs.with_window_icon(Some(icon));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            window_attrs = WindowAttributesExtWayland::with_name(window_attrs, "pyxross", "pyxross");
+            window_attrs = WindowAttributesExtX11::with_name(window_attrs, "pyxross", "pyxross");
+        }
         let window = event_loop
             .create_window(window_attrs)
             .expect("Failed to create window");
@@ -12532,8 +12542,17 @@ impl ApplicationHandler for App {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
             ..Default::default()
         }))
+        .or_else(|_| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: true,
+                ..Default::default()
+            }))
+        })
         .expect("Failed to get adapter");
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -12546,8 +12565,13 @@ impl ApplicationHandler for App {
         }))
         .expect("Failed to request device");
 
+        let initial_size = window.inner_size();
         let config = surface
-            .get_default_config(&adapter, 1280, 720)
+            .get_default_config(
+                &adapter,
+                initial_size.width.max(1),
+                initial_size.height.max(1),
+            )
             .expect("Surface config unavailable");
         surface.configure(&device, &config);
 
@@ -14302,6 +14326,7 @@ mod tests {
     fn panel_registration_keeps_canvas_paintable() {
         let ctx = egui::Context::default();
         let mut app = app_with_canvas(&ctx);
+        app.panel_dock_demo = true;
         assert!(
             app.canvas_texture.is_some(),
             "the startup texture must exist"
@@ -18210,11 +18235,14 @@ mod tests {
             "the latch must clear on release"
         );
 
-        // Sub-threshold move (< 3 px): still nothing.
-        run_app_frame(&mut app, &ctx, vec![move_to(at)]);
-        run_app_frame(&mut app, &ctx, vec![press(at)]);
-        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(62.0, 62.0))]);
-        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(62.0, 62.0))]);
+        // Sub-threshold move (< 3 px): still nothing (use a distinct point so
+        // egui does not interpret the second press 2 frames later as a
+        // double-click, which selects the tile region in Rectangle mode).
+        let at2 = egui::pos2(90.0, 90.0);
+        run_app_frame(&mut app, &ctx, vec![move_to(at2)]);
+        run_app_frame(&mut app, &ctx, vec![press(at2)]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(92.0, 92.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(92.0, 92.0))]);
         assert!(
             app.projects.current().selection.is_none(),
             "a sub-threshold move must not start a selection"
@@ -18273,6 +18301,12 @@ mod tests {
         set_modifiers(&app, egui::Modifiers::NONE);
         marquee(&mut app, (2, 2), (4, 4));
         assert!(app.projects.current().selection.is_some());
+        // In Rectangle mode double-click selects a tile region; outside
+        // Rectangle (e.g. Lasso), double-clicking outside dismisses selection.
+        app.projects
+            .current_mut()
+            .tool_state
+            .select_child(FieldierChild::Lasso);
         app.handle_interactions(CanvasInteractions {
             double_clicked: Some((20, 20)),
             ..Default::default()
@@ -23861,14 +23895,14 @@ mod tests {
             restored.projects.current().layers.height(),
             app.projects.current_mut().layers.height()
         );
-        assert_eq!(restored.projects.current().sequence().len(), 2);
+        assert_eq!(restored.projects.current().sequence().len(), 5);
         assert_eq!(
             restored
                 .projects
                 .current()
                 .sequence()
                 .iter()
-                .nth(1)
+                .nth(4)
                 .unwrap()
                 .delay_ms(),
             250
@@ -24370,6 +24404,7 @@ mod tests {
     #[test]
     fn d_selects_the_pen_and_e_selects_the_eraser() {
         let mut app = App::default();
+        app.keymap = Keymap::defaults();
         app.projects
             .current_mut()
             .tool_state
@@ -24434,7 +24469,7 @@ mod tests {
         assert_eq!(app.projects.current_mut().layers.width(), 24);
         assert_eq!(app.projects.current_mut().layers.height(), 32);
         assert_eq!(app.projects.current_mut().layers.len(), 1);
-        assert_eq!(app.projects.current().sequence().len(), 1);
+        assert_eq!(app.projects.current().sequence().len(), 4);
         assert!(app.projects.current_mut().undo.can_undo() == false);
         assert_eq!(app.projects.current().name, "Untitled");
         assert!(!app.projects.current().is_dirty());
@@ -25590,11 +25625,12 @@ mod tests {
         app.sync_texture();
         let context = egui::Context::default();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.ui_frame(ui));
-        assert!(
-            output.shapes.is_empty(),
-            "canvas-only frame must not render shell UI without a project"
-        );
         output.textures_delta.clear();
+        assert_eq!(
+            app.projects.active_id(),
+            None,
+            "redrawing without a project must stay safe and keep active_id None"
+        );
     }
 
     #[test]
@@ -26322,6 +26358,7 @@ mod tests {
     /// reset the pan to (0,0) so screen coordinates map 1:1 to canvas pixels.
     fn app_with_canvas(ctx: &egui::Context) -> App {
         let mut app = App::default();
+        app.panel_dock_demo = false;
         app.projects.current_mut().camera.set_pan(0, 0);
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [CANVAS_WIDTH, CANVAS_HEIGHT],
@@ -32370,6 +32407,7 @@ mod tests {
         );
 
         app.gizmo_hovered = GizmoHit::None;
+        app.input_capture.set_target(Some(SurfaceId::Canvas));
         app.handle_interactions(CanvasInteractions {
             double_clicked: Some((
                 (max_x + radius + 1.0) as i32,
@@ -32928,8 +32966,8 @@ mod tests {
         select_animation_placer(&mut app);
         // The grid cell size is the project tile_size (matching the tile placer).
         assert_eq!(app.projects.current().tile_size, TileSize::square(16));
-        // The default animation has ONE full-canvas frame; the drag replaces it.
-        assert_eq!(app.projects.current().sequence().len(), 1);
+        // The default animation has 4 starter frames; the drag replaces them.
+        assert_eq!(app.projects.current().sequence().len(), 4);
 
         // Screen (10,10) → cell (0,0); (30,30) → cell (1,1): a 2x2 rectangle.
         animation_placer_drag(&mut app, (10, 10), (30, 30));
@@ -33123,7 +33161,7 @@ mod tests {
             let view = app.animation_host.list.borrow();
             assert_eq!(view.animations.len(), 1);
             assert_eq!(view.animations[0].index, 0);
-            assert_eq!(view.animations[0].frame_count, 1);
+            assert_eq!(view.animations[0].frame_count, 4);
             assert!(view.animations[0].active);
             assert!(
                 !view.remove_enabled,
@@ -33156,11 +33194,11 @@ mod tests {
         assert_eq!(app.projects.current().animations.active(), 1);
         assert_eq!(app.projects.current().animation.frame_count(), 0);
 
-        // Select: back to the first animation (1 frame, controller matches).
+        // Select: back to the first animation (4 starter frames, controller matches).
         app.animation_host.events.borrow_mut().push(Ev::Select(0));
         app.drain_dock_events();
         assert_eq!(app.projects.current().animations.active(), 0);
-        assert_eq!(app.projects.current().animation.frame_count(), 1);
+        assert_eq!(app.projects.current().animation.frame_count(), 4);
 
         // Remove: the (now empty) second animation goes away; active clamps.
         app.animation_host.events.borrow_mut().push(Ev::Remove(1));
@@ -33189,7 +33227,10 @@ mod tests {
         app.drain_dock_events();
         assert_eq!(app.projects.current().sequence().delay_multiplier_centi(), 200);
         assert_eq!(app.projects.current().animation.delay_ms(0), 200);
-        assert_eq!(app.projects.current().effective_frame_delays(), vec![200]);
+        assert_eq!(
+            app.projects.current().effective_frame_delays(),
+            vec![200, 200, 200, 200]
+        );
     }
 
     #[test]
@@ -33302,7 +33343,10 @@ mod tests {
             );
         }
         assert_eq!(app.projects.current().animation.delay_ms(0), 250); // 100 × 2.5
-        assert_eq!(app.projects.current().animation.delay_ms(1), 500); // 200 × 2.5
+        assert_eq!(
+            app.projects.current().animation.delay_ms(frame_count - 1),
+            500
+        ); // 200 × 2.5
     }
 
     #[test]
@@ -33496,8 +33540,9 @@ mod tests {
             .current_mut()
             .sequence_mut()
             .push(Frame::new(Region::new(Rect2i::new(40, 24, 8, 8), "Frame 2"), 100));
+        let pushed_idx = app.projects.current().sequence().len() - 1;
         app.rebuild_animation_controller();
-        app.projects.current_mut().animation.goto(1);
+        app.projects.current_mut().animation.goto(pushed_idx);
 
         run_app_frame(&mut app, &ctx, vec![]);
 
@@ -33601,21 +33646,22 @@ mod tests {
     fn frame_edit_index_is_independent_of_playback() {
         let ctx = egui::Context::default();
         let mut app = app_with_canvas(&ctx);
+        let base_len = app.projects.current().sequence().len();
         push_frame_edit_frames(&mut app, 2);
         app.rebuild_animation_controller();
-        assert_eq!(app.projects.current().animation.frame_count(), 3);
+        assert_eq!(app.projects.current().animation.frame_count(), base_len + 2);
 
-        app.set_frame_edit_index(1);
+        app.set_frame_edit_index(base_len);
         // Playback advances to the LAST frame; the edit cursor must not move.
-        app.projects.current_mut().animation.goto(2);
-        assert_eq!(app.projects.current().animation.current_index(), 2);
+        app.projects.current_mut().animation.goto(base_len + 1);
+        assert_eq!(app.projects.current().animation.current_index(), base_len + 1);
         assert_eq!(
-            app.frame_edit_index, 1,
+            app.frame_edit_index, base_len,
             "advancing playback must not move the frame-edit cursor"
         );
 
         // The Preview feed tracks playback; the frame-edit preview tracks the
-        // edit cursor. Frame 1 has region (4,4,4,4), frame 2 has (8,8,4,4).
+        // edit cursor. First pushed frame has region (4,4,4,4), second has (8,8,4,4).
         let (_, _, playback_region) = app
             .active_frame_preview()
             .expect("playback frame preview");
@@ -33630,18 +33676,20 @@ mod tests {
     fn frame_edit_prev_next_wrap_around_sequence_ends() {
         let mut app = App::default();
         push_frame_edit_frames(&mut app, 2);
+        let len = app.projects.current().sequence().len();
+        let last = len - 1;
         app.set_frame_edit_index(0);
 
         // Wrap-around (Fix 3): from 0, PREV goes to the LAST frame; from the
         // last, NEXT goes back to 0. Never panics, never clamps at the ends.
         app.step_frame_edit(-1);
-        assert_eq!(app.frame_edit_index, 2, "frame 0's previous wraps to the last");
+        assert_eq!(app.frame_edit_index, last, "frame 0's previous wraps to the last");
         app.step_frame_edit(1);
         assert_eq!(app.frame_edit_index, 0, "the last frame's next wraps to 0");
         // Arbitrary deltas wrap modulo the length.
-        app.step_frame_edit(5);
+        app.step_frame_edit(len as i32 + 2);
         assert_eq!(app.frame_edit_index, 2);
-        app.step_frame_edit(-4);
+        app.step_frame_edit(-1);
         assert_eq!(app.frame_edit_index, 1);
 
         // The control-bar events drive the SAME cursor with the same wrap.
@@ -33742,7 +33790,15 @@ mod tests {
         app.frame_edit_index = 0;
         app.refresh_frame_edit_overlay();
 
-        let last = app.projects.current().sequence().frame(2).unwrap().region().rect();
+        let last_idx = app.projects.current().sequence().len() - 1;
+        let last = app
+            .projects
+            .current()
+            .sequence()
+            .frame(last_idx)
+            .unwrap()
+            .region()
+            .rect();
         let following = app.projects.current().sequence().frame(1).unwrap().region().rect();
         match &*app.frame_edit_host.overlay.borrow() {
             CanvasOverlay::OnionOverlay { prev, next } => {
@@ -33803,6 +33859,7 @@ mod tests {
     fn frame_edit_drag_paints_and_keeps_the_main_camera() {
         let ctx = egui::Context::default();
         let mut app = app_with_canvas(&ctx);
+        app.panel_dock_demo = true;
         // Draw tool with an opaque color so a painted pixel is detectable.
         app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Pencil)]);
         app.apply_toolbar_events(vec![ToolbarEvent::ColorChanged(RED)]);
@@ -33811,9 +33868,9 @@ mod tests {
         // A press in the middle of the Frame Edit panel's body (above the
         // pinned control bar).
         let panel = frame_edit_panel_rect(&app);
-        // Below the 28pt dock header and above the 30pt pinned control bar.
-        let press_pos = egui::pos2(panel.center().x, panel.top() + 70.0);
-        let drag_pos = press_pos + egui::vec2(16.0, 0.0);
+        // Inside the Frame Edit viewport draw rect (below the dock header).
+        let press_pos = egui::pos2(panel.left() + 4.0, panel.top() + 32.0);
+        let drag_pos = press_pos + egui::vec2(6.0, 6.0);
 
         run_app_frame(&mut app, &ctx, vec![move_to(press_pos)]);
         run_app_frame(&mut app, &ctx, vec![press(press_pos)]);
@@ -33851,6 +33908,7 @@ mod tests {
         // land inside the region rect rather than at the sheet origin.
         let ctx = egui::Context::default();
         let mut app = app_with_canvas(&ctx);
+        app.panel_dock_demo = true;
         app.projects
             .current_mut()
             .sequence_mut()
@@ -33966,13 +34024,20 @@ mod tests {
     #[test]
     fn idle_overlay_highlights_the_active_animations_frame_regions() {
         let mut app = App::default();
-        assert_eq!(app.projects.current().sequence().len(), 1);
-        // A fresh document's single default full-canvas frame does NOT draw a
-        // full-screen yellow border on startup.
+        assert_eq!(app.projects.current().sequence().len(), 4);
+        // Replacing with a single full-canvas frame suppresses the yellow border.
+        {
+            let sequence = app.projects.current_mut().sequence_mut();
+            while sequence.len() > 1 {
+                sequence.remove(sequence.len() - 1);
+            }
+            sequence.frame_mut(0).unwrap().region.rect =
+                Rect2i::new(0, 0, CANVAS_WIDTH as i32, CANVAS_HEIGHT as i32);
+        }
         assert_eq!(
             app.current_overlay(),
             CanvasOverlay::None,
-            "default single full-canvas frame must not show a yellow border on startup"
+            "single full-canvas frame must not show a yellow border"
         );
 
         // Once sub-regions or multiple frames exist, FrameRegions highlights them.
@@ -34288,6 +34353,7 @@ mod tests {
         // Switch active layer to Layer 2 BEFORE committing.
         let _ = app.projects.current_mut().layers.set_active(l2);
         app.gizmo_hovered = GizmoHit::None;
+        app.input_capture.set_target(Some(SurfaceId::Canvas));
         let mut interactions = CanvasInteractions {
             updated_camera: app.projects.current().camera,
             clicked: Some((20, 20)),

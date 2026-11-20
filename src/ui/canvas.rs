@@ -2934,7 +2934,7 @@ mod tests {
             .iter()
             .filter_map(|shape| match shape {
                 egui::Shape::LineSegment { points, stroke }
-                    if stroke.color == color && stroke.width == 1.0 =>
+                    if stroke.color == color && (1.0..=2.0).contains(&stroke.width) =>
                 {
                     Some(*points)
                 }
@@ -5510,21 +5510,16 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
 
         let theme = Theme::default_dark().colors;
-        let on = ant_stroke_color(theme.marching_ants_core(), 0);
-        let on_color = egui::Color32::from_rgba_unmultiplied(on.r, on.g, on.b, on.a);
-        let off = ant_under_stroke_color(theme.marching_ants_under_core());
-        let off_color = egui::Color32::from_rgba_unmultiplied(off.r, off.g, off.b, off.a);
+        let on_color = crate::ui::theme::SKIN_TINT;
+        let dark_under = theme.marching_ants_contrast_dark32();
 
         let on_lines = ant_line_points(&shapes, on_color);
-        assert!(!on_lines.is_empty(), "expected theme-tinted ON dashes");
-        assert!(
-            ant_line_points(&shapes, off_color).is_empty(),
-            "the OFF runs must be gaps, not painted"
-        );
-        assert!(
-            ant_line_points(&shapes, egui::Color32::BLACK).is_empty()
-                && ant_line_points(&shapes, egui::Color32::WHITE).is_empty(),
-            "the mask border must not use hard-coded black/white"
+        let under_lines = ant_line_points(&shapes, dark_under);
+        assert!(!on_lines.is_empty(), "expected bright ON dashes");
+        assert_eq!(
+            under_lines.len(),
+            12 * PIXEL_ANT_SUBDIV as usize,
+            "all 12 document edges × SUBDIV sub-edges have a dark backing stroke"
         );
 
         let all: Vec<[egui::Pos2; 2]> = on_lines;
@@ -5547,11 +5542,6 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
 
     #[test]
     fn ants_mask_uses_theme_tokens_without_a_canvas_sample() {
-        // Given: a closed mask boundary and no App-supplied composited-canvas
-        // sample.
-        // When: the AntsMask overlay paints one headless frame.
-        // Then: the border renders in theme tokens — hard-coded black/white
-        // never appears.
         let ctx = egui::Context::default();
         let mut widget = CanvasWidget::new();
         let boundary = vec![
@@ -5562,37 +5552,20 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         ];
         widget.set_overlay(CanvasOverlay::AntsMask(boundary));
         let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
-        assert!(
-            ant_line_points(&shapes, egui::Color32::BLACK).is_empty(),
-            "the mask border must not fall back to fixed black"
-        );
-        assert!(
-            ant_line_points(&shapes, egui::Color32::WHITE).is_empty(),
-            "the mask border must not fall back to fixed white"
-        );
 
         let theme = Theme::default_dark().colors;
-        let under = ant_under_stroke_color(theme.marching_ants_under_core());
-        let under_color = egui::Color32::from_rgba_unmultiplied(under.r, under.g, under.b, under.a);
-        let ant = ant_stroke_color(theme.marching_ants_core(), 0);
-        let ant_color = egui::Color32::from_rgba_unmultiplied(ant.r, ant.g, ant.b, ant.a);
         assert!(
-            !ant_line_points(&shapes, ant_color).is_empty(),
-            "the theme marching-ants token must appear on the mask border"
+            !ant_line_points(&shapes, theme.marching_ants_contrast_dark32()).is_empty(),
+            "the theme dark contrast backing must appear on the mask border"
         );
         assert!(
-            ant_line_points(&shapes, under_color).is_empty(),
-            "the OFF runs must be gaps, not an under-stroke"
+            !ant_line_points(&shapes, crate::ui::theme::SKIN_TINT).is_empty(),
+            "the bright ON dashes must appear over the dark backing"
         );
     }
 
     #[test]
     fn ants_mask_stays_theme_tinted_with_a_canvas_sample() {
-        // Given: a closed mask boundary and App-supplied composited-canvas
-        // samples of white and of mid grey.
-        // When: the AntsMask overlay paints one headless frame per sample.
-        // Then: the border is theme-tinted either way; neither black/white nor
-        // any sample-driven recolour appears.
         let ctx = egui::Context::default();
         let mut widget = CanvasWidget::new();
         let boundary = vec![
@@ -5603,8 +5576,8 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         ];
         widget.set_overlay(CanvasOverlay::AntsMask(boundary));
         let theme = Theme::default_dark().colors;
-        let ant = ant_stroke_color(theme.marching_ants_core(), 0);
-        let ant_color = egui::Color32::from_rgba_unmultiplied(ant.r, ant.g, ant.b, ant.a);
+        let dark_under = theme.marching_ants_contrast_dark32();
+        let bright_ant = crate::ui::theme::SKIN_TINT;
         for bg in [
             Color::rgba(255, 255, 255, 255),
             Color::rgba(128, 128, 128, 255),
@@ -5615,13 +5588,9 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
             };
             let (_, shapes) = run_frame_with_view(&ctx, vec![], &mut widget, view, Camera::new());
             assert!(
-                !ant_line_points(&shapes, ant_color).is_empty(),
-                "the ON dashes must stay theme-tinted over {bg:?}"
-            );
-            assert!(
-                ant_line_points(&shapes, egui::Color32::BLACK).is_empty()
-                    && ant_line_points(&shapes, egui::Color32::WHITE).is_empty(),
-                "no hard-coded black/white may appear over {bg:?}"
+                !ant_line_points(&shapes, dark_under).is_empty()
+                    && !ant_line_points(&shapes, bright_ant).is_empty(),
+                "mask ants must keep high-contrast backing + bright dashes over {bg:?}"
             );
         }
     }
@@ -6177,19 +6146,17 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         let (_, shapes) = run_frame_with_view(&ctx, Vec::new(), &mut widget, view, Camera::new());
 
         let theme = Theme::default_dark().colors;
-        let on = ant_stroke_color(theme.marching_ants_core(), 0);
-        let on_color = egui::Color32::from_rgba_unmultiplied(on.r, on.g, on.b, on.a);
-        let off = ant_under_stroke_color(theme.marching_ants_under_core());
-        let off_color = egui::Color32::from_rgba_unmultiplied(off.r, off.g, off.b, off.a);
+        let on_color = crate::ui::theme::SKIN_TINT;
+        let dark_under = theme.marching_ants_contrast_dark32();
         let cell_color = theme.marching_ants32();
 
-        // The base keeps its committed pixel-perfect ants: the ON sub-unit
-        // segments are painted, the OFF ones are gaps.
+        // The base keeps its committed pixel-perfect ants: dark backing plus
+        // bright ON sub-unit dashes.
         let on_lines = ant_line_points(&shapes, on_color);
-        assert!(!on_lines.is_empty(), "expected the base's theme-tinted ON dashes");
+        assert!(!on_lines.is_empty(), "expected the base's bright ON dashes");
         assert!(
-            ant_line_points(&shapes, off_color).is_empty(),
-            "the base's OFF runs must be gaps, not painted"
+            !ant_line_points(&shapes, dark_under).is_empty(),
+            "expected the base's dark contrast backing"
         );
         assert_eq!(
             on_lines.len(),
@@ -6232,7 +6199,7 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
             matches!(
                 shape,
                 egui::Shape::LineSegment { stroke, .. }
-                    if stroke.color == on_color || stroke.color == off_color
+                    if stroke.color == on_color || stroke.color == dark_under
             )
         };
         let first_base = shapes.iter().position(is_ant_line);

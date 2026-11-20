@@ -35,8 +35,17 @@ New-Item -ItemType Directory -Force (Join-Path $PackageRoot 'themes\builtin') | 
 Copy-Item $Binary (Join-Path $PackageRoot "$Package.exe")
 Copy-Item $Theme (Join-Path $PackageRoot 'themes\builtin\theme.json')
 Copy-Item $Atlas (Join-Path $PackageRoot 'themes\builtin\atlas.png')
+$BannersDir = Join-Path $RepoRoot 'banners'
+if (Test-Path $BannersDir) {
+    New-Item -ItemType Directory -Force (Join-Path $PackageRoot 'banners') | Out-Null
+    Copy-Item (Join-Path $BannersDir '*') (Join-Path $PackageRoot 'banners') -Recurse -Force -ErrorAction SilentlyContinue
+}
 Copy-Item (Join-Path $RepoRoot 'packaging\package-README.md') (Join-Path $PackageRoot 'README.md')
 Copy-Item (Join-Path $RepoRoot 'LICENSE') (Join-Path $PackageRoot 'LICENSE')
+$FontLicense = Join-Path $RepoRoot 'assets\fonts\OFL.txt'
+if (Test-Path $FontLicense) {
+    Copy-Item $FontLicense (Join-Path $PackageRoot 'LICENSE-FONT-OFL.txt')
+}
 if (Test-Path $Archive) { Remove-Item $Archive -Force }
 $Epoch = ([DateTimeOffset]'1970-01-01T00:00:00Z').AddSeconds([long]$env:SOURCE_DATE_EPOCH)
 $ZipStream = [System.IO.File]::Open($Archive, [System.IO.FileMode]::CreateNew)

@@ -88,6 +88,14 @@ impl Component for CreditsComponent {
                     "Image codecs, clipboard integration, serialization, and compression.",
                 );
                 ui.add_space(6.0);
+                credit_card(
+                    ui,
+                    chrome,
+                    "JetBrains Mono Nerd Font",
+                    "SIL Open Font License 1.1 (OFL-1.1)",
+                    "Embedded UI/icon font (JetBrains s.r.o. & Nerd Fonts contributors).",
+                );
+                ui.add_space(6.0);
             });
 
         ui.separator();

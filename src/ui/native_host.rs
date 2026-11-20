@@ -120,7 +120,7 @@ fn logical_geometry(
 fn native_host_backends() -> wgpu::Backends {
     #[cfg(target_os = "linux")]
     {
-        wgpu::Backends::VULKAN
+        wgpu::Backends::VULKAN | wgpu::Backends::GL
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -176,8 +176,17 @@ impl NativeWorkspaceHost {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
             ..Default::default()
         }))
+        .or_else(|_| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: true,
+                ..Default::default()
+            }))
+        })
         .map_err(|_| NativeHostError::AdapterUnavailable)?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("workspace"),
@@ -383,7 +392,7 @@ mod tests {
         let backends = native_host_backends();
 
         #[cfg(target_os = "linux")]
-        assert_eq!(backends, wgpu::Backends::VULKAN);
+        assert_eq!(backends, wgpu::Backends::VULKAN | wgpu::Backends::GL);
 
         #[cfg(not(target_os = "linux"))]
         assert_eq!(backends, wgpu::Backends::all());

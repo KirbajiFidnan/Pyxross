@@ -130,8 +130,8 @@ impl DockManager {
 
     /// Test-only dock that also registers the legacy dummy panels B/C/D, so the
     /// low-level dock geometry/z-order tests keep a multi-panel fixture.
-    #[cfg(test)]
-    pub(crate) fn demo_with_dummies() -> Self {
+    #[doc(hidden)]
+    pub fn demo_with_dummies() -> Self {
         Self::from_demo_specs(true)
     }
 

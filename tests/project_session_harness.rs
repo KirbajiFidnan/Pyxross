@@ -259,10 +259,10 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         lifecycle: "rebuilt when the theme or its dir changes",
     },
     AppOwnership {
-        field: "timeline",
+        field: "animation_host",
         owner: AppOwner::ShellGlobal,
-        rationale: "panel UI memory is shell-global",
-        lifecycle: "survives project switches",
+        rationale: "docked animation panel view/event host is shell-global",
+        lifecycle: "synchronized from the active project each frame",
     },
     AppOwnership {
         field: "panel_dock",
@@ -447,6 +447,318 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         owner: AppOwner::HostLocal,
         rationale: "cache generation is an approved host cache",
         lifecycle: "increments when host project cache invalidates",
+    },
+    AppOwnership {
+        field: "anim_rect_anchor",
+        owner: AppOwner::HostLocal,
+        rationale: "in-flight animation region drag anchor",
+        lifecycle: "set during drag, cleared on release or project switch",
+    },
+    AppOwnership {
+        field: "anim_rect_current",
+        owner: AppOwner::HostLocal,
+        rationale: "in-flight animation region drag cursor",
+        lifecycle: "updated during drag, cleared on release or project switch",
+    },
+    AppOwnership {
+        field: "anim_rect_dragging",
+        owner: AppOwner::HostLocal,
+        rationale: "in-flight animation region drag flag",
+        lifecycle: "true while dragging an animation region",
+    },
+    AppOwnership {
+        field: "banner_picker_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating banner picker panel host is shell-global",
+        lifecycle: "persists across project switches",
+    },
+    AppOwnership {
+        field: "banner_texture",
+        owner: AppOwner::HostLocal,
+        rationale: "GPU texture handle for the active top-bar banner",
+        lifecycle: "reloaded when banner selection changes",
+    },
+    AppOwnership {
+        field: "banner_thumb_cache",
+        owner: AppOwner::HostLocal,
+        rationale: "GPU thumbnail texture cache for banner picker",
+        lifecycle: "populated lazily when banner picker opens",
+    },
+    AppOwnership {
+        field: "create_document_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating new-document modal host is shell-global",
+        lifecycle: "opened on demand and closed on confirm/cancel",
+    },
+    AppOwnership {
+        field: "credits_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating credits modal host is shell-global",
+        lifecycle: "opened on demand and closed on dismiss",
+    },
+    AppOwnership {
+        field: "discovered_fonts",
+        owner: AppOwner::ShellGlobal,
+        rationale: "discovered system/bundled font list is host-wide",
+        lifecycle: "scanned once and reused across projects",
+    },
+    AppOwnership {
+        field: "dropped_file_hovering",
+        owner: AppOwner::HostLocal,
+        rationale: "OS drag-and-drop hover indicator for the host window",
+        lifecycle: "toggled by winit HoveredFile/DroppedFile events",
+    },
+    AppOwnership {
+        field: "editor_options",
+        owner: AppOwner::ShellGlobal,
+        rationale: "persisted editor options apply across all projects",
+        lifecycle: "loaded on startup and saved on change",
+    },
+    AppOwnership {
+        field: "editor_options_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating editor options panel host is shell-global",
+        lifecycle: "opened on demand and persists across project switches",
+    },
+    AppOwnership {
+        field: "exit_guard_queue",
+        owner: AppOwner::ShellGlobal,
+        rationale: "pending dirty projects awaiting close confirmation",
+        lifecycle: "populated on app close and drained as user responds",
+    },
+    AppOwnership {
+        field: "exit_guard_total",
+        owner: AppOwner::ShellGlobal,
+        rationale: "total dirty projects in the active exit guard sequence",
+        lifecycle: "reset when exit guard completes or cancels",
+    },
+    AppOwnership {
+        field: "exit_requested",
+        owner: AppOwner::HostLocal,
+        rationale: "host event-loop exit flag",
+        lifecycle: "set when exit guard clears and consumed in about_to_wait",
+    },
+    AppOwnership {
+        field: "exit_save_all_active",
+        owner: AppOwner::ShellGlobal,
+        rationale: "tracks Save All flow across queued dirty projects",
+        lifecycle: "cleared when exit guard completes or cancels",
+    },
+    AppOwnership {
+        field: "export_animation_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating animation export modal host is shell-global",
+        lifecycle: "opened on demand and closed on confirm/cancel",
+    },
+    AppOwnership {
+        field: "file_chooser_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "in-app file manager panel host is shell-global",
+        lifecycle: "opened on demand and persists last directory",
+    },
+    AppOwnership {
+        field: "font_byte_cache",
+        owner: AppOwner::HostLocal,
+        rationale: "cached raw font bytes for text tool rendering",
+        lifecycle: "populated lazily per font path for process lifetime",
+    },
+    AppOwnership {
+        field: "frame_edit_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "docked frame editor panel host is shell-global",
+        lifecycle: "synchronized from the active project each frame",
+    },
+    AppOwnership {
+        field: "frame_edit_index",
+        owner: AppOwner::HostLocal,
+        rationale: "selected frame index in the frame editor host",
+        lifecycle: "updated by frame editor navigation and clamped per project",
+    },
+    AppOwnership {
+        field: "frame_preview_feed",
+        owner: AppOwner::HostLocal,
+        rationale: "GPU preview texture feed for animation playback",
+        lifecycle: "updated when the active animation frame changes",
+    },
+    AppOwnership {
+        field: "ghost_tile",
+        owner: AppOwner::HostLocal,
+        rationale: "ephemeral eyedropper ghost tile preview",
+        lifecycle: "cleared on tool change or commit",
+    },
+    AppOwnership {
+        field: "global_bg_color",
+        owner: AppOwner::ShellGlobal,
+        rationale: "shell-level background color shared with top bar",
+        lifecycle: "synchronized with active project secondary color",
+    },
+    AppOwnership {
+        field: "global_fg_color",
+        owner: AppOwner::ShellGlobal,
+        rationale: "shell-level foreground color shared with top bar",
+        lifecycle: "synchronized with active project primary color",
+    },
+    AppOwnership {
+        field: "img2pixel_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating image-to-pixel import panel host is shell-global",
+        lifecycle: "opened on demand and cleared on close",
+    },
+    AppOwnership {
+        field: "import_aseprite_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating Aseprite import modal host is shell-global",
+        lifecycle: "opened on demand and cleared on close",
+    },
+    AppOwnership {
+        field: "import_gif_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating GIF import modal host is shell-global",
+        lifecycle: "opened on demand and cleared on close",
+    },
+    AppOwnership {
+        field: "import_image_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating image import modal host is shell-global",
+        lifecycle: "opened on demand and cleared on close",
+    },
+    AppOwnership {
+        field: "import_pyxel_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating Pyxel import modal host is shell-global",
+        lifecycle: "opened on demand and cleared on close",
+    },
+    AppOwnership {
+        field: "keybindings_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating keybindings panel host is shell-global",
+        lifecycle: "opened on demand and applies edits to shell keymap",
+    },
+    AppOwnership {
+        field: "last_dir",
+        owner: AppOwner::ShellGlobal,
+        rationale: "last visited directory for file dialogs is shell-global",
+        lifecycle: "loaded from config and updated on open/save",
+    },
+    AppOwnership {
+        field: "last_error_seen",
+        owner: AppOwner::HostLocal,
+        rationale: "tracks last surfaced error banner to avoid repeats",
+        lifecycle: "updated as errors are displayed or dismissed",
+    },
+    AppOwnership {
+        field: "last_text_key_frame",
+        owner: AppOwner::HostLocal,
+        rationale: "frame counter deduplicating text tool keyboard input",
+        lifecycle: "updated per frame during text editing",
+    },
+    AppOwnership {
+        field: "os_clipboard_available",
+        owner: AppOwner::HostLocal,
+        rationale: "host capability flag for OS image clipboard availability",
+        lifecycle: "set when the native host initializes",
+    },
+    AppOwnership {
+        field: "pending_aseprite_import",
+        owner: AppOwner::HostLocal,
+        rationale: "decoded Aseprite payload awaiting import confirmation",
+        lifecycle: "set when file is selected and cleared on confirm/cancel",
+    },
+    AppOwnership {
+        field: "pending_gif_import",
+        owner: AppOwner::HostLocal,
+        rationale: "decoded GIF payload awaiting import confirmation",
+        lifecycle: "set when file is selected and cleared on confirm/cancel",
+    },
+    AppOwnership {
+        field: "pending_image_import",
+        owner: AppOwner::HostLocal,
+        rationale: "decoded image payload awaiting import confirmation",
+        lifecycle: "set when file is selected and cleared on confirm/cancel",
+    },
+    AppOwnership {
+        field: "pending_pyxel_import",
+        owner: AppOwner::HostLocal,
+        rationale: "decoded Pyxel payload awaiting import confirmation",
+        lifecycle: "set when file is selected and cleared on confirm/cancel",
+    },
+    AppOwnership {
+        field: "prev_alt",
+        owner: AppOwner::HostLocal,
+        rationale: "previous frame Alt modifier edge-detection state",
+        lifecycle: "updated every frame by the host input loop",
+    },
+    AppOwnership {
+        field: "recovery_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating crash-recovery prompt host is shell-global",
+        lifecycle: "opened when a recovery journal is detected",
+    },
+    AppOwnership {
+        field: "resize_canvas_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating canvas resize modal host is shell-global",
+        lifecycle: "opened on demand and cleared on confirm/cancel",
+    },
+    AppOwnership {
+        field: "save_as_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating save-as/export modal host is shell-global",
+        lifecycle: "opened on demand and cleared on confirm/cancel",
+    },
+    AppOwnership {
+        field: "save_toast",
+        owner: AppOwner::HostLocal,
+        rationale: "transient on-screen save confirmation toast",
+        lifecycle: "expires automatically after toast duration",
+    },
+    AppOwnership {
+        field: "style_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating UI style panel host is shell-global",
+        lifecycle: "opened on demand and edits shell UI style",
+    },
+    AppOwnership {
+        field: "tile_placer_transform",
+        owner: AppOwner::HostLocal,
+        rationale: "ephemeral tile placement flip/rotation state",
+        lifecycle: "updated by placement shortcuts while tile tool is active",
+    },
+    AppOwnership {
+        field: "tile_rect_anchor",
+        owner: AppOwner::HostLocal,
+        rationale: "in-flight shift-drag tile rectangle anchor",
+        lifecycle: "set on drag start and cleared on release",
+    },
+    AppOwnership {
+        field: "tile_rect_current",
+        owner: AppOwner::HostLocal,
+        rationale: "in-flight shift-drag tile rectangle cursor",
+        lifecycle: "updated during drag and cleared on release",
+    },
+    AppOwnership {
+        field: "tile_rect_deleting",
+        owner: AppOwner::HostLocal,
+        rationale: "whether in-flight tile rectangle drag is erasing",
+        lifecycle: "set on drag start and cleared on release",
+    },
+    AppOwnership {
+        field: "top_bar",
+        owner: AppOwner::ShellGlobal,
+        rationale: "persistent top bar menu/tab chrome state is shell-global",
+        lifecycle: "lives for the shell lifetime across project switches",
+    },
+    AppOwnership {
+        field: "ui_style",
+        owner: AppOwner::ShellGlobal,
+        rationale: "persisted UI style preferences apply shell-wide",
+        lifecycle: "loaded on startup and saved on change",
+    },
+    AppOwnership {
+        field: "unsaved_guard_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating unsaved-changes guard modal host is shell-global",
+        lifecycle: "opened when closing dirty projects or exiting",
     },
 ];
 
@@ -787,17 +1099,24 @@ fn ownership_source_inventory_matches_session_and_host_boundaries() {
         ),
         ("src/ui/settings.rs", include_str!("../src/ui/settings.rs")),
         ("src/ui/theme.rs", include_str!("../src/ui/theme.rs")),
-        ("src/ui/timeline.rs", include_str!("../src/ui/timeline.rs")),
+        (
+            "src/ui/dock_animations_panel.rs",
+            include_str!("../src/ui/dock_animations_panel.rs"),
+        ),
         ("src/ui/toolbar.rs", include_str!("../src/ui/toolbar.rs")),
     ];
+    let contains_ident = |text: &str, ident: &str| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == ident)
+    };
     for (path, source) in view_sources {
         for struct_body in struct_bodies(source) {
             assert!(
-                !struct_body.contains("Document"),
+                !contains_ident(struct_body, "Document"),
                 "{path} stores Document in a view/host struct"
             );
             assert!(
-                !struct_body.contains("ProjectSession"),
+                !contains_ident(struct_body, "ProjectSession"),
                 "{path} stores ProjectSession in a view/host struct"
             );
         }
@@ -832,7 +1151,7 @@ fn every_project_local_category_survives_switch_without_cross_contamination() {
     store.activate(alpha).expect("alpha is open");
     {
         let session = store.current_mut();
-        session.tile_size = 4;
+        session.tile_size = pyxross::core::tilemap::TileSize::square(4);
         session.mark_dirty();
         session.save_generation = 3;
         session.recovery_pending = true;
@@ -846,7 +1165,7 @@ fn every_project_local_category_survives_switch_without_cross_contamination() {
         session.layers.set_active(layer);
         session.animation.goto(0);
         session.camera.pan_by(3, 4);
-        session.sequence.set_looping(false);
+        session.sequence_mut().set_looping(false);
         session.animation.play();
         session.palettes.push(
             pyxross::core::palette::Palette::new("Alpha", vec![[1, 2, 3, 255]])
@@ -907,7 +1226,7 @@ fn every_project_local_category_survives_switch_without_cross_contamination() {
     assert!(store.current().selection.is_none());
     assert!(store.current().transform.is_none());
     assert_eq!(store.current().camera.pan(), (0, 0));
-    assert!(store.current().sequence.looping());
+    assert!(store.current().sequence().looping());
     assert!(!store.current().animation.is_playing());
     assert_eq!(store.current().active_palette, 0);
     assert_eq!(store.current().color, Color::BLACK);
@@ -915,14 +1234,17 @@ fn every_project_local_category_survives_switch_without_cross_contamination() {
     assert!(store.current().grid_visible);
     store.activate(alpha).expect("alpha is open");
     let preserved = store.current();
-    assert_eq!(preserved.tile_size, 4);
+    assert_eq!(
+        preserved.tile_size,
+        pyxross::core::tilemap::TileSize::square(4)
+    );
     assert!(preserved.is_dirty());
     assert_eq!(preserved.save_generation, 3);
     assert!(preserved.recovery_pending);
     assert!(preserved.selection.is_some());
     assert!(preserved.transform.is_some());
     assert_eq!(preserved.camera.pan(), (3, 4));
-    assert!(!preserved.sequence.looping());
+    assert!(!preserved.sequence().looping());
     assert!(preserved.animation.is_playing());
     assert_eq!(preserved.active_palette, 1);
     assert_eq!(preserved.color, Color::rgba(9, 8, 7, 255));
@@ -995,13 +1317,19 @@ fn frame_context_and_session_document_roundtrip_use_active_session() {
     let alpha = store.new_project("alpha", 2, 2).project();
     let beta = store.new_project("beta", 2, 2).project();
     store.activate(alpha).expect("alpha is open");
-    store.current_mut().tile_size = 3;
+    store.current_mut().tile_size = pyxross::core::tilemap::TileSize::square(3);
     store.current_mut().mark_dirty();
     assert_eq!(store.frame().id(), alpha);
-    assert_eq!(store.frame().to_document().tile_size, 3);
+    assert_eq!(
+        store.frame().to_document().tile_size,
+        pyxross::core::tilemap::TileSize::square(3)
+    );
     store.activate(beta).expect("beta is open");
     assert_eq!(store.frame().id(), beta);
-    assert_eq!(store.frame().to_document().tile_size, 16);
+    assert_eq!(
+        store.frame().to_document().tile_size,
+        pyxross::core::tilemap::TileSize::square(16)
+    );
     assert!(!store.frame().session().is_dirty());
 }
 

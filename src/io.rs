@@ -381,26 +381,62 @@ pub fn save_document_file(doc: &Document, path: &Path) -> Result<(), Persistence
 
     let parent = path.parent().map_or_else(|| Path::new("."), |value| value);
     fs::create_dir_all(parent).map_err(PersistenceError::Io)?;
-    let tmp = path.with_extension("tmp");
+    let tmp = sibling_temp_path(path, "tmp");
     fs::write(&tmp, bytes).map_err(PersistenceError::Io)?;
 
     #[cfg(windows)]
     {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                return Err(PersistenceError::Io(e));
-            }
+        if let Err(e) = replace_file_with_backup(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(PersistenceError::Io(e));
         }
     }
 
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(PersistenceError::Io(e));
+    #[cfg(not(windows))]
+    {
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(PersistenceError::Io(e));
+        }
     }
     Ok(())
+}
+
+fn sibling_temp_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("project"));
+    name.push(format!(".{suffix}"));
+    path.with_file_name(name)
+}
+
+/// Safe two-phase file replacement for platforms where `rename` cannot
+/// overwrite an existing destination (Windows): moves an existing `target`
+/// aside to a sibling `.bak`, renames `tmp` into place, and restores `.bak`
+/// if the final rename fails so the previous saved file is never lost.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn replace_file_with_backup(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    let backup = sibling_temp_path(target, "bak");
+    let had_target = target.exists();
+    if had_target {
+        let _ = fs::remove_file(&backup);
+        fs::rename(target, &backup)?;
+    }
+    match fs::rename(tmp, target) {
+        Ok(()) => {
+            if had_target {
+                let _ = fs::remove_file(&backup);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if had_target {
+                let _ = fs::rename(&backup, target);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Loads a `.pyxross` project saved by [`save_document`] (directory) or
@@ -2589,5 +2625,37 @@ mod tests {
             !file.exists(),
             "no file may be created when validation fails"
         );
+    }
+
+    #[test]
+    fn replace_file_with_backup_creates_overwrites_and_rolls_back_on_error() {
+        let dir = TempDir::new();
+        let target = dir.path().join("project.pyxross");
+        let tmp = sibling_temp_path(&target, "tmp");
+        let bak = sibling_temp_path(&target, "bak");
+
+        // 1. Fresh target (no pre-existing file)
+        fs::write(&tmp, b"v1").unwrap();
+        replace_file_with_backup(&tmp, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"v1");
+        assert!(!tmp.exists());
+        assert!(!bak.exists());
+
+        // 2. Overwrite existing target
+        fs::write(&tmp, b"v2").unwrap();
+        replace_file_with_backup(&tmp, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"v2");
+        assert!(!tmp.exists());
+        assert!(!bak.exists());
+
+        // 3. Failure during rename (missing tmp) restores previous target
+        let missing_tmp = dir.path().join("does_not_exist.tmp");
+        assert!(replace_file_with_backup(&missing_tmp, &target).is_err());
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"v2",
+            "existing file must be restored when replacement fails"
+        );
+        assert!(!bak.exists());
     }
 }

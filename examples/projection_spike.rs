@@ -15,6 +15,18 @@
 //!
 //! Exit: compositor closes the surface, Ctrl-C, or P0_FRAMES reached.
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("projection_spike is only supported on Linux Wayland compositors.");
+}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    linux::run();
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
 use std::ptr::NonNull;
 use std::time::Instant;
 
@@ -50,7 +62,7 @@ const REQUESTED_HEIGHT: u32 = 320;
 const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 const FPS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn main() {
+pub fn run() {
     let target_output = std::env::args().nth(1);
     let (width, height) = match std::env::var("P0_SIZE") {
         Ok(s) => {
@@ -662,3 +674,4 @@ delegate_output!(SpikeApp);
 delegate_layer!(SpikeApp);
 delegate_registry!(SpikeApp);
 delegate_noop!(SpikeApp: wl_region::WlRegion);
+}

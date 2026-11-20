@@ -64,9 +64,22 @@ impl RendererState {
         textures_delta: &egui::TexturesDelta,
         clear_color: egui::Color32,
     ) -> Result<(), ()> {
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+
         let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(st) => st,
-            wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
+            wgpu::CurrentSurfaceTexture::Success(st)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.resize(size.width, size.height);
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(st)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
+                    _ => return Err(()),
+                }
+            }
             _ => return Err(()),
         };
 
@@ -89,7 +102,7 @@ impl RendererState {
         }
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [window.inner_size().width, window.inner_size().height],
+            size_in_pixels: [size.width, size.height],
             pixels_per_point: window.scale_factor() as f32,
         };
 

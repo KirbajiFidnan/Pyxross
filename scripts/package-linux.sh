@@ -29,7 +29,8 @@ EOF
 
 cargo build --locked --release --target "$TARGET" --manifest-path "$REPO_ROOT/Cargo.toml" \
   || die "Linux $TARGET release build failed (toolchain/build blocker)"
-BINARY="$REPO_ROOT/target/$TARGET/release/$PACKAGE"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+BINARY="$TARGET_DIR/$TARGET/release/$PACKAGE"
 [ -x "$BINARY" ] || die "built binary not found at $BINARY (script/build error)"
 
 SOURCE_THEME="$REPO_ROOT/assets/themes/default/theme.json"
@@ -56,11 +57,17 @@ if [ -d "$REPO_ROOT/banners" ]; then
 fi
 cp "$REPO_ROOT/packaging/package-README.md" "$PACKAGE_ROOT/README.md"
 cp "$REPO_ROOT/LICENSE" "$PACKAGE_ROOT/LICENSE"
+if [ -f "$REPO_ROOT/assets/fonts/OFL.txt" ]; then
+  cp "$REPO_ROOT/assets/fonts/OFL.txt" "$PACKAGE_ROOT/LICENSE-FONT-OFL.txt"
+fi
 cp "$BINARY" "$APPDIR/usr/bin/$PACKAGE"
 cp "$SOURCE_THEME" "$APPDIR/usr/share/$PACKAGE/themes/builtin/theme.json"
 cp "$SOURCE_ATLAS" "$APPDIR/usr/share/$PACKAGE/themes/builtin/atlas.png"
 cp "$REPO_ROOT/packaging/package-README.md" "$APPDIR/usr/share/$PACKAGE/README.md"
 cp "$REPO_ROOT/LICENSE" "$APPDIR/usr/share/$PACKAGE/LICENSE"
+if [ -f "$REPO_ROOT/assets/fonts/OFL.txt" ]; then
+  cp "$REPO_ROOT/assets/fonts/OFL.txt" "$APPDIR/usr/share/$PACKAGE/LICENSE-FONT-OFL.txt"
+fi
 cp "$REPO_ROOT/packaging/pyxross.desktop" "$APPDIR/pyxross.desktop"
 cp "$REPO_ROOT/assets/pyxross.png" "$APPDIR/assets/pyxross.png"
 cp "$REPO_ROOT/assets/pyxross.png" "$APPDIR/pyxross.png"
@@ -77,7 +84,7 @@ chmod 0755 "$APPDIR/AppRun" "$PACKAGE_ROOT/$PACKAGE" "$APPDIR/usr/bin/$PACKAGE"
 tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - -C "$DIST_DIR" "$(basename "$PACKAGE_ROOT")" | gzip -n > "$ARCHIVE"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" appimagetool "$APPDIR" "$APPIMAGE" \
   || die 'appimagetool failed; no trustworthy AppImage artifact was accepted'
-sha256sum "$ARCHIVE" "$APPIMAGE" > "$DIST_DIR/SHA256SUMS"
+(cd "$DIST_DIR" && sha256sum "$(basename "$ARCHIVE")" "$(basename "$APPIMAGE")") > "$DIST_DIR/SHA256SUMS"
 
 tar -tzf "$ARCHIVE" | grep -Fx "$(basename "$PACKAGE_ROOT")/$PACKAGE" >/dev/null || die 'tar archive content check failed'
 tar -tzf "$ARCHIVE" | grep -Fx "$(basename "$PACKAGE_ROOT")/themes/builtin/theme.json" >/dev/null || die 'tar theme check failed'

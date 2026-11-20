@@ -1,0 +1,45 @@
+# Portable Linux release builder for Pyxross Workshop.
+# Uses Ubuntu 22.04 LTS (GLIBC 2.35) so release binaries and AppImages run
+# across Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS, Fedora, openSUSE,
+# SteamOS, and Arch Linux without GLIBC version mismatches.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binutils \
+    build-essential \
+    ca-certificates \
+    curl \
+    file \
+    libwayland-dev \
+    libx11-dev \
+    libxcb-render0-dev \
+    libxcb-shape0-dev \
+    libxcb-xfixes0-dev \
+    libxcb1-dev \
+    libxkbcommon-dev \
+    pkg-config \
+    python3 \
+    squashfs-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain matching Cargo.toml rust-version (1.95).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.95.0 --target x86_64-unknown-linux-gnu
+
+# Install appimagetool extracted so it runs in unprivileged containers without FUSE.
+RUN curl -fsSL -o /tmp/appimagetool.AppImage \
+    https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+    && chmod +x /tmp/appimagetool.AppImage \
+    && cd /opt \
+    && /tmp/appimagetool.AppImage --appimage-extract \
+    && mv /opt/squashfs-root /opt/appimagetool \
+    && chmod -R a+rX /opt/appimagetool \
+    && ln -s /opt/appimagetool/AppRun /usr/local/bin/appimagetool \
+    && rm -f /tmp/appimagetool.AppImage
+
+WORKDIR /work

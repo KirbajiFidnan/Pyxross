@@ -483,7 +483,7 @@ impl Img2PixelPanelContent {
                                     egui::pos2(0.0, 0.0),
                                     egui::pos2(1.0, 1.0),
                                 ),
-                                egui::Color32::WHITE,
+                                egui::Color32::WHITE, // NB: neutral texture tint
                             );
                         }
 
@@ -504,7 +504,7 @@ impl Img2PixelPanelContent {
                                     ui.painter().rect_filled(
                                         rect,
                                         0.0,
-                                        egui::Color32::from_rgb(r, g, b),
+                                        egui::Color32::from_rgb(r, g, b), // NB: artwork color
                                     );
                                 }
                             });

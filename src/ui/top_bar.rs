@@ -794,13 +794,13 @@ impl TopBarHost {
         let fg_resp = ui
             .interact(fg_rect, Id::new("top-bar-fg-swatch"), Sense::click())
             .on_hover_text("Foreground color (Click to open Color Picker)");
-        let bg32 = egui::Color32::from_rgba_unmultiplied(
+        let bg32 = egui::Color32::from_rgba_unmultiplied( // NB: artwork color
             self.bg_color.r,
             self.bg_color.g,
             self.bg_color.b,
             self.bg_color.a,
         );
-        let fg32 = egui::Color32::from_rgba_unmultiplied(
+        let fg32 = egui::Color32::from_rgba_unmultiplied( // NB: artwork color
             self.fg_color.r,
             self.fg_color.g,
             self.fg_color.b,
@@ -955,7 +955,7 @@ impl TopBarHost {
                     chosen = Some(row.item.action);
                 }
             } else {
-                painter.rect_filled(rect, 2.0, egui::Color32::from_black_alpha(45));
+                painter.rect_filled(rect, 2.0, colors.disabled_row_scrim32());
                 let disabled_text = weak_color.gamma_multiply(0.55);
                 painter.text(
                     pos2(rect.left() + MENU_ITEM_TEXT_INSET, rect.center().y),
@@ -1166,7 +1166,7 @@ fn truncate_label_to_width(
 ) -> (String, bool) {
     let measure = |s: &str| {
         painter
-            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::TRANSPARENT)
             .size()
             .x
     };

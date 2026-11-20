@@ -1035,7 +1035,7 @@ fn preview_ui(
                 texture.id(),
                 draw_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
+                egui::Color32::WHITE, // NB: neutral texture tint
             );
             ui.add_space(4.0);
             if let Some(p) = selected {

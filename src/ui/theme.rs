@@ -179,6 +179,18 @@ macro_rules! color_accessors {
 }
 
 impl ThemeColors {
+    /// Semi-transparent modal/drop-overlay scrim derived from the theme clear color.
+    pub fn scrim_color32(&self) -> egui::Color32 {
+        let [r, g, b, _] = self.clear_color;
+        egui::Color32::from_rgba_unmultiplied(r / 2, g / 2, b / 2, 120)
+    }
+
+    /// Subtle dark tint for disabled menu rows, derived from the theme panel background.
+    pub fn disabled_row_scrim32(&self) -> egui::Color32 {
+        let [r, g, b, _] = self.panel_bg;
+        egui::Color32::from_rgba_unmultiplied(r / 2, g / 2, b / 2, 45)
+    }
+
     color_accessors! {
         (clear_color, clear_color32, clear_color_core),
         (canvas_border, canvas_border32, canvas_border_core),
@@ -1388,6 +1400,9 @@ mod tests {
                     continue;
                 }
                 if line.contains("// NB: neutral texture tint") {
+                    continue;
+                }
+                if line.contains("// NB: artwork color") {
                     continue;
                 }
                 if line.contains("// NB: fixed mask border") {

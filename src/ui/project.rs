@@ -97,7 +97,7 @@ impl Ownership {
         Self { category: "camera", owner: OwnerClass::ProjectLocal, fields: "camera", close_policy: "discard with session" },
         Self { category: "animation/playback", owner: OwnerClass::ProjectLocal, fields: "animations, animation, onion_prev, onion_next", close_policy: "discard with session" },
         Self { category: "palette/colors", owner: OwnerClass::ProjectLocal, fields: "palettes, active_palette, color, secondary_color, tile_palette", close_policy: "discard with session" },
-        Self { category: "tool/brush/grid", owner: OwnerClass::ProjectLocal, fields: "tool_state, pen_draw_settings, eraser_draw_settings, grid_visible", close_policy: "discard with session" },
+        Self { category: "tool/brush/grid", owner: OwnerClass::ProjectLocal, fields: "tool_state, pen_draw_settings, eraser_draw_settings, grid_visible, text_font, text_size, text_align", close_policy: "discard with session" },
         Self { category: "canvas texture", owner: OwnerClass::ProjectLocal, fields: "canvas_generation", close_policy: "discard with session" },
         Self { category: "dialogs", owner: OwnerClass::ProjectLocal, fields: "tile_size, new_draft_w, new_draft_h, dialog_open, pending_action, last_error", close_policy: "discard with session" },
         Self { category: "keymap", owner: OwnerClass::ShellGlobal, fields: "App.keymap", close_policy: "retain" },
