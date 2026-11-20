@@ -1139,13 +1139,65 @@ fn pack_zip(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Builds a self-contained in-memory `.pyxel` archive for unit tests so the
+    /// repository does not need to check in a binary `.pyxel` fixture file.
+    pub(crate) fn synthetic_example_pyxel_bytes() -> Vec<u8> {
+        let tile_size = TileSize::new(16, 16);
+        let mut tile_palette = TilePalette::new();
+        for color in [
+            [0xd9u8, 0x38, 0x48, 0xff],
+            [0x57, 0xb3, 0x64, 0xff],
+            [0xf7, 0xe2, 0x6b, 0xff],
+        ] {
+            let pixels = color.repeat(16 * 16);
+            tile_palette.add(Tile {
+                id: TileId(0),
+                w: 16,
+                h: 16,
+                pixels,
+            });
+        }
+        let tile_ids: Vec<TileId> = tile_palette.tiles.iter().map(|t| t.id).collect();
+        let mut layers = LayerStack::new(256, 256);
+        let layer0_id = layers.active_layer().id;
+        layers.active_layer_mut().name = "Layer 0".to_string();
+        let mut tm = TileMap::new(tile_size, 16, 16);
+        tm.set_cell((2, 0), Some(TileCell::new(tile_ids[0])));
+        tm.set_cell((2, 2), Some(TileCell::new(tile_ids[1])));
+        tm.set_cell((4, 5), Some(TileCell::new(tile_ids[2])));
+        layers.active_layer_mut().tilemap = Some(tm);
+        layers.add_layer("Layer 1");
+        layers.add_layer("Layer 2");
+        layers.set_active(layer0_id);
+
+        let mut colors = vec![[0x33u8, 0x44, 0x55, 0xff]; 20];
+        for slot in &mut colors[8..12] {
+            *slot = [0, 0, 0, 0];
+        }
+        colors[12] = [0xf7, 0xe2, 0x6b, 0xff];
+        let palette = Palette {
+            version: 1,
+            name: "dungeon".to_string(),
+            colors,
+        };
+        export_pyxel_bytes(
+            "dungeon tileset1",
+            tile_size,
+            &layers,
+            &tile_palette,
+            &AnimationSet::new(),
+            Some(&palette),
+        )
+        .expect("synthetic .pyxel export should succeed")
+    }
 
     #[test]
     fn imports_example_pyxel_with_tiles_layers_and_palette() {
-        let bytes = include_bytes!("../../example.pyxel");
-        let imp = import_pyxel_bytes(bytes, "fallback").expect("example.pyxel should import");
+        let bytes = synthetic_example_pyxel_bytes();
+        let imp = import_pyxel_bytes(&bytes, "fallback").expect("example.pyxel should import");
         assert_eq!(imp.name, "dungeon tileset1");
         assert_eq!(imp.width, 256);
         assert_eq!(imp.height, 256);
@@ -1154,7 +1206,6 @@ mod tests {
         assert_eq!(imp.tile_palette.tiles.len(), 3);
         assert!(imp.palette.is_some());
         assert_eq!(imp.preview_rgba.len(), 256 * 256 * 4);
-        // Layer 0 in example.pyxel had 15 tileRefs.
         let layer0 = imp
             .layers
             .iter()
@@ -1168,8 +1219,8 @@ mod tests {
 
     #[test]
     fn export_and_reimport_round_trip_preserves_document() {
-        let bytes = include_bytes!("../../example.pyxel");
-        let imp = import_pyxel_bytes(bytes, "fallback").unwrap();
+        let bytes = synthetic_example_pyxel_bytes();
+        let imp = import_pyxel_bytes(&bytes, "fallback").unwrap();
         let exported = export_pyxel_bytes(
             &imp.name,
             imp.tile_size,

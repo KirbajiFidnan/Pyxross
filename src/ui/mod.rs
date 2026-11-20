@@ -34213,8 +34213,15 @@ mod tests {
 
     #[test]
     fn import_pyxel_opens_preview_panel_and_creates_project_then_exports_pyxel() {
+        let path = std::env::temp_dir().join(format!(
+            "pyxross_test_preview_{}.pyxel",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::core::pyxel::tests::synthetic_example_pyxel_bytes())
+            .expect("write temp pyxel");
         let mut app = App::new_empty();
-        app.file_import_pyxel_pick(std::path::Path::new("example.pyxel"));
+        app.file_import_pyxel_pick(&path);
+        let _ = std::fs::remove_file(&path);
         let pyxel_panel =
             panel_dock::PanelId::new(dock_import_pyxel_panel::IMPORT_PYXEL_PANEL_ID);
         assert!(app.panel_dock.placement(pyxel_panel).is_some());
@@ -34261,9 +34268,16 @@ mod tests {
 
     #[test]
     fn import_pyxel_copy_selection_reads_tilemap_pixels_and_preserves_os_clipboard() {
+        let path = std::env::temp_dir().join(format!(
+            "pyxross_test_copy_{}.pyxel",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::core::pyxel::tests::synthetic_example_pyxel_bytes())
+            .expect("write temp pyxel");
         let mut app = App::new_empty();
         app.os_clipboard_available = true;
-        app.file_import_pyxel_pick(std::path::Path::new("example.pyxel"));
+        app.file_import_pyxel_pick(&path);
+        let _ = std::fs::remove_file(&path);
         app.import_pyxel_host
             .events
             .borrow_mut()
