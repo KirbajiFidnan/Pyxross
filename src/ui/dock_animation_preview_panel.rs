@@ -69,6 +69,11 @@ impl Component for AnimationPreviewControls {
         // A flat theme-colored band keeps the glyphs legible over the frame.
         ui.painter()
             .rect_filled(bar, 0.0, chrome.colors.panel_header_bg32());
+        ui.painter().hline(
+            bar.left()..=bar.right(),
+            bar.top(),
+            egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+        );
 
         // Three equal column rects: left transport, centered stepping, right
         // loop. Each zone is exactly one third with the same inset, so the
@@ -289,7 +294,7 @@ pub fn animation_preview_panel_spec(
 ) -> PanelSpec {
     PanelSpec {
         id: PanelId::new(ANIMATION_PREVIEW_PANEL_ID),
-        metadata: PanelMetadata::new("playback", true, vec2(240.0, 180.0)),
+        metadata: PanelMetadata::new("Playback", true, vec2(240.0, 180.0)),
         placement,
         floating_rect: egui::Rect::from_min_size(egui::pos2(80.0, 80.0), vec2(320.0, 260.0)),
         content: Box::new(AnimationPreviewPanelContent {

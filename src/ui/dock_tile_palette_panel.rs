@@ -165,6 +165,8 @@ impl Component for TilePaletteHeaderComponent {
                     .push(TilePalettePanelEvent::MoveSelected(-1));
             }
         });
+        ui.add_space(2.0);
+        ui.separator();
     }
 }
 

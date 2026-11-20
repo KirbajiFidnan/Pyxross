@@ -174,6 +174,24 @@ pub fn load_font_bytes(font_name: &str, fonts: &[FontEntry]) -> Option<Vec<u8>> 
     None
 }
 
+/// Horizontal alignment for multi-line text rasterization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+fn align_offset(align: TextAlign, max_content_w: i32, line_w: i32) -> i32 {
+    let slack = (max_content_w - line_w).max(0);
+    match align {
+        TextAlign::Left => 0,
+        TextAlign::Center => slack / 2,
+        TextAlign::Right => slack,
+    }
+}
+
 /// Parameters for [`render_text`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextRenderParams {
@@ -181,6 +199,7 @@ pub struct TextRenderParams {
     pub font_name: String,
     pub font_size: u32,
     pub color: [u8; 4],
+    pub align: TextAlign,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -294,7 +313,7 @@ fn render_ab_glyph(font: &FontRef<'_>, params: &TextRenderParams) -> TextLayout 
     let pad = 2i32;
 
     let mut lines: Vec<LineStops> = Vec::new();
-    let mut glyph_draws: Vec<(ab_glyph::OutlinedGlyph, i32, i32)> = Vec::new();
+    let mut line_glyphs: Vec<(usize, ab_glyph::OutlinedGlyph)> = Vec::new();
     let mut max_w = 10i32;
 
     let mut char_idx = 0usize;
@@ -319,7 +338,7 @@ fn render_ab_glyph(font: &FontRef<'_>, params: &TextRenderParams) -> TextLayout 
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 max_w = max_w.max(bounds.max.x.ceil() as i32 + pad);
-                glyph_draws.push((outlined, 0, 0));
+                line_glyphs.push((li, outlined));
             }
             cursor_x += scaled.h_advance(gid);
             max_w = max_w.max(cursor_x.ceil() as i32 + pad);
@@ -332,11 +351,29 @@ fn render_ab_glyph(font: &FontRef<'_>, params: &TextRenderParams) -> TextLayout 
     }
 
     let width = max_w.max(8) as u32;
+    let max_content_w = (width as i32 - 2 * pad).max(0);
+    let mut line_dx = vec![0i32; lines.len()];
+    for (li, line) in lines.iter_mut().enumerate() {
+        let line_w = line
+            .stops
+            .last()
+            .map(|&(x, _)| (x - pad).max(0))
+            .unwrap_or(0);
+        let dx = align_offset(params.align, max_content_w, line_w);
+        line_dx[li] = dx;
+        if dx != 0 {
+            for (x, _) in &mut line.stops {
+                *x += dx;
+            }
+        }
+    }
+
     let height = ((raw_lines.len() as i32) * line_height + pad).max(line_height) as u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     let color = [params.color[0], params.color[1], params.color[2], 255];
 
-    for (outlined, ox, oy) in glyph_draws {
+    for (li, outlined) in line_glyphs {
+        let ox = line_dx[li];
         let bounds = outlined.px_bounds();
         outlined.draw(|gx, gy, coverage| {
             // Hard binary threshold -> zero anti-aliasing.
@@ -344,7 +381,7 @@ fn render_ab_glyph(font: &FontRef<'_>, params: &TextRenderParams) -> TextLayout 
                 return;
             }
             let px = bounds.min.x.floor() as i32 + gx as i32 + ox;
-            let py = bounds.min.y.floor() as i32 + gy as i32 + oy;
+            let py = bounds.min.y.floor() as i32 + gy as i32;
             if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
                 let idx = ((py as u32 * width + px as u32) * 4) as usize;
                 rgba[idx..idx + 4].copy_from_slice(&color);
@@ -382,9 +419,12 @@ fn render_pixel_5x7(params: &TextRenderParams) -> TextLayout {
     let mut lines = Vec::new();
     let mut char_idx = 0usize;
 
+    let max_content_w = (max_chars * advance).max(0);
     for (li, line_str) in raw_lines.iter().enumerate() {
         let y0 = li as i32 * line_height + pad;
-        let mut x0 = pad;
+        let line_w = line_str.chars().count() as i32 * advance;
+        let dx = align_offset(params.align, max_content_w, line_w);
+        let mut x0 = pad + dx;
         let mut stops = Vec::new();
         for ch in line_str.chars() {
             stops.push((x0, char_idx));
@@ -541,6 +581,7 @@ mod tests {
                 font_name: BUILTIN_PIXEL_FONT_NAME.to_owned(),
                 font_size: 14,
                 color: [255, 80, 40, 255],
+                align: TextAlign::Left,
             },
             None,
         );
@@ -562,6 +603,7 @@ mod tests {
                 font_name: BUNDLED_MONO_FONT_NAME.to_owned(),
                 font_size: 16,
                 color: [10, 220, 120, 255],
+                align: TextAlign::Left,
             },
             None,
         );
@@ -583,6 +625,7 @@ mod tests {
                 font_name: BUILTIN_PIXEL_FONT_NAME.to_owned(),
                 font_size: 7,
                 color: [255, 255, 255, 255],
+                align: TextAlign::Left,
             },
             None,
         );
@@ -591,5 +634,28 @@ mod tests {
             let hit = layout.hit_test_caret(x, y + h * 0.5);
             assert_eq!(hit, idx);
         }
+    }
+
+    #[test]
+    fn pixel_5x7_align_centers_and_right_aligns_shorter_lines() {
+        let base = |align| {
+            render_text(
+                &TextRenderParams {
+                    text: "AAAA\nB".to_owned(),
+                    font_name: BUILTIN_PIXEL_FONT_NAME.to_owned(),
+                    font_size: 7,
+                    color: [255, 255, 255, 255],
+                    align,
+                },
+                None,
+            )
+        };
+        let left = base(TextAlign::Left);
+        let center = base(TextAlign::Center);
+        let right = base(TextAlign::Right);
+        let x_left = left.lines[1].stops[0].0;
+        let x_center = center.lines[1].stops[0].0;
+        let x_right = right.lines[1].stops[0].0;
+        assert!(x_left < x_center && x_center < x_right);
     }
 }

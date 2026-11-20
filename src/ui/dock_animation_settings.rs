@@ -35,8 +35,14 @@ impl Component for AnimationSettingsComponent {
         // Name: commit on Enter, or on losing focus with a changed value. The
         // buffer is the host's persistent text so typed characters survive
         // across frames.
+        ui.weak("Name");
+        ui.add_space(2.0);
         let mut rename = self.host.rename_buffer.borrow_mut();
-        let name_response = ui.add(egui::TextEdit::singleline(&mut *rename).hint_text("Name"));
+        let name_response = ui.add(
+            egui::TextEdit::singleline(&mut *rename)
+                .desired_width(ui.available_width())
+                .hint_text("Name"),
+        );
         let enter =
             name_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         if enter || (name_response.lost_focus() && *rename != row.name) {
@@ -51,13 +57,16 @@ impl Component for AnimationSettingsComponent {
         }
         drop(rename);
 
-        // Delay multiplier: parse the buffer on every edit; malformed text is
-        // left uncommitted until it parses, so a half-typed number never emits.
+        ui.add_space(8.0);
+
+        // Delay multiplier & Loop on one aligned row.
         let mut multiplier = self.host.multiplier_buffer.borrow_mut();
+        let mut loop_on = self.host.settings_loop.borrow_mut();
         ui.horizontal(|ui| {
-            ui.label("Delay ×");
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.weak("Delay ×");
             let response =
-                ui.add(egui::TextEdit::singleline(&mut *multiplier).desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut *multiplier).desired_width(64.0));
             if response.changed() {
                 if let Ok(parsed) = multiplier.trim().parse::<f64>() {
                     self.host
@@ -69,20 +78,18 @@ impl Component for AnimationSettingsComponent {
                         });
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.checkbox(&mut *loop_on, "Loop").changed() {
+                    self.host
+                        .events
+                        .borrow_mut()
+                        .push(AnimationPanelEvent::SetLoop {
+                            index,
+                            on: *loop_on,
+                        });
+                }
+            });
         });
-        drop(multiplier);
-
-        // Loop: the settings panel edits its own snapshot flag.
-        let mut loop_on = self.host.settings_loop.borrow_mut();
-        if ui.checkbox(&mut *loop_on, "Loop").changed() {
-            self.host
-                .events
-                .borrow_mut()
-                .push(AnimationPanelEvent::SetLoop {
-                    index,
-                    on: *loop_on,
-                });
-        }
     }
 }
 
@@ -112,9 +119,16 @@ pub fn animation_settings_panel_spec(
     host: &AnimationPanelHost,
     floating_rect: egui::Rect,
 ) -> PanelSpec {
+    let floating_rect = egui::Rect::from_min_size(
+        floating_rect.min,
+        vec2(
+            floating_rect.width().max(260.0),
+            floating_rect.height().min(132.0).max(124.0),
+        ),
+    );
     PanelSpec {
         id: PanelId::new(ANIMATION_SETTINGS_PANEL_ID),
-        metadata: PanelMetadata::new("Animation settings", false, vec2(260.0, 150.0)),
+        metadata: PanelMetadata::new("Animation settings", false, vec2(260.0, 124.0)),
         placement: PanelPlacement::Floating,
         floating_rect,
         content: Box::new(AnimationSettingsPanelContent {

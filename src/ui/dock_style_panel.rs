@@ -12,9 +12,11 @@ use std::rc::Rc;
 
 use egui::vec2;
 
+use crate::ui::dock_tool_property_panel::pro_slider;
 use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
 use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
+    FLOATING_PANEL_CHROME_HEIGHT,
 };
 use crate::ui::style::{user_style_path, StylePreset, UiStyle, MAX_ROUNDING};
 
@@ -24,8 +26,10 @@ pub const STYLE_PANEL_ID: u64 = 213;
 /// Panel/window title.
 const STYLE_TITLE: &str = "Style";
 
-/// Minimum size of the resizable floating Style window.
-const STYLE_MIN_SIZE: egui::Vec2 = vec2(300.0, 280.0);
+/// Minimum size of the resizable floating Style window. Sized so all controls,
+/// the 2-column color grid, file row, and banner preview + action fit cleanly
+/// without scrollbars.
+const STYLE_MIN_SIZE: egui::Vec2 = vec2(400.0, 388.0 + FLOATING_PANEL_CHROME_HEIGHT);
 
 /// Actions emitted by the Style panel.
 #[derive(Clone, Debug, PartialEq)]
@@ -106,11 +110,11 @@ impl Component for StyleComponent {
         let mut style = self.host.style.borrow().clone();
         let mut modified = false;
 
-        ui.label("Preset");
-        ui.add_space(4.0);
+        ui.weak("Preset");
+        ui.add_space(2.0);
         let current_preset = style.preset.clone();
         egui::ComboBox::from_id_salt("style_preset_combo")
-            .width(ui.available_width().clamp(140.0, 240.0))
+            .width(ui.available_width().max(140.0))
             .selected_text(&current_preset)
             .show_ui(ui, |ui| {
                 for preset in StylePreset::ALL {
@@ -125,12 +129,24 @@ impl Component for StyleComponent {
             });
 
         ui.add_space(8.0);
-        ui.label("Rounding");
+        ui.weak("Rounding");
         ui.add_space(2.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             let mut r = style.clamped_rounding();
-            let drag = ui.add(egui::DragValue::new(&mut r).range(0.0..=MAX_ROUNDING).speed(0.1));
-            let slider = ui.add(egui::Slider::new(&mut r, 0.0..=MAX_ROUNDING).show_value(false));
+            let drag = ui.add_sized(
+                vec2(44.0, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut r)
+                    .range(0.0..=MAX_ROUNDING)
+                    .speed(0.1)
+                    .fixed_decimals(1),
+            );
+            let slider_w = (ui.available_width() - 52.0).max(40.0);
+            let slider = ui
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(ui, "style-rounding", &mut r, 0.0..=MAX_ROUNDING, false)
+                })
+                .inner;
             if drag.changed() || slider.changed() {
                 style.rounding = r.clamp(0.0, MAX_ROUNDING);
                 modified = true;
@@ -142,16 +158,20 @@ impl Component for StyleComponent {
         });
 
         ui.add_space(8.0);
-        ui.label("Colors");
-        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.weak("Colors");
+        ui.add_space(4.0);
         let mut color_changed = false;
-        color_changed |= color_edit_row(ui, "Workspace", &mut style.colors.clear_color);
-        color_changed |= color_edit_row(ui, "Panel", &mut style.colors.panel_bg);
-        color_changed |= color_edit_row(ui, "Header", &mut style.colors.panel_header_bg);
-        color_changed |= color_edit_row(ui, "Border", &mut style.colors.panel_border);
-        color_changed |= color_edit_row(ui, "Accent Fill", &mut style.colors.accent_fill);
-        color_changed |= color_edit_row(ui, "Accent Stroke", &mut style.colors.accent_stroke);
-        color_changed |= color_edit_row(ui, "Text", &mut style.colors.text_primary);
+        ui.columns(2, |cols| {
+            color_changed |= color_edit_row(&mut cols[0], "Workspace", &mut style.colors.clear_color);
+            color_changed |= color_edit_row(&mut cols[0], "Panel", &mut style.colors.panel_bg);
+            color_changed |= color_edit_row(&mut cols[0], "Header", &mut style.colors.panel_header_bg);
+            color_changed |= color_edit_row(&mut cols[0], "Border", &mut style.colors.panel_border);
+            color_changed |= color_edit_row(&mut cols[1], "Accent Fill", &mut style.colors.accent_fill);
+            color_changed |= color_edit_row(&mut cols[1], "Accent Stroke", &mut style.colors.accent_stroke);
+            color_changed |= color_edit_row(&mut cols[1], "Text", &mut style.colors.text_primary);
+        });
         if color_changed {
             style.preset = "Custom".to_string();
             modified = true;
@@ -166,45 +186,53 @@ impl Component for StyleComponent {
         }
 
         ui.add_space(8.0);
-        ui.label("File");
+        ui.separator();
+        ui.add_space(6.0);
+        ui.weak("File");
         ui.add_space(2.0);
         let mut path_str = self.host.file_path.borrow().clone();
-        if ui
-            .add(egui::TextEdit::singleline(&mut path_str).desired_width(ui.available_width()))
-            .changed()
-        {
-            *self.host.file_path.borrow_mut() = path_str.clone();
-        }
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if chrome.button(ui, "Save File", ButtonStyle::plain()).clicked() {
-                self.host
-                    .events
-                    .borrow_mut()
-                    .push(StyleEvent::SaveFile(PathBuf::from(path_str.trim())));
-            }
-            if chrome.button(ui, "Load File", ButtonStyle::plain()).clicked() {
-                self.host
-                    .events
-                    .borrow_mut()
-                    .push(StyleEvent::LoadFile(PathBuf::from(path_str.trim())));
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chrome.button(ui, "Load", ButtonStyle::plain()).clicked() {
+                    self.host
+                        .events
+                        .borrow_mut()
+                        .push(StyleEvent::LoadFile(PathBuf::from(path_str.trim())));
+                }
+                if chrome.button(ui, "Save", ButtonStyle::plain()).clicked() {
+                    self.host
+                        .events
+                        .borrow_mut()
+                        .push(StyleEvent::SaveFile(PathBuf::from(path_str.trim())));
+                }
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut path_str)
+                            .desired_width(ui.available_width()),
+                    )
+                    .changed()
+                {
+                    *self.host.file_path.borrow_mut() = path_str.clone();
+                }
+            });
         });
 
         if let Some(status) = self.host.status.borrow().as_deref() {
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             ui.weak(status);
         }
 
         ui.add_space(8.0);
-        ui.label("Banner");
-        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.weak("Banner");
+        ui.add_space(4.0);
         let preview = *self.host.banner_preview.borrow();
         let current_name = style.banner.clone();
         if let Some((tex_id, [bw, bh])) = preview {
             if bw > 0 && bh > 0 {
-                let target_h = 44.0_f32;
+                let target_h = 40.0_f32;
                 let max_w = ui.available_width().max(32.0);
                 let aspect_w = target_h * (bw as f32 / bh as f32);
                 let draw_size = if aspect_w <= max_w {
@@ -231,19 +259,23 @@ impl Component for StyleComponent {
         } else {
             ui.weak("No banner selected");
         }
-        if let Some(name) = current_name.as_deref() {
-            ui.weak(name);
-        }
         ui.add_space(4.0);
-        if chrome
-            .button(ui, "change banner", ButtonStyle::plain())
-            .clicked()
-        {
-            self.host
-                .events
-                .borrow_mut()
-                .push(StyleEvent::OpenBannerPicker);
-        }
+        ui.horizontal(|ui| {
+            if let Some(name) = current_name.as_deref() {
+                ui.weak(name);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chrome
+                    .button(ui, "Change Banner...", ButtonStyle::plain())
+                    .clicked()
+                {
+                    self.host
+                        .events
+                        .borrow_mut()
+                        .push(StyleEvent::OpenBannerPicker);
+                }
+            });
+        });
     }
 }
 
@@ -265,6 +297,13 @@ pub(crate) fn build_style_nest(host: &StyleHost) -> NestContent {
 
 /// Dock spec for the Style floating panel (dock id 213).
 pub fn style_panel_spec(host: &StyleHost, floating_rect: egui::Rect) -> PanelSpec {
+    let floating_rect = egui::Rect::from_min_size(
+        floating_rect.min,
+        vec2(
+            floating_rect.width().max(STYLE_MIN_SIZE.x),
+            floating_rect.height().max(STYLE_MIN_SIZE.y),
+        ),
+    );
     PanelSpec {
         id: PanelId::new(STYLE_PANEL_ID),
         metadata: PanelMetadata {

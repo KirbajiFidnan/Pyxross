@@ -28,6 +28,7 @@ pub enum AsepriteLayoutMode {
     RowLength(u32),
     SingleRow,
     SplitByTags,
+    SingleCanvas { px_w: u32, px_h: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -499,6 +500,15 @@ pub fn layout_grid(parsed: &ParsedAseprite, mode: AsepriteLayoutMode) -> (usize,
                 (max_tag, parsed.tags.len())
             }
         }
+        AsepriteLayoutMode::SingleCanvas { px_w, px_h } => {
+            let (rw, rh) = crate::core::import::regions_from_pixels(
+                parsed.frame_w.max(1),
+                parsed.frame_h.max(1),
+                px_w.max(1),
+                px_h.max(1),
+            );
+            (rw.max(1) as usize, rh.max(1) as usize)
+        }
     }
 }
 
@@ -515,8 +525,12 @@ pub fn build_aseprite_import(
     let (cols, rows) = layout_grid(parsed, mode);
     let fw = parsed.frame_w as usize;
     let fh = parsed.frame_h as usize;
-    let width = cols.saturating_mul(fw).max(1);
-    let height = rows.saturating_mul(fh).max(1);
+    let (cell_w, cell_h) = match mode {
+        AsepriteLayoutMode::SingleCanvas { px_w, px_h } => (px_w.max(1), px_h.max(1)),
+        _ => (parsed.frame_w.max(1), parsed.frame_h.max(1)),
+    };
+    let width = cols.saturating_mul(cell_w as usize).max(fw).max(1);
+    let height = rows.saturating_mul(cell_h as usize).max(fh).max(1);
 
     let mut layer_stack = LayerStack::new(width, height);
     let initial_id = layer_stack.active_layer_id();
@@ -568,6 +582,9 @@ pub fn build_aseprite_import(
     };
 
     match mode {
+        AsepriteLayoutMode::SingleCanvas { .. } => {
+            blit_frame_at(0, 0, 0);
+        }
         AsepriteLayoutMode::SplitByTags if !parsed.tags.is_empty() => {
             for (row_idx, tag) in parsed.tags.iter().enumerate() {
                 let to = tag.to_frame.min(parsed.frames.len() - 1);
@@ -712,13 +729,136 @@ pub fn build_aseprite_import(
         name: name.to_owned(),
         width,
         height,
-        frame_w: parsed.frame_w,
-        frame_h: parsed.frame_h,
+        frame_w: cell_w,
+        frame_h: cell_h,
         layers: layer_stack,
         animations,
         palette: parsed.palette.clone(),
         preview_rgba,
     })
+}
+
+/// Precomputed preview frames for the Export `.ase` panel.
+#[derive(Clone, Debug)]
+pub struct AsepriteExportPreview {
+    pub unified_w: usize,
+    pub unified_h: usize,
+    pub unified_rgba: Vec<u8>,
+    pub frames: Vec<(usize, usize, Vec<u8>)>,
+    pub total_timeline_frames: usize,
+    pub frame_w: usize,
+    pub frame_h: usize,
+}
+
+fn aseprite_timeline_rects(
+    layers: &LayerStack,
+    animations: &AnimationSet,
+    tile_size: TileSize,
+    unified_frames: bool,
+) -> (Vec<(Rect2i, u32)>, Vec<AsepriteTag>) {
+    let cw = layers.width();
+    let ch = layers.height();
+    let mut timeline: Vec<(Rect2i, u32)> = Vec::new();
+    let mut tags: Vec<AsepriteTag> = Vec::new();
+
+    if unified_frames {
+        timeline.push((Rect2i::new(0, 0, cw as i32, ch as i32), 100));
+        return (timeline, tags);
+    }
+
+    for seq in animations.iter() {
+        if seq.is_empty() {
+            continue;
+        }
+        let from_frame = timeline.len();
+        for i in 0..seq.len() {
+            if let Some(f) = seq.frame(i) {
+                timeline.push((f.region().rect(), f.delay_ms().max(1)));
+            }
+        }
+        let to_frame = timeline.len().saturating_sub(1);
+        if to_frame >= from_frame {
+            tags.push(AsepriteTag {
+                name: seq.name().to_owned(),
+                from_frame,
+                to_frame,
+            });
+        }
+    }
+
+    if timeline.is_empty() {
+        let tw = (tile_size.w.max(1) as usize).min(cw.max(1));
+        let th = (tile_size.h.max(1) as usize).min(ch.max(1));
+        let cols = (cw / tw).max(1);
+        let rows = (ch / th).max(1);
+        for cy in 0..rows {
+            for cx in 0..cols {
+                timeline.push((
+                    Rect2i::new(
+                        (cx * tw) as i32,
+                        (cy * th) as i32,
+                        tw as i32,
+                        th as i32,
+                    ),
+                    100,
+                ));
+            }
+        }
+    }
+
+    (timeline, tags)
+}
+
+/// Builds both the unified canvas preview and up to `max_frames` timeline
+/// frame previews for the Export `.ase` panel.
+pub fn aseprite_export_preview(
+    layers: &LayerStack,
+    tile_palette: &TilePalette,
+    animations: &AnimationSet,
+    tile_size: TileSize,
+    max_frames: usize,
+) -> AsepriteExportPreview {
+    let composited = layers.composite_layers(tile_palette);
+    let unified_w = composited.width();
+    let unified_h = composited.height();
+    let unified_rgba = composited.as_bytes().to_vec();
+
+    let (timeline, _) = aseprite_timeline_rects(layers, animations, tile_size, false);
+    let total_timeline_frames = timeline.len();
+    let frame_w = timeline
+        .first()
+        .map(|(r, _)| r.w.max(1) as usize)
+        .unwrap_or(unified_w.max(1));
+    let frame_h = timeline
+        .first()
+        .map(|(r, _)| r.h.max(1) as usize)
+        .unwrap_or(unified_h.max(1));
+
+    let frames = timeline
+        .iter()
+        .take(max_frames)
+        .map(|(rect, _)| {
+            let rgba = crop_rgba(
+                &unified_rgba,
+                unified_w,
+                unified_h,
+                *rect,
+                frame_w,
+                frame_h,
+            );
+            (frame_w, frame_h, rgba)
+        })
+        .collect();
+
+    AsepriteExportPreview {
+        unified_w,
+        unified_h,
+        unified_rgba,
+        frames,
+        total_timeline_frames,
+        frame_w,
+        frame_h,
+    }
 }
 
 /// Exports Pyxross animations (or region grid / unified canvas) and layers into
@@ -733,54 +873,7 @@ pub fn export_aseprite_bytes(
 ) -> Result<Vec<u8>, String> {
     let cw = layers.width();
     let ch = layers.height();
-    let mut timeline: Vec<(Rect2i, u32)> = Vec::new();
-    let mut tags: Vec<AsepriteTag> = Vec::new();
-
-    if unified_frames {
-        timeline.push((Rect2i::new(0, 0, cw as i32, ch as i32), 100));
-    } else {
-        // Flatten animations into sequential timeline frames + tags.
-        for seq in animations.iter() {
-            if seq.is_empty() {
-                continue;
-            }
-            let from_frame = timeline.len();
-            for i in 0..seq.len() {
-                if let Some(f) = seq.frame(i) {
-                    timeline.push((f.region().rect(), f.delay_ms().max(1)));
-                }
-            }
-            let to_frame = timeline.len().saturating_sub(1);
-            if to_frame >= from_frame {
-                tags.push(AsepriteTag {
-                    name: seq.name().to_owned(),
-                    from_frame,
-                    to_frame,
-                });
-            }
-        }
-        // If the project has no animation frames at all, lay out every region
-        // cell from top-left to bottom-right as sequential timeline frames.
-        if timeline.is_empty() {
-            let tw = (tile_size.w.max(1) as usize).min(cw.max(1));
-            let th = (tile_size.h.max(1) as usize).min(ch.max(1));
-            let cols = (cw / tw).max(1);
-            let rows = (ch / th).max(1);
-            for cy in 0..rows {
-                for cx in 0..cols {
-                    timeline.push((
-                        Rect2i::new(
-                            (cx * tw) as i32,
-                            (cy * th) as i32,
-                            tw as i32,
-                            th as i32,
-                        ),
-                        100,
-                    ));
-                }
-            }
-        }
-    }
+    let (timeline, tags) = aseprite_timeline_rects(layers, animations, tile_size, unified_frames);
 
     let frame_w = timeline[0].0.w.max(1) as u16;
     let frame_h = timeline[0].0.h.max(1) as u16;
@@ -1124,5 +1217,87 @@ mod tests {
         assert_eq!(p_grid.frame_w, 16);
         assert_eq!(p_grid.frame_h, 16);
         assert_eq!(p_grid.frames.len(), 4); // 2x2 grid of 16x16 regions
+    }
+
+    #[test]
+    fn single_canvas_import_uses_first_frame_only_and_splits_regions() {
+        let parsed = ParsedAseprite {
+            frame_w: 32,
+            frame_h: 16,
+            layers: vec![AsepriteLayerInfo {
+                name: "Layer 1".to_owned(),
+                visible: true,
+                is_group: false,
+                opacity: 255,
+                blend: BlendMode::Normal,
+                child_level: 0,
+            }],
+            frames: vec![
+                AsepriteFrame {
+                    duration_ms: 100,
+                    cels: vec![AsepriteCel {
+                        layer_index: 0,
+                        x: 0,
+                        y: 0,
+                        w: 1,
+                        h: 1,
+                        opacity: 255,
+                        rgba: vec![200, 10, 10, 255],
+                    }],
+                },
+                AsepriteFrame {
+                    duration_ms: 100,
+                    cels: vec![AsepriteCel {
+                        layer_index: 0,
+                        x: 0,
+                        y: 0,
+                        w: 1,
+                        h: 1,
+                        opacity: 255,
+                        rgba: vec![10, 200, 10, 255],
+                    }],
+                },
+            ],
+            tags: vec![AsepriteTag {
+                name: "Run".to_owned(),
+                from_frame: 0,
+                to_frame: 1,
+            }],
+            palette: None,
+        };
+        let imp = build_aseprite_import(
+            &parsed,
+            "Single",
+            AsepriteLayoutMode::SingleCanvas { px_w: 16, px_h: 16 },
+        )
+        .unwrap();
+        assert_eq!((imp.width, imp.height), (32, 16));
+        assert_eq!((imp.frame_w, imp.frame_h), (16, 16));
+        assert_eq!(imp.animations.len(), 1);
+        assert!(imp.animations.get(0).unwrap().is_empty());
+        let px = imp.layers.active_layer().buffer.get_pixel(0, 0).unwrap();
+        assert_eq!((px.r, px.g, px.b, px.a), (200, 10, 10, 255));
+    }
+
+    #[test]
+    fn aseprite_export_preview_caps_timeline_at_four_and_includes_unified() {
+        let layers = LayerStack::new(96, 16);
+        let tiles = TilePalette::new();
+        let mut anims = AnimationSet::new();
+        {
+            let s = anims.get_mut(0).unwrap();
+            *s = AnimationSequence::new("Walk");
+            for i in 0..6 {
+                s.push(Frame::new(
+                    Region::new(Rect2i::new(i * 16, 0, 16, 16), format!("F{i}")),
+                    100,
+                ));
+            }
+        }
+        let preview = aseprite_export_preview(&layers, &tiles, &anims, TileSize::new(16, 16), 4);
+        assert_eq!((preview.unified_w, preview.unified_h), (96, 16));
+        assert_eq!(preview.total_timeline_frames, 6);
+        assert_eq!(preview.frames.len(), 4);
+        assert_eq!((preview.frame_w, preview.frame_h), (16, 16));
     }
 }

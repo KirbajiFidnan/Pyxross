@@ -40,9 +40,14 @@ pub const ERASER: &str = "\u{f01fe}";
 pub const SELECTION: &str = "\u{f0486}";
 pub const FILL: &str = "\u{f0266}";
 pub const EYEDROPPER: &str = "\u{f020a}";
-pub const TILE: &str = "\u{f0755}";
+pub const TILE: &str = "\u{f0570}";
 pub const ANIMATION: &str = "\u{f022e}";
 pub const TEXT: &str = "\u{f0284}";
+pub const ALIGN_LEFT: &str = "\u{f0262}";
+pub const ALIGN_CENTER: &str = "\u{f0260}";
+pub const ALIGN_RIGHT: &str = "\u{f0263}";
+pub const ONION_PREV: &str = "\u{f0f63}";
+pub const ONION_NEXT: &str = "\u{f0f61}";
 
 // Chrome & panel action icons
 pub const SETTINGS: &str = "\u{f0493}";

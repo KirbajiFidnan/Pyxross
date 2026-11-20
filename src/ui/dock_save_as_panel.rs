@@ -32,6 +32,9 @@ use std::rc::Rc;
 
 use egui::vec2;
 
+use crate::ui::Document;
+use crate::io::GifFrameInput;
+use crate::ui::dock_tool_property_panel::pro_slider;
 use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
 use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
@@ -41,16 +44,22 @@ use crate::ui::panel_dock::{
 /// Dock id for the save-as/export floating panel.
 pub const SAVE_AS_PANEL_ID: u64 = 207;
 
+/// Maximum integer nearest-neighbor upscale factor for image/GIF exports.
+pub const MAX_PIXEL_SCALE: u32 = 16;
+
 /// Fixed minimum size of the (non-resizable) floating window. Sized so the
-/// path/name rows, optional inline error, and bottom actions fit cleanly
-/// with zero scrollbars.
-const SAVE_AS_MIN_SIZE: egui::Vec2 = vec2(440.0, 176.0 + FLOATING_PANEL_CHROME_HEIGHT);
+/// path/name rows, optional pixel scale / checkbox, inline error, and bottom
+/// actions fit cleanly with zero scrollbars.
+const SAVE_AS_MIN_SIZE: egui::Vec2 = vec2(440.0, 218.0 + FLOATING_PANEL_CHROME_HEIGHT);
+const SAVE_AS_ASEPRITE_MIN_SIZE: egui::Vec2 = vec2(440.0, 356.0 + FLOATING_PANEL_CHROME_HEIGHT);
 
 /// What kind of save/export the modal is currently drafting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SaveAsKind {
-    /// Project Save As…: directory project or single `.pyxross` archive.
+    /// Project Save As…: single `.pyxross` archive.
     Project,
+    /// Full-canvas single PNG image export.
+    Image,
     /// Sprite-sheet export: PNG plus a sibling `.json` meta file.
     SpriteSheet,
     /// GIF animation export.
@@ -68,6 +77,7 @@ impl SaveAsKind {
     pub fn title(self) -> &'static str {
         match self {
             SaveAsKind::Project => "Save As",
+            SaveAsKind::Image => "Export Image",
             SaveAsKind::SpriteSheet => "Export Sprite Sheet",
             SaveAsKind::Gif => "Export GIF",
             SaveAsKind::Pyxel => "Export .pyxel",
@@ -76,34 +86,71 @@ impl SaveAsKind {
         }
     }
 
-    /// Default file/dir name suggested when the modal opens. The project
-    /// default is the current project name (set by the App shell); the export
-    /// defaults match the file names the old `save_file()` dialogs proposed.
+    /// Default file/dir name suggested when the modal opens (without extension;
+    /// the locked extension badge shows and enforces the target extension).
     pub fn default_name(self) -> &'static str {
         match self {
             SaveAsKind::Project => "project",
-            SaveAsKind::SpriteSheet => "sprite_sheet.png",
-            SaveAsKind::Gif => "animation.gif",
-            SaveAsKind::Pyxel => "project.pyxel",
-            SaveAsKind::Aseprite => "project.ase",
-            SaveAsKind::SelectionPng => "selection.png",
+            SaveAsKind::Image => "image",
+            SaveAsKind::SpriteSheet => "sprite_sheet",
+            SaveAsKind::Gif => "animation",
+            SaveAsKind::Pyxel => "project",
+            SaveAsKind::Aseprite => "project",
+            SaveAsKind::SelectionPng => "selection",
         }
     }
 }
 
-/// The format choices for `kind`, in display order; the first is the selected
-/// one. Per D82 Save As is a mandatory single `.pyxross`, so that is the only
-/// entry today — the slice keeps the row extensible for future formats.
+/// True for raster/animated exports that support integer `pixel_scale` upscaling.
+pub fn supports_pixel_scale(kind: SaveAsKind) -> bool {
+    matches!(
+        kind,
+        SaveAsKind::Image | SaveAsKind::SpriteSheet | SaveAsKind::Gif | SaveAsKind::SelectionPng
+    )
+}
+
+/// The locked extension badge(s) for `kind`, in display order; the first is
+/// selected and enforced on save/export.
 pub fn formats_for(kind: SaveAsKind) -> &'static [&'static str] {
     const PROJECT: &[&str] = &[".pyxross"];
+    const PNG: &[&str] = &[".png"];
+    const GIF: &[&str] = &[".gif"];
+    const PYXEL: &[&str] = &[".pyxel"];
+    const ASE: &[&str] = &[".ase"];
     match kind {
         SaveAsKind::Project => PROJECT,
-        SaveAsKind::SpriteSheet
-        | SaveAsKind::Gif
-        | SaveAsKind::Pyxel
-        | SaveAsKind::Aseprite
-        | SaveAsKind::SelectionPng => &[],
+        SaveAsKind::Image | SaveAsKind::SpriteSheet | SaveAsKind::SelectionPng => PNG,
+        SaveAsKind::Gif => GIF,
+        SaveAsKind::Pyxel => PYXEL,
+        SaveAsKind::Aseprite => ASE,
     }
+}
+
+/// Nearest-neighbor integer upscaling for RGBA8 buffers (`scale` clamped >= 1).
+pub fn scale_rgba_nearest(w: usize, h: usize, rgba: &[u8], scale: u32) -> (usize, usize, Vec<u8>) {
+    let scale = scale.max(1) as usize;
+    if scale == 1 || w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return (w, h, rgba.to_vec());
+    }
+    let out_w = w.saturating_mul(scale);
+    let out_h = h.saturating_mul(scale);
+    let mut out = vec![0u8; out_w.saturating_mul(out_h).saturating_mul(4)];
+    for y in 0..h {
+        for x in 0..w {
+            let src_idx = (y * w + x) * 4;
+            let px = &rgba[src_idx..src_idx + 4];
+            for sy in 0..scale {
+                let dst_y = y * scale + sy;
+                let row_off = dst_y * out_w * 4;
+                for sx in 0..scale {
+                    let dst_x = x * scale + sx;
+                    let dst_idx = row_off + dst_x * 4;
+                    out[dst_idx..dst_idx + 4].copy_from_slice(px);
+                }
+            }
+        }
+    }
+    (out_w, out_h, out)
 }
 
 /// Pre-computed export payload. Computed ONCE when the export entry point
@@ -111,15 +158,37 @@ pub fn formats_for(kind: SaveAsKind) -> &'static [&'static str] {
 /// serialize through `io` when Save is confirmed.
 #[derive(Clone, Debug)]
 pub enum SavePayload {
-    /// PNG bytes + the sibling `.json` meta bytes.
-    SpriteSheet { png: Vec<u8>, meta: Vec<u8> },
-    Gif(Vec<u8>),
+    /// Full-canvas RGBA8 pixels for single-PNG export.
+    Image { w: usize, h: usize, rgba: Vec<u8> },
+    /// Sprite-sheet RGBA8 pixels + source document for scaled `.json` metadata.
+    SpriteSheet {
+        w: usize,
+        h: usize,
+        rgba: Vec<u8>,
+        doc: Document,
+    },
+    /// Raw frame buffers + delays for scaled GIF encoding.
+    Gif(Vec<GifFrameInput>),
     Pyxel(Vec<u8>),
     Aseprite {
         unified: Vec<u8>,
         timeline: Vec<u8>,
+        preview: Option<crate::core::aseprite::AsepriteExportPreview>,
     },
     SelectionPng { w: usize, h: usize, rgba: Vec<u8> },
+}
+
+impl SavePayload {
+    /// Base `(width, height)` in pixels before `pixel_scale` is applied.
+    pub fn base_dimensions(&self) -> Option<(usize, usize)> {
+        match self {
+            SavePayload::Image { w, h, .. }
+            | SavePayload::SpriteSheet { w, h, .. }
+            | SavePayload::SelectionPng { w, h, .. } => Some((*w, *h)),
+            SavePayload::Gif(frames) => frames.first().map(|f| (f.width, f.height)),
+            SavePayload::Pyxel(_) | SavePayload::Aseprite { .. } => None,
+        }
+    }
 }
 
 /// The in-progress save-as/export form values (dialog draft state, not model
@@ -148,6 +217,12 @@ pub struct SaveAsView {
     pub focus_requested: bool,
     /// When true on `SaveAsKind::Aseprite`, exports the entire canvas as a single frame.
     pub aseprite_unified_frames: bool,
+    /// Integer nearest-neighbor upscale factor (`1..=MAX_PIXEL_SCALE`) for
+    /// Image, Sprite Sheet, GIF, and Selection PNG exports.
+    pub pixel_scale: u32,
+    /// Incremented whenever a new export payload is loaded so cached preview
+    /// textures are re-uploaded.
+    pub preview_generation: u64,
 }
 
 impl Default for SaveAsView {
@@ -162,6 +237,8 @@ impl Default for SaveAsView {
             error: None,
             focus_requested: false,
             aseprite_unified_frames: false,
+            pixel_scale: 1,
+            preview_generation: 0,
         }
     }
 }
@@ -204,16 +281,20 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Project-name completion: ensure a `.pyxross` suffix is present (Save As
-/// always writes a single file). Names are trimmed; a name already ending in
-/// `.pyxross` is left as-is.
-pub fn with_pyxross_extension(name: &str) -> String {
+/// Ensures `name` ends with `ext` (case-insensitive); names are trimmed.
+pub fn with_extension(name: &str, ext: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.ends_with(".pyxross") {
+    if trimmed.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase()) {
         trimmed.to_owned()
     } else {
-        format!("{trimmed}.pyxross")
+        format!("{trimmed}{ext}")
     }
+}
+
+/// Project-name completion: ensure a `.pyxross` suffix is present (Save As
+/// always writes a single file).
+pub fn with_pyxross_extension(name: &str) -> String {
+    with_extension(name, ".pyxross")
 }
 
 /// Copies the editable path box into [`SaveAsView::location`], so a typed or
@@ -244,8 +325,8 @@ pub fn checked_target(view: &SaveAsView) -> Result<(PathBuf, String), String> {
             view.location.display()
         ));
     }
-    let final_name = if view.kind == SaveAsKind::Project {
-        with_pyxross_extension(&view.name)
+    let final_name = if let Some(ext) = formats_for(view.kind).first() {
+        with_extension(&view.name, ext)
     } else {
         view.name.trim().to_owned()
     };
@@ -268,6 +349,79 @@ pub fn commit_save(view: &SaveAsView) -> Result<SaveAsEvent, String> {
 /// line, Save/Cancel.
 struct SaveAsComponent {
     host: SaveAsHost,
+    ase_preview_gen: u64,
+    ase_unified_tex: Option<(usize, usize, egui::TextureHandle)>,
+    ase_frame_texs: Vec<(usize, usize, egui::TextureHandle)>,
+}
+
+impl SaveAsComponent {
+    fn new(host: SaveAsHost) -> Self {
+        Self {
+            host,
+            ase_preview_gen: 0,
+            ase_unified_tex: None,
+            ase_frame_texs: Vec::new(),
+        }
+    }
+
+    fn sync_aseprite_textures(&mut self, ctx: &egui::Context) {
+        let view = self.host.view.borrow();
+        let Some(SavePayload::Aseprite {
+            preview: Some(preview),
+            ..
+        }) = &view.payload
+        else {
+            self.ase_unified_tex = None;
+            self.ase_frame_texs.clear();
+            return;
+        };
+        if self.ase_preview_gen == view.preview_generation && self.ase_unified_tex.is_some() {
+            return;
+        }
+        self.ase_preview_gen = view.preview_generation;
+        self.ase_unified_tex = None;
+        self.ase_frame_texs.clear();
+
+        if preview.unified_w > 0
+            && preview.unified_h > 0
+            && preview.unified_rgba.len() == preview.unified_w * preview.unified_h * 4
+        {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [preview.unified_w, preview.unified_h],
+                &preview.unified_rgba,
+            );
+            let tex = ctx.load_texture(
+                "export-aseprite-unified-preview",
+                image,
+                egui::TextureOptions::NEAREST,
+            );
+            self.ase_unified_tex = Some((preview.unified_w, preview.unified_h, tex));
+        }
+
+        for (idx, (fw, fh, rgba)) in preview.frames.iter().take(4).enumerate() {
+            if *fw == 0 || *fh == 0 || rgba.len() != fw * fh * 4 {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied([*fw, *fh], rgba);
+            let tex = ctx.load_texture(
+                format!("export-aseprite-frame-preview-{idx}"),
+                image,
+                egui::TextureOptions::NEAREST,
+            );
+            self.ase_frame_texs.push((*fw, *fh, tex));
+        }
+    }
+}
+
+fn fit_rect_aspect(container: egui::Rect, w: usize, h: usize) -> egui::Rect {
+    let aspect = (w.max(1) as f32) / (h.max(1) as f32);
+    let mut draw_w = container.width().max(1.0);
+    let mut draw_h = draw_w / aspect;
+    if draw_h > container.height().max(1.0) {
+        draw_h = container.height().max(1.0);
+        draw_w = draw_h * aspect;
+    }
+    egui::Rect::from_center_size(container.center(), vec2(draw_w.max(1.0), draw_h.max(1.0)))
 }
 
 impl Component for SaveAsComponent {
@@ -283,6 +437,8 @@ impl Component for SaveAsComponent {
             mut location_edit,
             mut synced,
             mut aseprite_unified_frames,
+            mut pixel_scale,
+            base_dims,
         ) = {
             let v = self.host.view.borrow();
             (
@@ -294,6 +450,8 @@ impl Component for SaveAsComponent {
                 v.location_edit.clone(),
                 v.synced_location.clone(),
                 v.aseprite_unified_frames,
+                v.pixel_scale.clamp(1, MAX_PIXEL_SCALE),
+                v.payload.as_ref().and_then(SavePayload::base_dimensions),
             )
         };
 
@@ -363,10 +521,164 @@ impl Component for SaveAsComponent {
             name_response.request_focus();
         }
 
+        if supports_pixel_scale(kind) {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.strong("Pixel scale:");
+                if let Some((bw, bh)) = base_dims {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(format!(
+                            "{} × {} px",
+                            bw.saturating_mul(pixel_scale as usize),
+                            bh.saturating_mul(pixel_scale as usize)
+                        ));
+                    });
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_sized(
+                    vec2(46.0, ui.spacing().interact_size.y),
+                    egui::DragValue::new(&mut pixel_scale)
+                        .range(1..=MAX_PIXEL_SCALE)
+                        .suffix("×"),
+                );
+                let mut scale_f = pixel_scale as f32;
+                let slider_w = ui.available_width().max(60.0);
+                let slider = ui
+                    .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                        pro_slider(
+                            ui,
+                            "export-pixel-scale",
+                            &mut scale_f,
+                            1.0..=(MAX_PIXEL_SCALE as f32),
+                            false,
+                        )
+                    })
+                    .inner;
+                if slider.changed() {
+                    pixel_scale = (scale_f.round() as u32).clamp(1, MAX_PIXEL_SCALE);
+                }
+            });
+        }
+
         if kind == SaveAsKind::Aseprite {
+            self.sync_aseprite_textures(ui.ctx());
             ui.add_space(6.0);
             ui.checkbox(&mut aseprite_unified_frames, "Unified frames")
                 .on_hover_text("Export the entire canvas as a single frame");
+            ui.add_space(6.0);
+
+            let (unified_dims, total_frames, frame_dims) = {
+                let v = self.host.view.borrow();
+                match &v.payload {
+                    Some(SavePayload::Aseprite {
+                        preview: Some(p), ..
+                    }) => (
+                        (p.unified_w, p.unified_h),
+                        p.total_timeline_frames,
+                        (p.frame_w, p.frame_h),
+                    ),
+                    _ => ((0, 0), 0, (0, 0)),
+                }
+            };
+
+            let avail_w = ui.available_width().max(120.0);
+            let (box_rect, _) = ui.allocate_exact_size(vec2(avail_w, 122.0), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(box_rect, 0.0, chrome.colors.panel_header_bg32());
+            painter.rect_stroke(
+                box_rect,
+                0.0,
+                egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+                egui::StrokeKind::Inside,
+            );
+
+            let inner = box_rect.shrink(6.0);
+            let header_rect =
+                egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.min.y + 16.0));
+            let img_area = egui::Rect::from_min_max(
+                egui::pos2(inner.min.x, header_rect.max.y + 4.0),
+                inner.max,
+            );
+            let caption = if aseprite_unified_frames {
+                format!(
+                    "Preview · Unified: 1 frame ({}×{} px)",
+                    unified_dims.0, unified_dims.1
+                )
+            } else if total_frames > 4 {
+                format!(
+                    "Preview · Timeline: {} frames ({}×{} px) · first 4",
+                    total_frames, frame_dims.0, frame_dims.1
+                )
+            } else {
+                format!(
+                    "Preview · Timeline: {} frame(s) ({}×{} px)",
+                    total_frames, frame_dims.0, frame_dims.1
+                )
+            };
+            painter.text(
+                header_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                caption,
+                egui::FontId::proportional(11.0),
+                ui.visuals().weak_text_color(),
+            );
+
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            if aseprite_unified_frames {
+                if let Some((w, h, tex)) = &self.ase_unified_tex {
+                    let dst = fit_rect_aspect(img_area, *w, *h);
+                    painter.rect_filled(dst, 0.0, chrome.colors.panel_bg32());
+                    painter.image(tex.id(), dst, uv, crate::ui::theme::SKIN_TINT);
+                    painter.rect_stroke(
+                        dst,
+                        0.0,
+                        egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            } else {
+                let count = self.ase_frame_texs.len().min(4);
+                if count > 0 {
+                    let gap = 8.0;
+                    let slot_w =
+                        ((img_area.width() - gap * (count.saturating_sub(1) as f32)) / count as f32)
+                            .max(12.0);
+                    for (idx, (fw, fh, tex)) in self.ase_frame_texs.iter().take(4).enumerate() {
+                        let x0 = img_area.min.x + idx as f32 * (slot_w + gap);
+                        let slot = egui::Rect::from_min_size(
+                            egui::pos2(x0, img_area.min.y),
+                            vec2(slot_w, img_area.height().max(12.0)),
+                        );
+                        let dst = fit_rect_aspect(slot, *fw, *fh);
+                        // Left-to-right frame-by-frame fade effect (1.0 -> 0.75 -> 0.50 -> 0.25).
+                        let alpha = (1.0 - (idx as f32) * 0.25).clamp(0.20, 1.0);
+                        let tint = egui::Color32::from_rgba_unmultiplied(
+                            255,
+                            255,
+                            255,
+                            (alpha * 255.0).round() as u8,
+                        );
+                        painter.rect_filled(
+                            dst,
+                            0.0,
+                            chrome.colors.panel_bg32().gamma_multiply(alpha),
+                        );
+                        painter.image(tex.id(), dst, uv, tint);
+                        painter.rect_stroke(
+                            dst,
+                            0.0,
+                            egui::Stroke::new(
+                                1.0,
+                                chrome.colors.panel_border32().gamma_multiply(alpha),
+                            ),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+            }
         }
 
         // Inline error line (theme error color, panel stays open).
@@ -409,6 +721,7 @@ impl Component for SaveAsComponent {
         view.name = name;
         view.focus_requested = false;
         view.aseprite_unified_frames = aseprite_unified_frames;
+        view.pixel_scale = pixel_scale.clamp(1, MAX_PIXEL_SCALE);
 
         if browse_clicked {
             // Seed the chooser at the path currently in the box.
@@ -453,7 +766,7 @@ impl PanelContent for SaveAsPanelContent {
 /// Static nest holding the save-as/export form.
 pub(crate) fn build_save_as_nest(host: &SaveAsHost) -> NestContent {
     let mut nest = NestContent::new(NestMode::Static);
-    nest.push(SaveAsComponent { host: host.clone() });
+    nest.push(SaveAsComponent::new(host.clone()));
     nest
 }
 
@@ -463,19 +776,26 @@ pub(crate) fn build_save_as_nest(host: &SaveAsHost) -> NestContent {
 /// `resizable == false` keeps the window fixed-size and draggable only by its
 /// header. The title follows the kind the host is drafting.
 pub fn save_as_panel_spec(host: &SaveAsHost, floating_rect: egui::Rect) -> PanelSpec {
-    let title = host.view.borrow().kind.title();
+    let view = host.view.borrow();
+    let title = view.kind.title();
+    let min_size = if view.kind == SaveAsKind::Aseprite {
+        SAVE_AS_ASEPRITE_MIN_SIZE
+    } else {
+        SAVE_AS_MIN_SIZE
+    };
+    drop(view);
     let floating_rect = egui::Rect::from_min_size(
         floating_rect.min,
         vec2(
-            floating_rect.width().max(SAVE_AS_MIN_SIZE.x),
-            floating_rect.height().max(SAVE_AS_MIN_SIZE.y),
+            floating_rect.width().max(min_size.x),
+            floating_rect.height().max(min_size.y),
         ),
     );
     PanelSpec {
         id: PanelId::new(SAVE_AS_PANEL_ID),
         metadata: PanelMetadata {
             resizable: false,
-            ..PanelMetadata::new(title, false, SAVE_AS_MIN_SIZE)
+            ..PanelMetadata::new(title, false, min_size)
         },
         placement: PanelPlacement::Floating,
         floating_rect,
@@ -511,6 +831,8 @@ mod tests {
             error: None,
             focus_requested: false,
             aseprite_unified_frames: false,
+            pixel_scale: 1,
+            preview_generation: 0,
         }
     }
 
@@ -635,11 +957,14 @@ mod tests {
     }
 
     #[test]
-    fn formats_for_project_is_pyxross_only() {
+    fn formats_for_every_kind_returns_locked_extension() {
         assert_eq!(formats_for(SaveAsKind::Project), &[".pyxross"][..]);
-        assert!(formats_for(SaveAsKind::SpriteSheet).is_empty());
-        assert!(formats_for(SaveAsKind::Gif).is_empty());
-        assert!(formats_for(SaveAsKind::SelectionPng).is_empty());
+        assert_eq!(formats_for(SaveAsKind::Image), &[".png"][..]);
+        assert_eq!(formats_for(SaveAsKind::SpriteSheet), &[".png"][..]);
+        assert_eq!(formats_for(SaveAsKind::SelectionPng), &[".png"][..]);
+        assert_eq!(formats_for(SaveAsKind::Gif), &[".gif"][..]);
+        assert_eq!(formats_for(SaveAsKind::Pyxel), &[".pyxel"][..]);
+        assert_eq!(formats_for(SaveAsKind::Aseprite), &[".ase"][..]);
     }
 
     #[test]
@@ -667,9 +992,12 @@ mod tests {
         use SaveAsKind::*;
         let cases = [
             (Project, "Save As", "project"),
-            (SpriteSheet, "Export Sprite Sheet", "sprite_sheet.png"),
-            (Gif, "Export GIF", "animation.gif"),
-            (SelectionPng, "Export Selection PNG", "selection.png"),
+            (Image, "Export Image", "image"),
+            (SpriteSheet, "Export Sprite Sheet", "sprite_sheet"),
+            (Gif, "Export GIF", "animation"),
+            (Pyxel, "Export .pyxel", "project"),
+            (Aseprite, "Export .ase", "project"),
+            (SelectionPng, "Export Selection PNG", "selection"),
         ];
         for (kind, title, default_name) in cases {
             assert_eq!(kind.title(), title);
@@ -696,7 +1024,7 @@ mod tests {
         let capture = crate::ui::input_capture::InputCapture::new();
         let chrome =
             PanelChrome::flat(&theme, &capture, crate::ui::input_capture::SurfaceId::Canvas);
-        let mut component = SaveAsComponent { host: host.clone() };
+        let mut component = SaveAsComponent::new(host.clone());
         let mut output = ctx.run_ui(raw, |ui| {
             let view = NestView::screen(ui.max_rect());
             component.ui(ui, &view, &chrome);
@@ -833,7 +1161,7 @@ mod tests {
                         .min_scrolled_height(0.0)
                         .show(inner, |scroll| {
                             let view = NestView::screen(nest_vp);
-                            let mut comp = SaveAsComponent { host: host.clone() };
+                            let mut comp = SaveAsComponent::new(host.clone());
                             comp.ui(scroll, &view, &chrome);
                         });
                     measured_content_size = out.content_size;
@@ -857,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn format_button_is_absent_for_export_kinds() {
+    fn locked_extension_badge_is_painted_for_export_kinds() {
         let ctx = egui::Context::default();
         let host = SaveAsHost::default();
         {
@@ -865,12 +1193,82 @@ mod tests {
             v.kind = SaveAsKind::Gif;
             v.location = std::env::temp_dir();
             v.location_edit = std::env::temp_dir().display().to_string();
-            v.name = "animation.gif".to_owned();
+            v.name = "animation".to_owned();
         }
         let output = run_component_frame(&ctx, &host, Vec::new());
         assert!(
-            text_positions(&output, ".pyxross").is_empty(),
-            "export kinds show no .pyxross format button"
+            !text_positions(&output, ".gif").is_empty(),
+            "GIF export shows the locked .gif extension badge"
+        );
+    }
+
+    #[test]
+    fn scale_rgba_nearest_upscales_pixels_crisply() {
+        let src = vec![
+            10, 20, 30, 255, // (0,0)
+            40, 50, 60, 255, // (1,0)
+        ];
+        let (w, h, out) = scale_rgba_nearest(2, 1, &src, 3);
+        assert_eq!((w, h), (6, 3));
+        assert_eq!(out.len(), 6 * 3 * 4);
+        // Top-left 3x3 block matches first pixel.
+        for y in 0..3 {
+            for x in 0..3 {
+                let idx = (y * 6 + x) * 4;
+                assert_eq!(&out[idx..idx + 4], &[10, 20, 30, 255]);
+            }
+            for x in 3..6 {
+                let idx = (y * 6 + x) * 4;
+                assert_eq!(&out[idx..idx + 4], &[40, 50, 60, 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn aseprite_export_panel_shows_timeline_and_unified_preview_captions() {
+        let ctx = egui::Context::default();
+        let host = SaveAsHost::default();
+        {
+            let mut v = host.view.borrow_mut();
+            v.kind = SaveAsKind::Aseprite;
+            v.location = std::env::temp_dir();
+            v.location_edit = std::env::temp_dir().display().to_string();
+            v.name = "sprite".to_owned();
+            v.aseprite_unified_frames = false;
+            v.payload = Some(SavePayload::Aseprite {
+                unified: Vec::new(),
+                timeline: Vec::new(),
+                preview: Some(crate::core::aseprite::AsepriteExportPreview {
+                    unified_w: 64,
+                    unified_h: 16,
+                    unified_rgba: vec![255; 64 * 16 * 4],
+                    frames: vec![
+                        (16, 16, vec![255; 16 * 16 * 4]),
+                        (16, 16, vec![255; 16 * 16 * 4]),
+                        (16, 16, vec![255; 16 * 16 * 4]),
+                        (16, 16, vec![255; 16 * 16 * 4]),
+                    ],
+                    total_timeline_frames: 6,
+                    frame_w: 16,
+                    frame_h: 16,
+                }),
+            });
+        }
+        let out_timeline = run_component_frame(&ctx, &host, Vec::new());
+        assert!(
+            !text_positions(
+                &out_timeline,
+                "Preview · Timeline: 6 frames (16×16 px) · first 4"
+            )
+            .is_empty(),
+            "timeline preview caption must be shown when unified frames is off"
+        );
+
+        host.view.borrow_mut().aseprite_unified_frames = true;
+        let out_unified = run_component_frame(&ctx, &host, Vec::new());
+        assert!(
+            !text_positions(&out_unified, "Preview · Unified: 1 frame (64×16 px)").is_empty(),
+            "unified preview caption must be shown when unified frames is on"
         );
     }
 }

@@ -47,12 +47,12 @@ const CONTROL_GAP: f32 = 4.0;
 /// the Tool Property panel so the field reads as a normal theme input.
 const CONTROL_DELAY_INPUT_WIDTH: f32 = 44.0;
 
-/// Direction-arrow glyphs for the onion-skin toggles (left = previous frame,
-/// right = next frame). Stable codepoints that render through the fallback font.
-const ONION_PREV_LABEL: &str = "\u{25c0}";
-const ONION_NEXT_LABEL: &str = "\u{25b6}";
-const PREV_LABEL: &str = "<";
-const NEXT_LABEL: &str = ">";
+/// Onion-skin toggles (ghost of previous/next frame) and frame stepping
+/// arrows (`◀` / `▶`).
+const ONION_PREV_LABEL: &str = crate::ui::icons::ONION_PREV;
+const ONION_NEXT_LABEL: &str = crate::ui::icons::ONION_NEXT;
+const PREV_LABEL: &str = "\u{25c0}";
+const NEXT_LABEL: &str = "\u{25b6}";
 
 /// A gesture emitted by the Frame Edit panel's control bar.
 ///
@@ -203,6 +203,11 @@ fn draw_controls(
     }
     ui.painter()
         .rect_filled(bar_rect, 0.0, chrome.colors.panel_header_bg32());
+    ui.painter().hline(
+        bar_rect.left()..=bar_rect.right(),
+        bar_rect.top(),
+        egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+    );
 
     let (left, center, right) = control_zone_rects(bar_rect);
 
@@ -387,7 +392,7 @@ pub(crate) fn control_zone_rects(bar_rect: Rect) -> (Rect, Rect, Rect) {
 pub fn frame_edit_panel_spec(host: &FrameEditHost, placement: PanelPlacement) -> PanelSpec {
     PanelSpec {
         id: PanelId::new(FRAME_EDIT_PANEL_ID),
-        metadata: PanelMetadata::new("frame editor", true, vec2(220.0, 150.0)),
+        metadata: PanelMetadata::new("Frame Editor", true, vec2(220.0, 150.0)),
         placement,
         floating_rect: Rect::from_min_size(pos2(120.0, 300.0), vec2(320.0, 240.0)),
         content: Box::new(FrameEditPanelContent { host: host.clone() }),

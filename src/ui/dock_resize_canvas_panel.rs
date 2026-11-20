@@ -34,7 +34,8 @@ const MAX_REGION_SIDE: u32 = 4096;
 const MAX_REGION_COUNT: u32 = 256;
 
 /// Fixed minimum size of the (non-resizable) floating window.
-const RESIZE_CANVAS_MIN_SIZE: egui::Vec2 = vec2(420.0, 260.0);
+const RESIZE_CANVAS_MIN_SIZE: egui::Vec2 =
+    vec2(440.0, 236.0 + crate::ui::panel_dock::FLOATING_PANEL_CHROME_HEIGHT);
 
 /// Side of one pivot-grid cell, in points.
 const PIVOT_CELL: f32 = 22.0;
@@ -349,8 +350,9 @@ fn resize_counts_section(ui: &mut egui::Ui, host: &ResizeCanvasHost, chrome: &Pa
             }
 
             ui.add_space(4.0);
-            // Keep Apply aligned with the left column's checkbox row.
-            ui.label("");
+            // Match the left column's checkbox height exactly so both group
+            // frames and Apply buttons align symmetrically.
+            ui.allocate_space(vec2(0.0, ui.spacing().interact_size.y));
             ui.add_space(4.0);
 
             if chrome
@@ -402,6 +404,13 @@ pub(crate) fn build_resize_canvas_nest(host: &ResizeCanvasHost) -> NestContent {
 /// button and the panel is not dockable. `resizable == false` keeps the window
 /// fixed-size and only draggable by its header.
 pub fn resize_canvas_panel_spec(host: &ResizeCanvasHost, floating_rect: egui::Rect) -> PanelSpec {
+    let floating_rect = egui::Rect::from_min_size(
+        floating_rect.min,
+        vec2(
+            floating_rect.width().max(RESIZE_CANVAS_MIN_SIZE.x),
+            floating_rect.height().max(RESIZE_CANVAS_MIN_SIZE.y),
+        ),
+    );
     PanelSpec {
         id: PanelId::new(RESIZE_CANVAS_PANEL_ID),
         metadata: PanelMetadata {
@@ -621,6 +630,66 @@ mod tests {
             p2,
             Pivot::BottomRight,
             "right pivot grid must respond to click"
+        );
+    }
+
+    #[test]
+    fn resize_canvas_panel_fits_without_overflow() {
+        let host = ResizeCanvasHost::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), RESIZE_CANVAS_MIN_SIZE);
+        let ctx = egui::Context::default();
+        let theme = crate::ui::theme::Theme::default_dark();
+        let capture = crate::ui::input_capture::InputCapture::new();
+        let chrome = PanelChrome::flat(
+            &theme,
+            &capture,
+            crate::ui::input_capture::SurfaceId::Panel(PanelId::new(RESIZE_CANVAS_PANEL_ID)),
+        );
+        let chrome_h = crate::ui::panel_dock::FLOATING_PANEL_CHROME_HEIGHT;
+        let viewport_size = vec2(rect.width() - 22.0, rect.height() - chrome_h);
+        let body_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            vec2(
+                viewport_size.x + 2.0 * crate::ui::panel_dock::nest::NEST_PADDING,
+                viewport_size.y + 2.0 * crate::ui::panel_dock::nest::NEST_PADDING,
+            ),
+        );
+        let mut measured_content_size = egui::Vec2::ZERO;
+        let raw = egui::RawInput {
+            screen_rect: Some(rect),
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |body| {
+                let nest_vp =
+                    crate::ui::panel_dock::nest::nest_viewport(body.available_rect_before_wrap());
+                body.scope_builder(egui::UiBuilder::new().max_rect(nest_vp), |inner| {
+                    let out = egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .min_scrolled_width(0.0)
+                        .min_scrolled_height(0.0)
+                        .show(inner, |scroll| {
+                            let view = NestView::screen(nest_vp);
+                            let mut comp = ResizeCanvasComponent { host: host.clone() };
+                            comp.ui(scroll, &view, &chrome);
+                        });
+                    measured_content_size = out.content_size;
+                });
+            });
+        })
+        .textures_delta
+        .clear();
+        assert!(
+            measured_content_size.y <= viewport_size.y,
+            "Resize Canvas content height ({}) must fit inside viewport ({}) without vertical scrollbar",
+            measured_content_size.y,
+            viewport_size.y
+        );
+        assert!(
+            measured_content_size.x <= viewport_size.x,
+            "Resize Canvas content width ({}) must fit inside viewport ({}) without horizontal scrollbar",
+            measured_content_size.x,
+            viewport_size.x
         );
     }
 }

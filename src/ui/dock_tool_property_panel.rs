@@ -23,9 +23,8 @@ use crate::ui::toolbar::{tool_label, ToolbarEvent};
 /// The dock id for the Tool Property panel.
 pub const TOOL_PROPERTY_PANEL_ID: u64 = 103;
 
-/// Content height: the tool name plus the property area. The width follows the
-/// panel so a narrow dock never overflows horizontally.
-const TOOL_PROPERTY_CONTENT_HEIGHT: f32 = 160.0;
+/// Minimum content height of the Tool Property nest.
+const TOOL_PROPERTY_CONTENT_HEIGHT: f32 = 80.0;
 
 /// Placeholder shown where the active tool's editable properties will render.
 const TOOL_PROPERTY_PLACEHOLDER: &str = "No editable properties for this tool yet.";
@@ -54,15 +53,24 @@ impl Component for ToolPropertyComponent {
         // the transform-session input contract).
         if view.text_transform_active {
             ui.strong("Text Transform");
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(4.0);
             self.text_properties(ui, &view, chrome);
             return;
         }
         if view.transform_active {
             ui.strong("Transform");
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(4.0);
             self.transform_properties(ui, &view, chrome);
             return;
         }
         ui.strong(tool_label(view.tool));
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(4.0);
         match view.tool {
             Tool::Pencil | Tool::Eraser => {
                 self.draw_properties(ui, &view, chrome);
@@ -87,11 +95,105 @@ impl Component for ToolPropertyComponent {
 }
 
 /// One property row: the parameter name on its own line, then the inputs
-/// left-aligned below it with a small gap.
+/// aligned below it with consistent vertical rhythm.
 fn property_row(ui: &mut egui::Ui, label: &str, inputs: impl FnOnce(&mut egui::Ui)) {
-    ui.label(label);
+    ui.weak(label);
     ui.add_space(2.0);
-    ui.horizontal_wrapped(inputs);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        inputs(ui);
+    });
+    ui.add_space(6.0);
+}
+
+/// Custom filled-track slider with crisp pixel-editor styling:
+/// dark recessed track, accent fill from origin (or center when `bipolar`),
+/// and a sharp 8x14px thumb.
+pub(crate) fn pro_slider(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    bipolar: bool,
+) -> egui::Response {
+    let min = *range.start();
+    let max = *range.end();
+    let span = (max - min).max(f32::EPSILON);
+    let width = ui.available_width().max(40.0);
+    let height = 18.0;
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, height), egui::Sense::click_and_drag());
+
+    let track_inset = 5.0;
+    let track_left = rect.left() + track_inset;
+    let track_right = (rect.right() - track_inset).max(track_left + 1.0);
+    let track_w = track_right - track_left;
+
+    if response.dragged() || response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let t = ((pos.x - track_left) / track_w).clamp(0.0, 1.0);
+            let new_val = (min + t * span).clamp(min, max);
+            if (new_val - *value).abs() > f32::EPSILON {
+                *value = new_val;
+                response.mark_changed();
+            }
+        }
+    }
+
+    let t = ((*value - min) / span).clamp(0.0, 1.0);
+    let handle_x = track_left + t * track_w;
+    let track_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.center().y),
+        vec2(track_w, 4.0),
+    );
+
+    let visuals = ui.visuals();
+    let painter = ui.painter();
+    painter.rect_filled(track_rect, 1.0, visuals.extreme_bg_color);
+    painter.rect_stroke(
+        track_rect,
+        1.0,
+        visuals.widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let fill_color = visuals.selection.stroke.color;
+    let fill_rect = if bipolar {
+        let zero_t = ((0.0 - min) / span).clamp(0.0, 1.0);
+        let zero_x = track_left + zero_t * track_w;
+        egui::Rect::from_min_max(
+            egui::pos2(zero_x.min(handle_x), track_rect.top()),
+            egui::pos2(zero_x.max(handle_x), track_rect.bottom()),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            track_rect.min,
+            egui::pos2(handle_x, track_rect.bottom()),
+        )
+    };
+    if fill_rect.width() > 0.5 {
+        painter.rect_filled(fill_rect, 1.0, fill_color);
+    }
+
+    let handle_rect = egui::Rect::from_center_size(
+        egui::pos2(handle_x, rect.center().y),
+        vec2(8.0, 14.0),
+    );
+    let active = response.hovered() || response.dragged();
+    let handle_fill = if active {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        visuals.widgets.inactive.bg_fill
+    };
+    let handle_stroke = if active {
+        visuals.selection.stroke
+    } else {
+        visuals.widgets.active.fg_stroke
+    };
+    painter.rect_filled(handle_rect, 1.5, handle_fill);
+    painter.rect_stroke(handle_rect, 1.5, handle_stroke, egui::StrokeKind::Inside);
+
+    let _ = id_salt;
+    response
 }
 
 impl ToolPropertyComponent {
@@ -106,13 +208,26 @@ impl ToolPropertyComponent {
             .size
             .clamp(BrushSpec::MIN_SIZE, BrushSpec::MAX_SIZE);
         property_row(ui, "Size (Shift+Scroll)", |ui| {
-            let input = ui.add(
+            let input = ui.add_sized(
+                vec2(42.0, ui.spacing().interact_size.y),
                 egui::DragValue::new(&mut size).range(BrushSpec::MIN_SIZE..=BrushSpec::MAX_SIZE),
             );
-            let slider = ui.add(
-                egui::Slider::new(&mut size, BrushSpec::MIN_SIZE..=BrushSpec::MAX_SIZE)
-                    .show_value(false),
-            );
+            let mut size_f = size as f32;
+            let slider_w = (ui.available_width() - 50.0).max(40.0);
+            let slider = ui
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(
+                        ui,
+                        "brush-size",
+                        &mut size_f,
+                        (BrushSpec::MIN_SIZE as f32)..=(BrushSpec::MAX_SIZE as f32),
+                        false,
+                    )
+                })
+                .inner;
+            if slider.changed() {
+                size = size_f.round() as u8;
+            }
             let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
             if (input.changed() || slider.changed()) && size != view.draw.size {
                 events
@@ -152,11 +267,17 @@ impl ToolPropertyComponent {
                 .draw
                 .tail
                 .clamp(-DrawTool::MAX_TAIL, DrawTool::MAX_TAIL);
-            let input = ui.add(
+            let input = ui.add_sized(
+                vec2(42.0, ui.spacing().interact_size.y),
                 egui::DragValue::new(&mut tail).range(-DrawTool::MAX_TAIL..=DrawTool::MAX_TAIL),
             );
             let mut position = tail_slider_from_value(tail);
-            let slider = ui.add(egui::Slider::new(&mut position, -1.0..=1.0).show_value(false));
+            let slider_w = (ui.available_width() - 50.0).max(40.0);
+            let slider = ui
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(ui, "brush-tail", &mut position, -1.0..=1.0, true)
+                })
+                .inner;
             let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
             if slider.changed() {
                 tail = tail_value_from_slider(position);
@@ -172,9 +293,26 @@ impl ToolPropertyComponent {
         });
         property_row(ui, "Scatter (Alt+Scroll)", |ui| {
             let mut scatter = view.draw.scatter.min(DrawTool::MAX_SCATTER);
-            let input = ui.add(egui::DragValue::new(&mut scatter).range(0..=DrawTool::MAX_SCATTER));
+            let input = ui.add_sized(
+                vec2(42.0, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut scatter).range(0..=DrawTool::MAX_SCATTER),
+            );
+            let mut scatter_f = scatter as f32;
+            let slider_w = (ui.available_width() - 50.0).max(40.0);
             let slider = ui
-                .add(egui::Slider::new(&mut scatter, 0..=DrawTool::MAX_SCATTER).show_value(false));
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(
+                        ui,
+                        "brush-scatter",
+                        &mut scatter_f,
+                        0.0..=(DrawTool::MAX_SCATTER as f32),
+                        false,
+                    )
+                })
+                .inner;
+            if slider.changed() {
+                scatter = scatter_f.round() as u8;
+            }
             let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
             if (input.changed() || slider.changed()) && scatter != view.draw.scatter {
                 events
@@ -264,8 +402,20 @@ impl ToolPropertyComponent {
         ui.add_enabled(false, egui::Checkbox::new(&mut effective, "Contiguous (Alt)"));
         property_row(ui, "Tolerance", |ui| {
             let mut tolerance = view.wand.tolerance;
-            let input = ui.add(egui::DragValue::new(&mut tolerance).range(0..=u8::MAX));
-            let slider = ui.add(egui::Slider::new(&mut tolerance, 0..=u8::MAX).show_value(false));
+            let input = ui.add_sized(
+                vec2(42.0, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut tolerance).range(0..=u8::MAX),
+            );
+            let mut tol_f = tolerance as f32;
+            let slider_w = (ui.available_width() - 50.0).max(40.0);
+            let slider = ui
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(ui, "wand-tol", &mut tol_f, 0.0..=(u8::MAX as f32), false)
+                })
+                .inner;
+            if slider.changed() {
+                tolerance = tol_f.round() as u8;
+            }
             let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
             if (input.changed() || slider.changed()) && tolerance != view.wand.tolerance {
                 events
@@ -294,8 +444,20 @@ impl ToolPropertyComponent {
         let events = &self.host.events;
         property_row(ui, "Tolerance", |ui| {
             let mut tolerance = view.fill.tolerance;
-            let input = ui.add(egui::DragValue::new(&mut tolerance).range(0..=u8::MAX));
-            let slider = ui.add(egui::Slider::new(&mut tolerance, 0..=u8::MAX).show_value(false));
+            let input = ui.add_sized(
+                vec2(42.0, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut tolerance).range(0..=u8::MAX),
+            );
+            let mut tol_f = tolerance as f32;
+            let slider_w = (ui.available_width() - 50.0).max(40.0);
+            let slider = ui
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(ui, "fill-tol", &mut tol_f, 0.0..=(u8::MAX as f32), false)
+                })
+                .inner;
+            if slider.changed() {
+                tolerance = tol_f.round() as u8;
+            }
             let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
             if (input.changed() || slider.changed()) && tolerance != view.fill.tolerance {
                 events
@@ -345,8 +507,20 @@ impl ToolPropertyComponent {
         ui.add_space(4.0);
         property_row(ui, "Size", |ui| {
             let mut size = view.text_size;
-            let input = ui.add(egui::DragValue::new(&mut size).range(5..=128));
-            let slider = ui.add(egui::Slider::new(&mut size, 5..=128).show_value(false));
+            let input = ui.add_sized(
+                vec2(42.0, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut size).range(5..=128),
+            );
+            let mut size_f = size as f32;
+            let slider_w = (ui.available_width() - 50.0).max(40.0);
+            let slider = ui
+                .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                    pro_slider(ui, "text-size", &mut size_f, 5.0..=128.0, false)
+                })
+                .inner;
+            if slider.changed() {
+                size = size_f.round() as u32;
+            }
             let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
             if (input.changed() || slider.changed()) && size != view.text_size {
                 events
@@ -359,7 +533,65 @@ impl ToolPropertyComponent {
                     .push(ToolbarEvent::TextSizeChanged(14));
             }
         });
-        ui.add_space(4.0);
+        property_row(ui, "Align", |ui| {
+            let total_w = ui.available_width().max(72.0);
+            let gap = 6.0;
+            let btn_w = ((total_w - 2.0 * gap) / 3.0).max(20.0);
+            let btn_h = ui.spacing().interact_size.y.max(22.0);
+            let (row_rect, _) =
+                ui.allocate_exact_size(vec2(total_w, btn_h), egui::Sense::hover());
+            for (i, (align, glyph, tip)) in [
+                (crate::core::text::TextAlign::Left, crate::ui::icons::ALIGN_LEFT, "Align Left"),
+                (crate::core::text::TextAlign::Center, crate::ui::icons::ALIGN_CENTER, "Align Center"),
+                (crate::core::text::TextAlign::Right, crate::ui::icons::ALIGN_RIGHT, "Align Right"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let x = row_rect.left() + i as f32 * (btn_w + gap);
+                let slot = egui::Rect::from_min_size(egui::pos2(x, row_rect.top()), vec2(btn_w, btn_h));
+                let selected = view.text_align == align;
+                let response = ui
+                    .interact(
+                        slot,
+                        ui.id().with(("text-align-btn", i)),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(tip);
+                let visuals = ui.visuals();
+                let fill = if selected {
+                    chrome.colors.selection_bg_fill32()
+                } else if response.hovered() {
+                    visuals.widgets.hovered.bg_fill
+                } else {
+                    chrome.colors.panel_bg32()
+                };
+                let stroke = if selected {
+                    egui::Stroke::new(1.0, chrome.colors.selection_stroke_color32())
+                } else {
+                    egui::Stroke::new(1.0, chrome.colors.panel_border32())
+                };
+                ui.painter().rect_filled(slot, chrome.rounding, fill);
+                ui.painter().rect_stroke(
+                    slot,
+                    chrome.rounding,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    slot.center(),
+                    egui::Align2::CENTER_CENTER,
+                    glyph,
+                    egui::FontId::proportional(14.0),
+                    visuals.text_color(),
+                );
+                if response.clicked() && !selected {
+                    events
+                        .borrow_mut()
+                        .push(ToolbarEvent::TextAlignChanged(align));
+                }
+            }
+        });
         self.transform_properties(ui, view, chrome);
     }
 

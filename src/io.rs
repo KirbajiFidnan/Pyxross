@@ -811,6 +811,7 @@ pub fn clear_recovery_journal(base: &Path) {
 }
 
 /// One frame of a GIF export: RGBA pixels plus a display delay.
+#[derive(Clone, Debug)]
 pub struct GifFrameInput {
     pub width: usize,
     pub height: usize,

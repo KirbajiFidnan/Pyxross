@@ -45,7 +45,14 @@ impl PreviewImage {
 impl Component for PreviewImage {
     fn ui(&mut self, ui: &mut egui::Ui, view: &NestView, _chrome: &PanelChrome) {
         let Some((texture, size)) = self.feed.image() else {
-            ui.label("No preview");
+            let center = view.clip().center();
+            ui.painter().text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "No preview",
+                egui::FontId::proportional(12.0),
+                ui.visuals().weak_text_color(),
+            );
             return;
         };
         let world = Rect::from_min_size(egui::Pos2::ZERO, size);
@@ -77,14 +84,25 @@ impl Component for PreviewControls {
         ComponentPlacement::Overlay
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, _chrome: &PanelChrome) {
-        ui.horizontal(|ui| {
-            if ui.button("Reset pan").clicked() {
-                self.reset.request(NestReset::Pan);
-            }
-            if ui.button("Reset zoom").clicked() {
-                self.reset.request(NestReset::Zoom);
-            }
+    fn ui(&mut self, ui: &mut egui::Ui, view: &NestView, chrome: &PanelChrome) {
+        let vp = view.clip();
+        let bar = Rect::from_min_max(vp.min + Vec2::splat(4.0), vp.max - Vec2::splat(4.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if chrome
+                    .button(ui, "Reset pan", super::skin::ButtonStyle::plain())
+                    .clicked()
+                {
+                    self.reset.request(NestReset::Pan);
+                }
+                if chrome
+                    .button(ui, "Reset zoom", super::skin::ButtonStyle::plain())
+                    .clicked()
+                {
+                    self.reset.request(NestReset::Zoom);
+                }
+            });
         });
     }
 }

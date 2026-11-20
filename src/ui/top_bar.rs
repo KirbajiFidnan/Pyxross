@@ -100,6 +100,7 @@ pub enum MenuAction {
     ImportPyxel,
     ImportAseprite,
     ImportImage2Pixel,
+    ExportImage,
     ExportSpriteSheet,
     ExportGif,
     ExportPyxel,
@@ -164,7 +165,7 @@ pub struct MenuDef {
     pub items: &'static [MenuItem],
 }
 
-static FILE_ITEMS: [MenuItem; 14] = [
+static FILE_ITEMS: [MenuItem; 15] = [
     grouped_item("Document", "New Project...", MenuAction::NewProject),
     item("Save Project", MenuAction::SaveProject),
     item("Save Project As...", MenuAction::SaveProjectAs),
@@ -174,7 +175,8 @@ static FILE_ITEMS: [MenuItem; 14] = [
     item("Import Pyxel...", MenuAction::ImportPyxel),
     item("Import Aseprite...", MenuAction::ImportAseprite),
     item("Image to Pixel...", MenuAction::ImportImage2Pixel),
-    grouped_item("Export", "Export Sprite Sheet...", MenuAction::ExportSpriteSheet),
+    grouped_item("Export", "Export Image...", MenuAction::ExportImage),
+    item("Export Sprite Sheet...", MenuAction::ExportSpriteSheet),
     item("Export GIF...", MenuAction::ExportGif),
     item("Export .pyxel...", MenuAction::ExportPyxel),
     item("Export .ase...", MenuAction::ExportAseprite),
@@ -317,25 +319,25 @@ pub fn split_frame(frame: Rect) -> TopBarLayout {
 const CREATE_BUTTON_LEFT_INSET: f32 = 20.0;
 
 /// The square "create new document" button in the middle slice: pinned to the
-/// RIGHT edge of `middle_rect`. Pure, so tests can target it.
+/// LEFT edge of `middle_rect`. Pure, so tests can target it.
 pub fn create_document_button_rect(layout: &TopBarLayout) -> Rect {
     let side = (layout.middle_rect.height() - 2.0 * SLICE_INSET).max(8.0);
     let inset = CREATE_BUTTON_LEFT_INSET.max(SLICE_INSET);
     let center = pos2(
-        layout.middle_rect.right() - inset - side * 0.5,
+        layout.middle_rect.left() + inset + side * 0.5,
         layout.middle_rect.center().y,
     );
     Rect::from_center_size(center, vec2(side, side))
 }
 
 /// The Foreground/Background color swatch cluster in the middle slice, placed
-/// on the LEFT edge where the create-document button used to sit.
+/// to the RIGHT of the create-document button with a divider gap.
 pub fn fg_bg_swatch_rects(layout: &TopBarLayout) -> (Rect, Rect) {
-    let inset = CREATE_BUTTON_LEFT_INSET.max(SLICE_INSET);
+    let create_rect = create_document_button_rect(layout);
     let side = ((layout.middle_rect.height() - 2.0 * SLICE_INSET) * 0.62).clamp(16.0, 32.0);
     let offset = (side * 0.42).round();
     let total = side + offset;
-    let x0 = layout.middle_rect.left() + inset;
+    let x0 = create_rect.right() + 20.0;
     let y0 = layout.middle_rect.center().y - total * 0.5;
     let fg = Rect::from_min_size(pos2(x0, y0), vec2(side, side));
     let bg = Rect::from_min_size(pos2(x0 + offset, y0 + offset), vec2(side, side));
@@ -721,7 +723,14 @@ impl TopBarHost {
             }
         }
 
-        // Middle slice: FG/BG color swatches on the LEFT, New Document button on the RIGHT.
+        // Middle slice: New Document button on the LEFT, vertical divider, then FG/BG swatches.
+        let button_rect = create_document_button_rect(layout);
+        let divider_x = button_rect.right() + 10.0;
+        painter.vline(
+            divider_x,
+            (layout.middle_rect.top() + 8.0)..=(layout.middle_rect.bottom() - 8.0),
+            Stroke::new(1.0, colors.panel_border32()),
+        );
         let (fg_rect, bg_rect) = fg_bg_swatch_rects(layout);
         let bg_resp = ui
             .interact(bg_rect, Id::new("top-bar-bg-swatch"), Sense::click())
@@ -764,7 +773,6 @@ impl TopBarHost {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        let button_rect = create_document_button_rect(layout);
         let button = ui
             .interact(
                 button_rect,
@@ -1232,31 +1240,27 @@ mod tests {
         assert!(
             (button.height() - (layout.middle_rect.height() - 2.0 * SLICE_INSET)).abs() < 1e-4
         );
-        // Offset a small FIXED inset from the RIGHT edge (not glued, but close).
+        // Offset a small FIXED inset from the LEFT edge (not glued, but close).
         assert!(layout.middle_rect.contains_rect(button), "button inside middle");
-        let right_inset = layout.middle_rect.right() - button.right();
+        let left_inset = button.left() - layout.middle_rect.left();
         assert!(
-            right_inset > SLICE_INSET + 1.0,
-            "button must NOT be glued to the right edge (inset {right_inset}): {button:?}"
+            left_inset > SLICE_INSET + 1.0,
+            "button must NOT be glued to the left edge (inset {left_inset}): {button:?}"
         );
         assert!(
-            (right_inset - CREATE_BUTTON_LEFT_INSET).abs() < 1e-3,
-            "right inset must be the small fixed {CREATE_BUTTON_LEFT_INSET}: {button:?}"
+            (left_inset - CREATE_BUTTON_LEFT_INSET).abs() < 1e-3,
+            "left inset must be the small fixed {CREATE_BUTTON_LEFT_INSET}: {button:?}"
         );
         assert!(
-            right_inset < layout.middle_rect.width() / 4.0,
-            "button should sit near the right edge: {button:?}"
-        );
-        assert!(
-            button.left() - layout.middle_rect.left() > 0.0,
-            "button must be clear of the left edge: {button:?}"
+            left_inset < layout.middle_rect.width() / 4.0,
+            "button should sit near the left edge: {button:?}"
         );
         let (fg_rect, bg_rect) = fg_bg_swatch_rects(&layout);
         assert!(layout.middle_rect.contains_rect(fg_rect), "fg swatch inside middle");
         assert!(layout.middle_rect.contains_rect(bg_rect), "bg swatch inside middle");
         assert!(
-            fg_rect.right() < button.left(),
-            "fg/bg swatches sit on the left while create button sits on the right"
+            button.right() < fg_rect.left(),
+            "create button sits on the left while fg/bg swatches sit to its right"
         );
     }
 
@@ -1316,7 +1320,7 @@ mod tests {
             Some("Document"),
             "the File dropdown starts with the 'Document' group"
         );
-        assert_eq!(menus[0].items.len(), 14);
+        assert_eq!(menus[0].items.len(), 15);
         assert_eq!(menus[1].items.len(), 12);
         assert_eq!(menus[2].items.len(), 1);
         assert_eq!(menus[2].items[0].label, "Resize Canvas...");
@@ -1347,6 +1351,7 @@ mod tests {
             MenuAction::ImportPyxel,
             MenuAction::ImportAseprite,
             MenuAction::ImportImage2Pixel,
+            MenuAction::ExportImage,
             MenuAction::ExportSpriteSheet,
             MenuAction::ExportGif,
             MenuAction::ExportPyxel,
@@ -1354,7 +1359,7 @@ mod tests {
             MenuAction::ExportSelected,
         ];
         let items = menu_item_rects(&layout, 0);
-        assert_eq!(items.len(), 14);
+        assert_eq!(items.len(), 15);
         for (i, (item, rect)) in items.iter().enumerate() {
             // Open File, then click this item.
             click_host(&ctx, &mut host, &layout, &colors, file_title);

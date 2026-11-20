@@ -71,6 +71,8 @@ pub enum ToolbarEvent {
     TextFontChanged(String),
     /// The user changed the Text tool's font size in the Tool Property panel.
     TextSizeChanged(u32),
+    /// The user changed the Text tool's horizontal alignment in the Tool Property panel.
+    TextAlignChanged(crate::core::text::TextAlign),
 }
 
 /// All tools in toolbox display order.

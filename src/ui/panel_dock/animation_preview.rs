@@ -49,7 +49,14 @@ impl FramePreviewImage {
 impl Component for FramePreviewImage {
     fn ui(&mut self, ui: &mut egui::Ui, view: &NestView, _chrome: &PanelChrome) {
         let Some((texture, sheet_size, region)) = self.feed.get() else {
-            ui.label("No preview");
+            let center = view.clip().center();
+            ui.painter().text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "No preview",
+                egui::FontId::proportional(12.0),
+                ui.visuals().weak_text_color(),
+            );
             return;
         };
         // Degenerate regions (or sheets) would divide by zero / paint nothing.

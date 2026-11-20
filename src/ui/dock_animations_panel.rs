@@ -75,11 +75,11 @@ impl Component for AnimationsHeaderComponent {
                         .push(AnimationPanelEvent::Remove(index));
                 }
             }
-            // The "set frames" action is pinned to the far right of the band
+            // The "Set Frames" action is pinned to the far right of the band
             // while add/remove stay on the left.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if chrome
-                    .button(ui, "set frames", ButtonStyle::plain())
+                    .button(ui, "Set Frames", ButtonStyle::plain())
                     .on_hover_text("Set the frame regions for this animation")
                     .clicked()
                 {
@@ -87,6 +87,8 @@ impl Component for AnimationsHeaderComponent {
                 }
             });
         });
+        ui.add_space(2.0);
+        ui.separator();
     }
 }
 
@@ -363,10 +365,10 @@ mod tests {
         // First frame lays the header out; no click yet, so no event.
         let output = run_header_frame(&ctx, Vec::new(), &host);
         assert!(host.events.borrow().is_empty());
-        let pos = text_positions(&output, "set frames")
+        let pos = text_positions(&output, "Set Frames")
             .into_iter()
             .next()
-            .expect("the set frames button should render its label");
+            .expect("the Set Frames button should render its label");
         let at = pos + egui::vec2(4.0, 8.0);
 
         run_header_frame(&ctx, vec![egui::Event::PointerMoved(at)], &host);

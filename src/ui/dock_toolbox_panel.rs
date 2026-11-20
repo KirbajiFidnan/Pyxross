@@ -15,10 +15,9 @@ use crate::ui::toolbar::{tool_label, ToolbarEvent, TOOLS};
 /// The dock id for the Toolbox panel.
 pub const TOOLBOX_PANEL_ID: u64 = 100;
 
-/// Content height tall enough to overflow a short dock viewport, so the tool
-/// buttons scroll with the nest content instead of being pinned. The width
-/// follows the panel so a narrow dock never overflows horizontally.
-const TOOLBOX_CONTENT_HEIGHT: f32 = 360.0;
+/// Button side and spacing for the multi-column tool grid.
+const TOOL_BUTTON_SIZE: f32 = 32.0;
+const TOOL_GRID_GAP: f32 = 4.0;
 
 fn tool_icon(tool: Tool, shortcuts: &crate::ui::dock_hosts::ToolboxShortcuts) -> String {
     match tool {
@@ -66,40 +65,51 @@ struct ToolboxComponent {
 
 impl Component for ToolboxComponent {
     fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
-        ui.set_min_size(vec2(ui.available_width(), TOOLBOX_CONTENT_HEIGHT));
         let view = self.host.view.borrow().clone();
         let active_tool = view.tool;
+        let avail_w = ui.available_width().max(TOOL_BUTTON_SIZE);
+        let cols = (((avail_w + TOOL_GRID_GAP) / (TOOL_BUTTON_SIZE + TOOL_GRID_GAP)).floor()
+            as usize)
+            .max(1);
+        let rows = (TOOLS.len() + cols - 1) / cols;
+        let grid_h = rows as f32 * TOOL_BUTTON_SIZE + (rows.saturating_sub(1)) as f32 * TOOL_GRID_GAP;
+        ui.set_min_size(vec2(avail_w, grid_h));
+
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            let button_w = ui.available_width().clamp(34.0, 48.0);
-            for tool in TOOLS {
-                let active = active_tool == tool;
-                let response = ui
-                    .allocate_ui(vec2(button_w, 34.0), |ui| {
-                        let label = tool_icon(tool, &view.shortcuts);
-                        let font_size = if tool == Tool::Text && label.len() > 2 {
-                            12.0
-                        } else if tool == Tool::Text {
-                            17.0
-                        } else {
-                            20.0
-                        };
-                        chrome
-                            .button_with_font_size(
-                                ui,
-                                &label,
-                                Some(font_size),
-                                ButtonStyle::toggled(active),
-                            )
-                            .on_hover_text(tool_tooltip(tool, &view.shortcuts))
-                    })
-                    .inner;
-                if response.clicked() {
-                    self.host
-                        .events
-                        .borrow_mut()
-                        .push(ToolbarEvent::ToolSelected(tool));
-                }
+            ui.spacing_mut().item_spacing = vec2(TOOL_GRID_GAP, TOOL_GRID_GAP);
+            for chunk in TOOLS.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(TOOL_GRID_GAP, TOOL_GRID_GAP);
+                    for &tool in chunk {
+                        let active = active_tool == tool;
+                        let response = ui
+                            .allocate_ui(vec2(TOOL_BUTTON_SIZE, TOOL_BUTTON_SIZE), |ui| {
+                                let label = tool_icon(tool, &view.shortcuts);
+                                let font_size = if tool == Tool::Text && label.len() > 2 {
+                                    11.5
+                                } else if tool == Tool::Text {
+                                    16.0
+                                } else {
+                                    18.0
+                                };
+                                chrome
+                                    .button_with_font_size(
+                                        ui,
+                                        &label,
+                                        Some(font_size),
+                                        ButtonStyle::toggled(active),
+                                    )
+                                    .on_hover_text(tool_tooltip(tool, &view.shortcuts))
+                            })
+                            .inner;
+                        if response.clicked() {
+                            self.host
+                                .events
+                                .borrow_mut()
+                                .push(ToolbarEvent::ToolSelected(tool));
+                        }
+                    }
+                });
             }
         });
     }

@@ -1808,6 +1808,7 @@ impl App {
             top_bar::MenuAction::ImportPyxel => self.file_import_pyxel(),
             top_bar::MenuAction::ImportAseprite => self.file_import_aseprite(),
             top_bar::MenuAction::ImportImage2Pixel => self.file_import_img2pixel(),
+            top_bar::MenuAction::ExportImage => self.file_export_image(),
             top_bar::MenuAction::ExportSpriteSheet => self.file_export_sprite_sheet(),
             top_bar::MenuAction::ExportGif => self.file_export_gif(),
             top_bar::MenuAction::ExportPyxel => self.file_export_pyxel(),
@@ -1992,7 +1993,7 @@ impl App {
         }
         let floating_rect = egui::Rect::from_min_size(
             egui::pos2(300.0, 110.0),
-            egui::vec2(460.0, 520.0),
+            egui::vec2(420.0, 440.0),
         );
         let spec = dock_style_panel::style_panel_spec(&self.style_host, floating_rect);
         if self.panel_dock.add_spec(spec).is_ok() {
@@ -2184,7 +2185,7 @@ impl App {
         }
         let floating_rect = egui::Rect::from_min_size(
             egui::pos2(340.0, 160.0),
-            egui::vec2(440.0, 280.0),
+            egui::vec2(440.0, 286.0),
         );
         let spec = dock_resize_canvas_panel::resize_canvas_panel_spec(
             &self.resize_canvas_host,
@@ -2292,17 +2293,25 @@ impl App {
             };
             view.error = None;
             view.focus_requested = true;
+            view.pixel_scale = 1;
+            view.preview_generation = view.preview_generation.wrapping_add(1);
             view.location = self.default_save_location();
         }
         let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
         if self.panel_dock.placement(panel_id).is_some() {
-            self.panel_dock.raise_floating(panel_id);
-            return;
+            if kind == dock_save_as_panel::SaveAsKind::Aseprite {
+                let _ = self.panel_dock.remove_spec(panel_id);
+            } else {
+                self.panel_dock.set_title(panel_id, kind.title());
+                self.panel_dock.raise_floating(panel_id);
+                return;
+            }
         }
-        let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(400.0, 260.0),
-            egui::vec2(420.0, 200.0),
-        );
+        let floating_rect = if kind == dock_save_as_panel::SaveAsKind::Aseprite {
+            egui::Rect::from_min_size(egui::pos2(380.0, 200.0), egui::vec2(460.0, 390.0))
+        } else {
+            egui::Rect::from_min_size(egui::pos2(400.0, 260.0), egui::vec2(420.0, 200.0))
+        };
         let spec = dock_save_as_panel::save_as_panel_spec(&self.save_as_host, floating_rect);
         if self.panel_dock.add_spec(spec).is_ok() {
             self.panel_dock.raise_floating(panel_id);
@@ -2672,9 +2681,14 @@ impl App {
     /// `last_error` cleared; on failure the inline panel error (and
     /// `last_error`) carry the message.
     fn save_as_target(&mut self, path: &Path) -> bool {
-        let (kind, payload, aseprite_unified) = {
+        let (kind, payload, aseprite_unified, pixel_scale) = {
             let view = self.save_as_host.view.borrow();
-            (view.kind, view.payload.clone(), view.aseprite_unified_frames)
+            (
+                view.kind,
+                view.payload.clone(),
+                view.aseprite_unified_frames,
+                view.pixel_scale.clamp(1, dock_save_as_panel::MAX_PIXEL_SCALE),
+            )
         };
         let outcome: Result<(), String> = match (kind, payload) {
             (dock_save_as_panel::SaveAsKind::Project, _) => {
@@ -2682,16 +2696,76 @@ impl App {
                 save_document_file(&doc, path).map_err(|err| format!("Failed to save: {err}"))
             }
             (
+                dock_save_as_panel::SaveAsKind::Image,
+                Some(dock_save_as_panel::SavePayload::Image { w, h, rgba }),
+            ) => {
+                let (sw, sh, scaled) =
+                    dock_save_as_panel::scale_rgba_nearest(w, h, &rgba, pixel_scale);
+                encode_png(sw, sh, &scaled)
+                    .map_err(|err| err.to_string())
+                    .and_then(|bytes| {
+                        std::fs::write(path, bytes)
+                            .map_err(|err| format!("Failed to export image: {err}"))
+                    })
+            }
+            (
                 dock_save_as_panel::SaveAsKind::SpriteSheet,
-                Some(dock_save_as_panel::SavePayload::SpriteSheet { png, meta }),
-            ) => std::fs::write(path, png)
-                .and_then(|_| std::fs::write(path.with_extension("json"), meta))
-                .map_err(|err| format!("Failed to export sprite sheet: {err}")),
+                Some(dock_save_as_panel::SavePayload::SpriteSheet { w, h, rgba, mut doc }),
+            ) => {
+                let (sw, sh, scaled) =
+                    dock_save_as_panel::scale_rgba_nearest(w, h, &rgba, pixel_scale);
+                if pixel_scale > 1 {
+                    let s = pixel_scale;
+                    doc.canvas_width = doc.canvas_width.saturating_mul(s);
+                    doc.canvas_height = doc.canvas_height.saturating_mul(s);
+                    doc.tile_size.w = doc.tile_size.w.saturating_mul(s);
+                    doc.tile_size.h = doc.tile_size.h.saturating_mul(s);
+                    for r in &mut doc.regions {
+                        r.x = r.x.saturating_mul(s);
+                        r.y = r.y.saturating_mul(s);
+                        r.width = r.width.saturating_mul(s);
+                        r.height = r.height.saturating_mul(s);
+                    }
+                }
+                let png = encode_png(sw, sh, &scaled).map_err(|err| err.to_string());
+                let meta = sprite_sheet_meta_json(&doc).map_err(|err| err.to_string());
+                match (png, meta) {
+                    (Ok(png), Ok(meta)) => std::fs::write(path, png)
+                        .and_then(|_| std::fs::write(path.with_extension("json"), meta))
+                        .map_err(|err| format!("Failed to export sprite sheet: {err}")),
+                    (Err(e), _) | (_, Err(e)) => {
+                        Err(format!("Failed to export sprite sheet: {e}"))
+                    }
+                }
+            }
             (
                 dock_save_as_panel::SaveAsKind::Gif,
-                Some(dock_save_as_panel::SavePayload::Gif(bytes)),
-            ) => std::fs::write(path, bytes)
-                .map_err(|err| format!("Failed to export GIF: {err}")),
+                Some(dock_save_as_panel::SavePayload::Gif(frames)),
+            ) => {
+                let scaled_frames: Vec<GifFrameInput> = frames
+                    .into_iter()
+                    .map(|f| {
+                        let (sw, sh, scaled) = dock_save_as_panel::scale_rgba_nearest(
+                            f.width,
+                            f.height,
+                            &f.rgba,
+                            pixel_scale,
+                        );
+                        GifFrameInput {
+                            width: sw,
+                            height: sh,
+                            rgba: scaled,
+                            delay_ms: f.delay_ms,
+                        }
+                    })
+                    .collect();
+                encode_gif(&scaled_frames)
+                    .map_err(|err| format!("Failed to export GIF: {err}"))
+                    .and_then(|bytes| {
+                        std::fs::write(path, bytes)
+                            .map_err(|err| format!("Failed to export GIF: {err}"))
+                    })
+            }
             (
                 dock_save_as_panel::SaveAsKind::Pyxel,
                 Some(dock_save_as_panel::SavePayload::Pyxel(bytes)),
@@ -2706,7 +2780,11 @@ impl App {
             }
             (
                 dock_save_as_panel::SaveAsKind::Aseprite,
-                Some(dock_save_as_panel::SavePayload::Aseprite { unified, timeline }),
+                Some(dock_save_as_panel::SavePayload::Aseprite {
+                    unified,
+                    timeline,
+                    ..
+                }),
             ) => {
                 let target = if path.extension().is_none() {
                     path.with_extension("ase")
@@ -2720,12 +2798,16 @@ impl App {
             (
                 dock_save_as_panel::SaveAsKind::SelectionPng,
                 Some(dock_save_as_panel::SavePayload::SelectionPng { w, h, rgba }),
-            ) => encode_png(w, h, &rgba)
-                .map_err(|err| err.to_string())
-                .and_then(|bytes| {
-                    std::fs::write(path, bytes)
-                        .map_err(|err| format!("Failed to export selection: {err}"))
-                }),
+            ) => {
+                let (sw, sh, scaled) =
+                    dock_save_as_panel::scale_rgba_nearest(w, h, &rgba, pixel_scale);
+                encode_png(sw, sh, &scaled)
+                    .map_err(|err| err.to_string())
+                    .and_then(|bytes| {
+                        std::fs::write(path, bytes)
+                            .map_err(|err| format!("Failed to export selection: {err}"))
+                    })
+            }
             _ => Err("internal: save-as draft has no payload and is not a project save".to_owned()),
         };
         match outcome {
@@ -3641,6 +3723,19 @@ impl App {
                         self.re_rasterize_text_transform();
                     }
                 }
+                ToolbarEvent::TextAlignChanged(align) => {
+                    self.projects.current_mut().text_align = align;
+                    if let Some(t) = self
+                        .projects
+                        .current_mut()
+                        .transform
+                        .as_mut()
+                        .and_then(TransformSession::text_mut)
+                    {
+                        t.align = align;
+                        self.re_rasterize_text_transform();
+                    }
+                }
                 ToolbarEvent::TileRotationChanged(degrees) => {
                     // The panel already snapped and normalized the value to a
                     // multiple of 90. It writes the SAME `tile_placer_transform`
@@ -3712,9 +3807,9 @@ impl App {
             .as_ref()
             .is_some_and(TransformSession::is_text);
         let transform_algorithm = session.transform_algorithm;
-        let (text_font, text_size) = match &session.transform {
-            Some(TransformSession::Text(t)) => (t.font_name.clone(), t.font_size),
-            _ => (session.text_font.clone(), session.text_size),
+        let (text_font, text_size, text_align) = match &session.transform {
+            Some(TransformSession::Text(t)) => (t.font_name.clone(), t.font_size, t.align),
+            _ => (session.text_font.clone(), session.text_size, session.text_align),
         };
         let available_fonts: Vec<String> = self
             .discovered_fonts
@@ -3744,6 +3839,7 @@ impl App {
             text_transform_active,
             text_font,
             text_size,
+            text_align,
             available_fonts,
         };
         let mut color_picker_view = self.color_picker_host.view.borrow_mut();
@@ -4180,7 +4276,7 @@ impl App {
         if !registered {
             let spec = dock_animation_settings::animation_settings_panel_spec(
                 &self.animation_host,
-                egui::Rect::from_min_size(egui::pos2(360.0, 140.0), egui::vec2(280.0, 180.0)),
+                egui::Rect::from_min_size(egui::pos2(360.0, 140.0), egui::vec2(280.0, 132.0)),
             );
             if self.panel_dock.add_spec(spec).is_ok() {
                 self.panel_dock.raise_floating(settings_id);
@@ -4489,7 +4585,7 @@ impl App {
                                 &self.layers_host,
                                 egui::Rect::from_min_size(
                                     egui::pos2(360.0, 140.0),
-                                    egui::vec2(280.0, 200.0),
+                                    egui::vec2(280.0, 180.0),
                                 ),
                             );
                             if self.panel_dock.add_spec(spec).is_ok() {
@@ -7069,6 +7165,7 @@ impl App {
                 font_name: t.font_name.clone(),
                 font_size: t.font_size,
                 color: [t.color.r, t.color.g, t.color.b, t.color.a],
+                align: t.align,
             }
         };
         let font_bytes = self.font_bytes_for(&params.font_name);
@@ -7089,11 +7186,12 @@ impl App {
     }
 
     fn begin_text_transform(&mut self, pt: (i32, i32)) {
-        let (font_name, font_size, color, alg, lid) = {
+        let (font_name, font_size, align, color, alg, lid) = {
             let s = self.projects.current();
             (
                 s.text_font.clone(),
                 s.text_size,
+                s.text_align,
                 s.color,
                 s.transform_algorithm,
                 s.layers.active_layer_id(),
@@ -7104,6 +7202,7 @@ impl App {
             font_name: font_name.clone(),
             font_size,
             color: [color.r, color.g, color.b, color.a],
+            align,
         };
         let font_bytes = self.font_bytes_for(&font_name);
         let layout = crate::core::text::render_text(&params, font_bytes.as_deref());
@@ -7151,6 +7250,7 @@ impl App {
                 caret: 0,
                 font_name,
                 font_size,
+                align,
                 color,
                 layout,
             },
@@ -8434,15 +8534,18 @@ impl App {
     /// mask shape (holes stay transparent), and mirror it to the OS image
     /// clipboard when the host supports it.
     fn copy_selection(&mut self) {
-        let Some(sel) = &self.projects.current_mut().selection else {
-            return;
-        };
-        let (bbox, mask) = sel.to_shape();
-        let Some(clip) = ClipboardRegion::from_pixel_buffer_masked(
-            &self.projects.current_mut().layers.active_layer().buffer,
-            bbox,
-            &mask,
-        ) else {
+        let Some(clip) = ({
+            let project = self.projects.current();
+            let Some(sel) = &project.selection else {
+                return;
+            };
+            let (bbox, mask) = sel.to_shape();
+            let effective = project
+                .layers
+                .active_layer()
+                .effective_pixel_buffer(&project.tile_palette);
+            ClipboardRegion::from_pixel_buffer_masked(effective.as_ref(), bbox, &mask)
+        }) else {
             return;
         };
         self.projects.current_mut().clipboard = Some(clip.clone());
@@ -8453,15 +8556,23 @@ impl App {
     /// Cut the committed selection: copy to clipboard, clear the selected
     /// pixels via an undoable DeltaRecorder, drop the selection.
     fn cut_selection(&mut self) {
-        let Some(sel) = &self.projects.current_mut().selection else {
-            return;
-        };
-        let (bbox, mask) = sel.to_shape();
-        let Some(clip) = ClipboardRegion::from_pixel_buffer_masked(
-            &self.projects.current_mut().layers.active_layer().buffer,
-            bbox,
-            &mask,
-        ) else {
+        let Some((bbox, mask, clip)) = ({
+            let project = self.projects.current();
+            let Some(sel) = &project.selection else {
+                return;
+            };
+            let (bbox, mask) = sel.to_shape();
+            let effective = project
+                .layers
+                .active_layer()
+                .effective_pixel_buffer(&project.tile_palette);
+            let Some(clip) =
+                ClipboardRegion::from_pixel_buffer_masked(effective.as_ref(), bbox, &mask)
+            else {
+                return;
+            };
+            Some((bbox, mask, clip))
+        }) else {
             return;
         };
         let lid = self.projects.current_mut().layers.active_layer_id();
@@ -10725,31 +10836,26 @@ impl App {
         Ok(())
     }
 
+    fn file_export_image(&mut self) {
+        let project = self.projects.current_mut();
+        let composite = project.layers.composite_layers(&project.tile_palette);
+        let (w, h) = (composite.width(), composite.height());
+        let rgba = composite.as_bytes().to_vec();
+        self.open_save_as_panel(
+            dock_save_as_panel::SaveAsKind::Image,
+            Some(dock_save_as_panel::SavePayload::Image { w, h, rgba }),
+        );
+    }
+
     fn file_export_sprite_sheet(&mut self) {
         let project = self.projects.current_mut();
         let composite = project.layers.composite_layers(&project.tile_palette);
         let (w, h) = (composite.width(), composite.height());
-        let png = match encode_png(w, h, composite.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export sprite sheet: {err}"));
-                return;
-            }
-        };
-        let meta = match sprite_sheet_meta_json(&self.app_to_document()) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export sprite sheet metadata: {err}"));
-                return;
-            }
-        };
-        // The payload is computed ONCE (above); the in-app modal only picks
-        // the destination — writing happens on Save (PNG + sibling .json).
+        let rgba = composite.as_bytes().to_vec();
+        let doc = self.app_to_document();
         self.open_save_as_panel(
             dock_save_as_panel::SaveAsKind::SpriteSheet,
-            Some(dock_save_as_panel::SavePayload::SpriteSheet { png, meta }),
+            Some(dock_save_as_panel::SavePayload::SpriteSheet { w, h, rgba, doc }),
         );
     }
 
@@ -10783,18 +10889,9 @@ impl App {
                 delay_ms,
             });
         }
-        let gif = match encode_gif(&frames) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export GIF: {err}"));
-                return;
-            }
-        };
-        // Compute once, then let the in-app modal pick the destination.
         self.open_save_as_panel(
             dock_save_as_panel::SaveAsKind::Gif,
-            Some(dock_save_as_panel::SavePayload::Gif(gif)),
+            Some(dock_save_as_panel::SavePayload::Gif(frames)),
         );
     }
 
@@ -11251,12 +11348,17 @@ impl App {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            view.method = dock_import_aseprite_panel::AsepriteImportMethod::TimelineCanvas;
             view.mode = if parsed.tags.is_empty() {
                 dock_import_aseprite_panel::AsepriteUiMode::RowLength
             } else {
                 dock_import_aseprite_panel::AsepriteUiMode::SplitByTags
             };
             view.line_length_text = parsed.frames.len().clamp(1, 8).to_string();
+            view.max_canvas_w = IMPORT_MAX_CANVAS_SIDE;
+            view.max_canvas_h = IMPORT_MAX_CANVAS_SIDE;
+            view.max_frames = MAX_FRAMES;
+            view.seed_single_canvas_defaults(parsed.frame_w, parsed.frame_h);
             view.parsed = Some(parsed.clone());
             view.refresh_preview();
         }
@@ -11268,8 +11370,8 @@ impl App {
             return;
         }
         let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(340.0, 120.0),
-            egui::vec2(480.0, 460.0),
+            egui::pos2(280.0, 120.0),
+            egui::vec2(680.0, 440.0),
         );
         let spec = dock_import_aseprite_panel::import_aseprite_panel_spec(
             &self.import_aseprite_host,
@@ -11373,10 +11475,21 @@ impl App {
                 return;
             }
         };
+        let preview = crate::core::aseprite::aseprite_export_preview(
+            &session.layers,
+            &session.tile_palette,
+            &session.animations,
+            session.tile_size,
+            4,
+        );
         self.save_as_host.view.borrow_mut().aseprite_unified_frames = false;
         self.open_save_as_panel(
             dock_save_as_panel::SaveAsKind::Aseprite,
-            Some(dock_save_as_panel::SavePayload::Aseprite { unified, timeline }),
+            Some(dock_save_as_panel::SavePayload::Aseprite {
+                unified,
+                timeline,
+                preview: Some(preview),
+            }),
         );
     }
 
@@ -11485,11 +11598,17 @@ impl App {
                 ),
             );
             if workspace_rect.width() >= 96.0 && workspace_rect.height() >= 96.0 {
-                let bg = ui.visuals().panel_fill;
+                let bg = self.theme.current().colors.clear_color32();
+                let fg = ui.visuals().text_color();
+                let blend = |a: u8, b: u8| -> u8 {
+                    (f32::from(a) + (f32::from(b) - f32::from(a)) * 0.16)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
                 let watermark_color = egui::Color32::from_rgba_unmultiplied(
-                    bg.r().saturating_sub(10),
-                    bg.g().saturating_sub(10),
-                    bg.b().saturating_sub(10),
+                    blend(bg.r(), fg.r()),
+                    blend(bg.g(), fg.g()),
+                    blend(bg.b(), fg.b()),
                     255,
                 );
                 let logo_side = (workspace_rect.width().min(workspace_rect.height()) * 0.28)
@@ -11518,7 +11637,7 @@ impl App {
                         egui::Align2::CENTER_TOP,
                         hint,
                         egui::FontId::proportional(14.0),
-                        watermark_color,
+                        ui.visuals().weak_text_color(),
                     );
                 }
             }
@@ -33068,11 +33187,11 @@ mod tests {
             panel_dock::PanelId::new(dock_animation_preview_panel::ANIMATION_PREVIEW_PANEL_ID);
         assert_eq!(
             app.panel_dock.metadata(frame_edit_id).unwrap().title,
-            "frame editor"
+            "Frame Editor"
         );
         assert_eq!(
             app.panel_dock.metadata(preview_id).unwrap().title,
-            "playback"
+            "Playback"
         );
     }
 
@@ -33715,6 +33834,33 @@ mod tests {
         app.os_clipboard_available = true;
         app.new_project("Doc", 16, 16);
         assert!(app.projects.current().os_clipboard_available);
+    }
+
+    #[test]
+    fn import_pyxel_copy_selection_reads_tilemap_pixels_and_preserves_os_clipboard() {
+        let mut app = App::new_empty();
+        app.os_clipboard_available = true;
+        app.file_import_pyxel_pick(std::path::Path::new("example.pyxel"));
+        app.import_pyxel_host
+            .events
+            .borrow_mut()
+            .push(dock_import_pyxel_panel::ImportPyxelEvent::Import);
+        app.drain_import_pyxel_events();
+        assert!(app.projects.current().os_clipboard_available);
+
+        // Select the entire canvas on the imported tilemap layer and copy.
+        app.select_all();
+        app.copy_selection();
+        let clip = app
+            .projects
+            .current()
+            .clipboard
+            .as_ref()
+            .expect("copy_selection should populate clipboard on imported pyxel");
+        assert!(
+            clip.pixels().chunks_exact(4).any(|px| px[3] > 0),
+            "copied selection from imported pyxel tilemap must contain non-transparent pixels"
+        );
     }
 
     #[test]

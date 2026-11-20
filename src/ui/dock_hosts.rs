@@ -144,6 +144,8 @@ pub struct ToolboxView {
     pub text_font: String,
     /// Active Text tool / Text Transform font size (px).
     pub text_size: u32,
+    /// Active Text tool / Text Transform horizontal alignment.
+    pub text_align: crate::core::text::TextAlign,
     /// Discovered font names (built-in + bundled + system fonts).
     pub available_fonts: Vec<String>,
 }
@@ -165,6 +167,7 @@ impl Default for ToolboxView {
             text_transform_active: false,
             text_font: crate::core::text::BUILTIN_PIXEL_FONT_NAME.to_owned(),
             text_size: 14,
+            text_align: crate::core::text::TextAlign::Left,
             available_fonts: vec![crate::core::text::BUILTIN_PIXEL_FONT_NAME.to_owned()],
         }
     }

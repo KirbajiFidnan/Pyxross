@@ -153,6 +153,25 @@ impl PartialEq for Layer {
     }
 }
 
+impl Layer {
+    /// Returns the layer's effective pixel buffer: `self.buffer` directly when
+    /// there is no tilemap, or a combined buffer with the rasterized tilemap
+    /// composited over `self.buffer` (matching [`composite_layer_over`]).
+    pub fn effective_pixel_buffer(
+        &self,
+        palette: &TilePalette,
+    ) -> std::borrow::Cow<'_, PixelBuffer> {
+        let Some(tm) = &self.tilemap else {
+            return std::borrow::Cow::Borrowed(&self.buffer);
+        };
+        let mut combined = self.buffer.clone();
+        let mut raster = PixelBuffer::new(self.buffer.width(), self.buffer.height());
+        tm.rasterize(palette, &mut raster);
+        composite_over(&mut combined, &raster, 1.0, BlendMode::Normal);
+        std::borrow::Cow::Owned(combined)
+    }
+}
+
 /// Rasterize cache for a layer's tilemap.
 ///
 /// The cached buffer is sized to the LAYER's canvas so it composites

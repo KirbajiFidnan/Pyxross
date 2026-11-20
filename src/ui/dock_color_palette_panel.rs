@@ -109,6 +109,8 @@ impl Component for PaletteHeaderComponent {
                 }
             }
         });
+        ui.add_space(2.0);
+        ui.separator();
     }
 }
 

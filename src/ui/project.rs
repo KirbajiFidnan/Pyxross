@@ -174,6 +174,7 @@ pub struct ProjectSession {
     pub transform_algorithm: TransformAlgorithm,
     pub text_font: String,
     pub text_size: u32,
+    pub text_align: crate::core::text::TextAlign,
     pub grid_visible: bool,
     pub canvas_generation: u64,
     pub modified: bool,
@@ -419,6 +420,7 @@ pub struct TextTransformSession {
     pub caret: usize,
     pub font_name: String,
     pub font_size: u32,
+    pub align: crate::core::text::TextAlign,
     pub color: Color,
     pub layout: crate::core::text::TextLayout,
 }
@@ -850,6 +852,7 @@ impl ProjectSession {
             transform_algorithm: TransformAlgorithm::default(),
             text_font: crate::core::text::BUILTIN_PIXEL_FONT_NAME.to_owned(),
             text_size: 14,
+            text_align: crate::core::text::TextAlign::Left,
             grid_visible: true,
             canvas_generation: 0,
             dialog_open: false,
