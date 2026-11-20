@@ -16,7 +16,8 @@
   </p>
 
   <p>
-    <a href="#-download--install">Download</a> •
+    <a href="https://github.com/KirbajiFidnan/Pyxross/releases">Download</a> •
+    <a href="docs/guide/README.md">User Manual</a> •
     <a href="#-why-pyxross">Why Pyxross?</a> •
     <a href="#-features">Features</a> •
     <a href="#-building-from-source">Build from Source</a> •
@@ -103,6 +104,22 @@ Built on an **Ubuntu 22.04 LTS (`GLIBC 2.35`)** baseline for broad compatibility
 1. Download `pyxross-0.9.0-windows-x86_64-portable.zip` from **[Releases](https://github.com/KirbajiFidnan/Pyxross/releases)**.
 2. Extract the archive to any folder (keep `themes/` and `banners/` alongside `pyxross.exe`).
 3. Run `pyxross.exe` — no installer required.
+
+---
+
+## 📖 Documentation (User Manual)
+
+Full, step-by-step documentation covering every tool, panel, and workflow lives in **[docs/guide/](docs/guide/README.md)**:
+
+1. [Getting Started & Core Concepts (Regions & Canvas)](docs/guide/01-getting-started.md)
+2. [Toolbox, Tool Properties & All Tools](docs/guide/02-tools.md)
+3. [Layers & Layer Groups](docs/guide/03-layers.md)
+4. [Animation System (Multi-Animation, Frame Editor & Playback)](docs/guide/04-animations.md)
+5. [Tile Palette & Linked Tiles](docs/guide/05-tiles.md)
+6. [Colors, Palettes & Color Picker](docs/guide/06-color-and-palette.md)
+7. [Files, Import & Export (.pyxross, Aseprite, Pyxel Edit, GIF, Image 2 Pixel)](docs/guide/07-files-import-export.md)
+8. [Style & Interface Customization (Themes, Banners, Keybindings)](docs/guide/08-style-and-customization.md)
+9. [Transforms (RotSprite/CleanEdge/Rotxel), Shortcuts & Troubleshooting](docs/guide/09-transforms-and-shortcuts.md)
 
 ---
 
