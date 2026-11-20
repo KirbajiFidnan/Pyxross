@@ -31,6 +31,17 @@
     "select_text": {"key":"q"},
     "save_project": {"key":"s","modifiers":{"command":true}},
     "save_project_as": {"key":"s","modifiers":{"command":true,"shift":true}},
-    "open_project": {"key":"o","modifiers":{"command":true}}
+    "open_project": {"key":"o","modifiers":{"command":true}},
+    "import_images": {"key":"e","modifiers":{"command":true,"alt":true}},
+    "import_gif": {"key":"a","modifiers":{"command":true,"alt":true}},
+    "import_pyxel": {"key":"p","modifiers":{"command":true,"alt":true}},
+    "import_aseprite": {"key":"g","modifiers":{"command":true,"alt":true}},
+    "import_image2pixel": {"key":"x","modifiers":{"command":true,"alt":true}},
+    "export_image": {"key":"e","modifiers":{"command":true,"shift":true}},
+    "export_animation": {"key":"a","modifiers":{"command":true,"shift":true}},
+    "export_pyxel": {"key":"p","modifiers":{"command":true,"shift":true}},
+    "export_aseprite": {"key":"g","modifiers":{"command":true,"shift":true}},
+    "export_selected": {"key":"r","modifiers":{"command":true,"shift":true}},
+    "resize_canvas": {"key":"r","modifiers":{"alt":true}}
   }
 }

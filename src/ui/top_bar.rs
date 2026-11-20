@@ -101,8 +101,7 @@ pub enum MenuAction {
     ImportAseprite,
     ImportImage2Pixel,
     ExportImage,
-    ExportSpriteSheet,
-    ExportGif,
+    ExportAnimation,
     ExportPyxel,
     ExportAseprite,
     ExportSelected,
@@ -165,7 +164,7 @@ pub struct MenuDef {
     pub items: &'static [MenuItem],
 }
 
-static FILE_ITEMS: [MenuItem; 15] = [
+static FILE_ITEMS: [MenuItem; 14] = [
     grouped_item("Document", "New Project...", MenuAction::NewProject),
     item("Save Project", MenuAction::SaveProject),
     item("Save Project As...", MenuAction::SaveProjectAs),
@@ -176,8 +175,7 @@ static FILE_ITEMS: [MenuItem; 15] = [
     item("Import Aseprite...", MenuAction::ImportAseprite),
     item("Image to Pixel...", MenuAction::ImportImage2Pixel),
     grouped_item("Export", "Export Image...", MenuAction::ExportImage),
-    item("Export Sprite Sheet...", MenuAction::ExportSpriteSheet),
-    item("Export GIF...", MenuAction::ExportGif),
+    item("Export Animation...", MenuAction::ExportAnimation),
     item("Export .pyxel...", MenuAction::ExportPyxel),
     item("Export .ase...", MenuAction::ExportAseprite),
     item("Export Selection...", MenuAction::ExportSelected),
@@ -357,7 +355,7 @@ pub fn tab_close_button_rect(tab_rect: Rect) -> Rect {
 
 /// Menu-bar metrics: title width, dropdown width, item height and padding.
 const MENU_TITLE_WIDTH: f32 = 72.0;
-const MENU_DROPDOWN_WIDTH: f32 = 236.0;
+const MENU_DROPDOWN_WIDTH: f32 = 268.0;
 const MENU_ITEM_HEIGHT: f32 = 22.0;
 const MENU_DROPDOWN_PAD: f32 = 6.0;
 const MENU_HEADER_HEIGHT: f32 = 20.0;
@@ -462,9 +460,24 @@ pub fn menu_item_rects(layout: &TopBarLayout, index: usize) -> Vec<(MenuItem, Re
         .collect()
 }
 
-/// Dynamic shortcut strings displayed alongside Edit menu entries.
+/// Dynamic shortcut strings displayed alongside File, Edit, and Canvas menu entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditMenuShortcuts {
+    pub new_project: String,
+    pub save_project: String,
+    pub save_project_as: String,
+    pub open_project: String,
+    pub import_images: String,
+    pub import_gif: String,
+    pub import_pyxel: String,
+    pub import_aseprite: String,
+    pub import_img2pixel: String,
+    pub export_image: String,
+    pub export_animation: String,
+    pub export_pyxel: String,
+    pub export_aseprite: String,
+    pub export_selected: String,
+    pub resize_canvas: String,
     pub undo: String,
     pub redo: String,
     pub cut: String,
@@ -481,7 +494,27 @@ pub struct EditMenuShortcuts {
 impl EditMenuShortcuts {
     pub fn from_keymap(keymap: &crate::input::Keymap) -> Self {
         use crate::input::Action;
+        let new_project = if cfg!(target_os = "macos") {
+            "Cmd+N".to_string()
+        } else {
+            "Ctrl+N".to_string()
+        };
         Self {
+            new_project,
+            save_project: keymap.display_label(Action::SaveProject),
+            save_project_as: keymap.display_label(Action::SaveProjectAs),
+            open_project: keymap.display_label(Action::OpenProject),
+            import_images: keymap.display_label(Action::ImportImages),
+            import_gif: keymap.display_label(Action::ImportGif),
+            import_pyxel: keymap.display_label(Action::ImportPyxel),
+            import_aseprite: keymap.display_label(Action::ImportAseprite),
+            import_img2pixel: keymap.display_label(Action::ImportImage2Pixel),
+            export_image: keymap.display_label(Action::ExportImage),
+            export_animation: keymap.display_label(Action::ExportAnimation),
+            export_pyxel: keymap.display_label(Action::ExportPyxel),
+            export_aseprite: keymap.display_label(Action::ExportAseprite),
+            export_selected: keymap.display_label(Action::ExportSelected),
+            resize_canvas: keymap.display_label(Action::ResizeCanvas),
             undo: keymap.display_label(Action::Undo),
             redo: keymap.display_label(Action::Redo),
             cut: keymap.display_label(Action::Cut),
@@ -523,6 +556,9 @@ pub struct TopBarHost {
     /// Global foreground / background colors displayed in the middle slice.
     fg_color: crate::core::color::Color,
     bg_color: crate::core::color::Color,
+    /// Whether a project document is currently open (gates document-dependent
+    /// menu items).
+    has_active_project: bool,
 }
 
 impl TopBarHost {
@@ -530,8 +566,13 @@ impl TopBarHost {
         Self {
             fg_color: crate::core::color::Color::BLACK,
             bg_color: crate::core::color::Color::WHITE,
+            has_active_project: true,
             ..Self::default()
         }
+    }
+
+    pub fn set_has_active_project(&mut self, has_project: bool) {
+        self.has_active_project = has_project;
     }
 
     pub fn set_colors(
@@ -553,6 +594,21 @@ impl TopBarHost {
 
     fn item_label_and_shortcut(&self, item: MenuItem) -> (&'static str, Option<&str>) {
         let shortcut = match item.action {
+            MenuAction::NewProject => Some(self.edit_shortcuts.new_project.as_str()),
+            MenuAction::SaveProject => Some(self.edit_shortcuts.save_project.as_str()),
+            MenuAction::SaveProjectAs => Some(self.edit_shortcuts.save_project_as.as_str()),
+            MenuAction::OpenProject => Some(self.edit_shortcuts.open_project.as_str()),
+            MenuAction::ImportImages => Some(self.edit_shortcuts.import_images.as_str()),
+            MenuAction::ImportGif => Some(self.edit_shortcuts.import_gif.as_str()),
+            MenuAction::ImportPyxel => Some(self.edit_shortcuts.import_pyxel.as_str()),
+            MenuAction::ImportAseprite => Some(self.edit_shortcuts.import_aseprite.as_str()),
+            MenuAction::ImportImage2Pixel => Some(self.edit_shortcuts.import_img2pixel.as_str()),
+            MenuAction::ExportImage => Some(self.edit_shortcuts.export_image.as_str()),
+            MenuAction::ExportAnimation => Some(self.edit_shortcuts.export_animation.as_str()),
+            MenuAction::ExportPyxel => Some(self.edit_shortcuts.export_pyxel.as_str()),
+            MenuAction::ExportAseprite => Some(self.edit_shortcuts.export_aseprite.as_str()),
+            MenuAction::ExportSelected => Some(self.edit_shortcuts.export_selected.as_str()),
+            MenuAction::ResizeCanvas => Some(self.edit_shortcuts.resize_canvas.as_str()),
             MenuAction::Undo => Some(self.edit_shortcuts.undo.as_str()),
             MenuAction::Redo => Some(self.edit_shortcuts.redo.as_str()),
             MenuAction::Cut => Some(self.edit_shortcuts.cut.as_str()),
@@ -868,33 +924,55 @@ impl TopBarHost {
                 );
             }
             let rect = row.item_rect;
-            let response = ui.interact(
-                rect,
-                Id::new(("top-bar-menu-item", index, row.item.label)),
-                Sense::click(),
-            );
-            if response.hovered() {
-                painter.rect_filled(rect, 2.0, colors.selection_bg_fill32());
-            }
+            let enabled = self.has_active_project || !menu_action_requires_project(row.item.action);
             let (label, shortcut) = self.item_label_and_shortcut(row.item);
-            painter.text(
-                pos2(rect.left() + MENU_ITEM_TEXT_INSET, rect.center().y),
-                Align2::LEFT_CENTER,
-                label,
-                FontId::proportional(12.5),
-                text_color,
-            );
-            if let Some(shortcut) = shortcut {
-                painter.text(
-                    pos2(rect.right() - MENU_ITEM_TEXT_INSET, rect.center().y),
-                    Align2::RIGHT_CENTER,
-                    shortcut,
-                    FontId::proportional(11.5),
-                    weak_color,
+            if enabled {
+                let response = ui.interact(
+                    rect,
+                    Id::new(("top-bar-menu-item", index, row.item.label)),
+                    Sense::click(),
                 );
-            }
-            if response.clicked() {
-                chosen = Some(row.item.action);
+                if response.hovered() {
+                    painter.rect_filled(rect, 2.0, colors.selection_bg_fill32());
+                }
+                painter.text(
+                    pos2(rect.left() + MENU_ITEM_TEXT_INSET, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(12.5),
+                    text_color,
+                );
+                if let Some(shortcut) = shortcut {
+                    painter.text(
+                        pos2(rect.right() - MENU_ITEM_TEXT_INSET, rect.center().y),
+                        Align2::RIGHT_CENTER,
+                        shortcut,
+                        FontId::proportional(11.5),
+                        weak_color,
+                    );
+                }
+                if response.clicked() {
+                    chosen = Some(row.item.action);
+                }
+            } else {
+                painter.rect_filled(rect, 2.0, egui::Color32::from_black_alpha(45));
+                let disabled_text = weak_color.gamma_multiply(0.55);
+                painter.text(
+                    pos2(rect.left() + MENU_ITEM_TEXT_INSET, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(12.5),
+                    disabled_text,
+                );
+                if let Some(shortcut) = shortcut {
+                    painter.text(
+                        pos2(rect.right() - MENU_ITEM_TEXT_INSET, rect.center().y),
+                        Align2::RIGHT_CENTER,
+                        shortcut,
+                        FontId::proportional(11.5),
+                        disabled_text,
+                    );
+                }
             }
         }
         if let Some(action) = chosen {
@@ -1142,6 +1220,23 @@ pub(crate) fn paint_new_document_watermark(
     }
 }
 
+pub fn menu_action_requires_project(action: MenuAction) -> bool {
+    !matches!(
+        action,
+        MenuAction::NewProject
+            | MenuAction::OpenProject
+            | MenuAction::ImportImages
+            | MenuAction::ImportGif
+            | MenuAction::ImportPyxel
+            | MenuAction::ImportAseprite
+            | MenuAction::ImportImage2Pixel
+            | MenuAction::Style
+            | MenuAction::KeyBindings
+            | MenuAction::EditorOptions
+            | MenuAction::Credits
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1320,7 +1415,7 @@ mod tests {
             Some("Document"),
             "the File dropdown starts with the 'Document' group"
         );
-        assert_eq!(menus[0].items.len(), 15);
+        assert_eq!(menus[0].items.len(), 14);
         assert_eq!(menus[1].items.len(), 12);
         assert_eq!(menus[2].items.len(), 1);
         assert_eq!(menus[2].items[0].label, "Resize Canvas...");
@@ -1352,14 +1447,13 @@ mod tests {
             MenuAction::ImportAseprite,
             MenuAction::ImportImage2Pixel,
             MenuAction::ExportImage,
-            MenuAction::ExportSpriteSheet,
-            MenuAction::ExportGif,
+            MenuAction::ExportAnimation,
             MenuAction::ExportPyxel,
             MenuAction::ExportAseprite,
             MenuAction::ExportSelected,
         ];
         let items = menu_item_rects(&layout, 0);
-        assert_eq!(items.len(), 15);
+        assert_eq!(items.len(), 14);
         for (i, (item, rect)) in items.iter().enumerate() {
             // Open File, then click this item.
             click_host(&ctx, &mut host, &layout, &colors, file_title);

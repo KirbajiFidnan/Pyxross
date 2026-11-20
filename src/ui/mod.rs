@@ -24,6 +24,7 @@ pub mod dock_color_picker_panel;
 pub mod dock_create_document_panel;
 pub mod dock_credits_panel;
 pub mod dock_editor_options_panel;
+pub mod dock_export_animation_panel;
 pub mod dock_file_chooser_panel;
 pub mod dock_save_as_panel;
 pub mod dock_frame_edit_panel;
@@ -335,6 +336,8 @@ struct App {
     import_pyxel_host: dock_import_pyxel_panel::ImportPyxelHost,
     /// Shared cells for the floating "Import Aseprite" panel (id 218).
     import_aseprite_host: dock_import_aseprite_panel::ImportAsepriteHost,
+    /// Shared cells for the floating "Export Animation" panel (id 219).
+    export_animation_host: dock_export_animation_panel::ExportAnimationHost,
     /// Shared cells for the floating "Unsaved Changes" panel (id 211).
     unsaved_guard_host: dock_unsaved_guard_panel::UnsavedGuardHost,
     /// Shared cells for the floating "Recover Unsaved Work?" panel (id 212).
@@ -664,6 +667,7 @@ impl App {
             import_image_host: dock_import_image_panel::ImportImageHost::new(),
             import_pyxel_host: dock_import_pyxel_panel::ImportPyxelHost::new(),
             import_aseprite_host: dock_import_aseprite_panel::ImportAsepriteHost::new(),
+            export_animation_host: dock_export_animation_panel::ExportAnimationHost::new(),
             unsaved_guard_host: dock_unsaved_guard_panel::UnsavedGuardHost::new(),
             recovery_host: dock_recovery_panel::RecoveryHost::new(),
             style_host,
@@ -1724,11 +1728,7 @@ impl App {
                     }
                 }
                 top_bar::TopBarEvent::OpenCreateDocument => self.open_create_document_panel(),
-                top_bar::TopBarEvent::ToggleColorPicker => {
-                    if self.projects.active_id().is_some() {
-                        self.toggle_color_picker();
-                    }
-                }
+                top_bar::TopBarEvent::ToggleColorPicker => self.toggle_color_picker(),
                 top_bar::TopBarEvent::SwapColors => {
                     if self.projects.active_id().is_some() {
                         self.apply_toolbar_events(vec![ToolbarEvent::SwapColors]);
@@ -1809,8 +1809,7 @@ impl App {
             top_bar::MenuAction::ImportAseprite => self.file_import_aseprite(),
             top_bar::MenuAction::ImportImage2Pixel => self.file_import_img2pixel(),
             top_bar::MenuAction::ExportImage => self.file_export_image(),
-            top_bar::MenuAction::ExportSpriteSheet => self.file_export_sprite_sheet(),
-            top_bar::MenuAction::ExportGif => self.file_export_gif(),
+            top_bar::MenuAction::ExportAnimation => self.file_export_animation(),
             top_bar::MenuAction::ExportPyxel => self.file_export_pyxel(),
             top_bar::MenuAction::ExportAseprite => self.file_export_aseprite(),
             top_bar::MenuAction::ExportSelected => self.file_export_selected(),
@@ -2252,10 +2251,19 @@ impl App {
                     // the top-bar tab bar updates itself from `projects.tabs()`.
                     let id = self.new_project("Untitled", w as usize, h as usize);
                     if let Some(session) = self.projects.session_mut(id) {
-                        session.tile_size = TileSize::new(region_w.max(1), region_h.max(1));
+                        let tile = TileSize::new(region_w.max(1), region_h.max(1));
+                        session.tile_size = tile;
+                        let (animations, animation) = project::default_animation_set_for_canvas(
+                            w as usize,
+                            h as usize,
+                            tile,
+                        );
+                        session.animations = animations;
+                        session.animation = animation;
                         session.new_draft_w = w;
                         session.new_draft_h = h;
                     }
+                    self.sync_anim_delays();
                     // Close the create panel once the document exists.
                     let panel_id = panel_dock::PanelId::new(
                         dock_create_document_panel::CREATE_DOCUMENT_PANEL_ID,
@@ -2299,16 +2307,10 @@ impl App {
         }
         let panel_id = panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
         if self.panel_dock.placement(panel_id).is_some() {
-            if kind == dock_save_as_panel::SaveAsKind::Aseprite {
-                let _ = self.panel_dock.remove_spec(panel_id);
-            } else {
-                self.panel_dock.set_title(panel_id, kind.title());
-                self.panel_dock.raise_floating(panel_id);
-                return;
-            }
+            let _ = self.panel_dock.remove_spec(panel_id);
         }
-        let floating_rect = if kind == dock_save_as_panel::SaveAsKind::Aseprite {
-            egui::Rect::from_min_size(egui::pos2(380.0, 200.0), egui::vec2(460.0, 390.0))
+        let floating_rect = if dock_save_as_panel::has_export_preview(kind) {
+            egui::Rect::from_min_size(egui::pos2(280.0, 200.0), egui::vec2(700.0, 320.0))
         } else {
             egui::Rect::from_min_size(egui::pos2(400.0, 260.0), egui::vec2(420.0, 200.0))
         };
@@ -2464,13 +2466,21 @@ impl App {
                             self.close_file_chooser();
                         }
                         dock_file_chooser_panel::FileChooserMode::ChooseFolder => {
-                            {
-                                let mut view = self.save_as_host.view.borrow_mut();
-                                view.location = path;
+                            let export_anim_id = panel_dock::PanelId::new(
+                                dock_export_animation_panel::EXPORT_ANIMATION_PANEL_ID,
+                            );
+                            if self.panel_dock.placement(export_anim_id).is_some() {
+                                self.export_animation_host.view.borrow_mut().location = path;
+                                self.panel_dock.raise_floating(export_anim_id);
+                            } else {
+                                {
+                                    let mut view = self.save_as_host.view.borrow_mut();
+                                    view.location = path;
+                                }
+                                let save_panel_id =
+                                    panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
+                                self.panel_dock.raise_floating(save_panel_id);
                             }
-                            let save_panel_id =
-                                panel_dock::PanelId::new(dock_save_as_panel::SAVE_AS_PANEL_ID);
-                            self.panel_dock.raise_floating(save_panel_id);
                             self.close_file_chooser();
                         }
                     }
@@ -2768,7 +2778,7 @@ impl App {
             }
             (
                 dock_save_as_panel::SaveAsKind::Pyxel,
-                Some(dock_save_as_panel::SavePayload::Pyxel(bytes)),
+                Some(dock_save_as_panel::SavePayload::Pyxel { bytes, .. }),
             ) => {
                 let target = if path.extension().is_none() {
                     path.with_extension("pyxel")
@@ -2780,20 +2790,28 @@ impl App {
             }
             (
                 dock_save_as_panel::SaveAsKind::Aseprite,
-                Some(dock_save_as_panel::SavePayload::Aseprite {
-                    unified,
-                    timeline,
-                    ..
-                }),
+                Some(dock_save_as_panel::SavePayload::Aseprite { .. }),
             ) => {
                 let target = if path.extension().is_none() {
                     path.with_extension("ase")
                 } else {
                     path.to_path_buf()
                 };
-                let bytes = if aseprite_unified { unified } else { timeline };
-                std::fs::write(&target, bytes)
-                    .map_err(|err| format!("Failed to export .ase: {err}"))
+                let session = self.projects.current();
+                let active_pal = session.palettes.get(session.active_palette);
+                crate::core::aseprite::export_aseprite_bytes(
+                    &session.layers,
+                    &session.tile_palette,
+                    &session.animations,
+                    active_pal,
+                    session.tile_size,
+                    aseprite_unified,
+                )
+                .map_err(|err| format!("Failed to export .ase: {err}"))
+                .and_then(|bytes| {
+                    std::fs::write(&target, bytes)
+                        .map_err(|err| format!("Failed to export .ase: {err}"))
+                })
             }
             (
                 dock_save_as_panel::SaveAsKind::SelectionPng,
@@ -3611,21 +3629,25 @@ impl App {
                 }
                 ToolbarEvent::ColorChanged(color) => {
                     self.global_fg_color = color;
-                    self.projects.current_mut().color = color;
-                    if let Some(t) = self
-                        .projects
-                        .current_mut()
-                        .transform
-                        .as_mut()
-                        .and_then(TransformSession::text_mut)
-                    {
-                        t.color = color;
-                        self.re_rasterize_text_transform();
+                    if self.projects.active_id().is_some() {
+                        self.projects.current_mut().color = color;
+                        if let Some(t) = self
+                            .projects
+                            .current_mut()
+                            .transform
+                            .as_mut()
+                            .and_then(TransformSession::text_mut)
+                        {
+                            t.color = color;
+                            self.re_rasterize_text_transform();
+                        }
                     }
                 }
                 ToolbarEvent::SecondaryColorChanged(color) => {
                     self.global_bg_color = color;
-                    self.projects.current_mut().secondary_color = color;
+                    if self.projects.active_id().is_some() {
+                        self.projects.current_mut().secondary_color = color;
+                    }
                 }
                 ToolbarEvent::BrushSizeChanged(size) => {
                     let session = self.projects.current_mut();
@@ -3771,9 +3793,11 @@ impl App {
                 }
                 ToolbarEvent::SwapColors => {
                     std::mem::swap(&mut self.global_fg_color, &mut self.global_bg_color);
-                    let session = self.projects.current_mut();
-                    session.color = self.global_fg_color;
-                    session.secondary_color = self.global_bg_color;
+                    if self.projects.active_id().is_some() {
+                        let session = self.projects.current_mut();
+                        session.color = self.global_fg_color;
+                        session.secondary_color = self.global_bg_color;
+                    }
                 }
             }
         }
@@ -4057,13 +4081,17 @@ impl App {
         });
         let spec = dock_color_picker_panel::color_picker_panel_spec(&self.color_picker_host, rect);
         if self.panel_dock.add_spec(spec).is_ok() {
-            let session = self.projects.current();
-            let color = session.color;
+            let (color, secondary_color) = if self.projects.active_id().is_some() {
+                let session = self.projects.current();
+                (session.color, session.secondary_color)
+            } else {
+                (self.global_fg_color, self.global_bg_color)
+            };
             *self.color_picker_host.view.borrow_mut() = ColorPickerView {
                 color,
                 old_color: color,
                 new_color: color,
-                secondary_color: session.secondary_color,
+                secondary_color,
                 open: true,
             };
             self.panel_dock.raise_floating(id);
@@ -9164,12 +9192,24 @@ impl App {
             return;
         }
         if self.projects.active_id().is_none() {
-            let open_project = self
-                .ctx
-                .input(|i| self.keymap.pressed(crate::input::Action::OpenProject, i));
+            let (open_project, toggle_color_picker, swap_colors) = self.ctx.input(|i| {
+                (
+                    self.keymap.pressed(crate::input::Action::OpenProject, i),
+                    self.keymap
+                        .pressed(crate::input::Action::ToggleColorPicker, i),
+                    self.keymap.pressed(crate::input::Action::SwapColors, i),
+                )
+            });
             if open_project {
                 self.file_open();
             }
+            if toggle_color_picker {
+                self.toggle_color_picker();
+            }
+            if swap_colors {
+                self.apply_toolbar_events(vec![ToolbarEvent::SwapColors]);
+            }
+            self.handle_import_shortcuts();
             return;
         }
         if self
@@ -9567,7 +9607,7 @@ impl App {
                 .tool_state
                 .select_tool(Tool::Text);
         }
-        // File shortcuts route through the SAME handlers as the menu actions.
+        // File & Canvas shortcuts route through the SAME handlers as the menu actions.
         if save_project {
             let _ = self.file_save();
         }
@@ -9576,6 +9616,77 @@ impl App {
         }
         if open_project {
             self.file_open();
+        }
+        self.handle_import_shortcuts();
+        let (
+            export_image,
+            export_animation,
+            export_pyxel,
+            export_aseprite,
+            export_selected,
+            resize_canvas,
+        ) = self.ctx.input(|i| {
+            (
+                self.keymap.pressed(crate::input::Action::ExportImage, i),
+                self.keymap
+                    .pressed(crate::input::Action::ExportAnimation, i),
+                self.keymap.pressed(crate::input::Action::ExportPyxel, i),
+                self.keymap.pressed(crate::input::Action::ExportAseprite, i),
+                self.keymap.pressed(crate::input::Action::ExportSelected, i),
+                self.keymap.pressed(crate::input::Action::ResizeCanvas, i),
+            )
+        });
+        if export_image {
+            self.file_export_image();
+        }
+        if export_animation {
+            self.file_export_animation();
+        }
+        if export_pyxel {
+            self.file_export_pyxel();
+        }
+        if export_aseprite {
+            self.file_export_aseprite();
+        }
+        if export_selected {
+            self.file_export_selected();
+        }
+        if resize_canvas {
+            self.open_resize_canvas_panel();
+        }
+    }
+
+    fn handle_import_shortcuts(&mut self) {
+        let (
+            import_images,
+            import_gif,
+            import_pyxel,
+            import_aseprite,
+            import_img2pixel,
+        ) = self.ctx.input(|i| {
+            (
+                self.keymap.pressed(crate::input::Action::ImportImages, i),
+                self.keymap.pressed(crate::input::Action::ImportGif, i),
+                self.keymap.pressed(crate::input::Action::ImportPyxel, i),
+                self.keymap.pressed(crate::input::Action::ImportAseprite, i),
+                self.keymap
+                    .pressed(crate::input::Action::ImportImage2Pixel, i),
+            )
+        });
+        if import_images {
+            self.file_import_png();
+        }
+        if import_gif {
+            self.file_import_gif();
+        }
+        if import_pyxel {
+            self.file_import_pyxel();
+        }
+        if import_aseprite {
+            self.file_import_aseprite();
+        }
+        if import_img2pixel {
+            self.file_import_img2pixel();
         }
     }
 
@@ -10085,16 +10196,12 @@ impl App {
         // single full-canvas frame. Replacing the whole set drops any extra
         // animations from the previous document.
         {
+            let (animations, animation) =
+                project::default_animation_set_for_canvas(w, h, tile);
             let session = self.projects.current_mut();
-            session.animations = crate::core::model::AnimationSet::new();
-            let seq = session.sequence_mut();
-            seq.set_looping(true);
-            seq.push(Frame::new(
-                Region::new(Rect2i::new(0, 0, w as i32, h as i32), "Frame 1"),
-                100,
-            ));
+            session.animations = animations;
+            session.animation = animation;
         }
-        self.projects.current_mut().animation = AnimationController::new_from_delays(1, vec![100]);
         // Enforce the invariant even on this fresh-canvas path: the controller's
         // delays/loop flag always come from the active sequence.
         self.sync_anim_delays();
@@ -11015,10 +11122,11 @@ impl App {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
+                let msg = format!("Failed to import .pyxel: {err}");
                 if self.projects.active_id().is_some() {
-                    self.projects.current_mut().last_error =
-                        Some(format!("Failed to import .pyxel: {err}"));
+                    self.projects.current_mut().last_error = Some(msg.clone());
                 }
+                self.show_status_toast(msg);
                 return;
             }
         };
@@ -11028,10 +11136,11 @@ impl App {
                 self.open_import_pyxel_panel(path.to_path_buf(), imported);
             }
             Err(err) => {
+                let msg = format!("Failed to import .pyxel: {err}");
                 if self.projects.active_id().is_some() {
-                    self.projects.current_mut().last_error =
-                        Some(format!("Failed to import .pyxel: {err}"));
+                    self.projects.current_mut().last_error = Some(msg.clone());
                 }
+                self.show_status_toast(msg);
             }
         }
     }
@@ -11054,7 +11163,7 @@ impl App {
             view.tile_h = imported.tile_size.h;
             view.layer_count = imported.layers.len();
             view.tile_count = imported.tile_palette.tiles.len();
-            view.animation_count = imported.animations.len();
+            view.animation_count = imported.animations.iter().filter(|s| !s.is_empty()).count();
             view.palette_colors = imported.palette.as_ref().map_or(0, |p| p.colors.len());
             view.preview_rgba = imported.preview_rgba.clone();
             view.preview_generation = view.preview_generation.wrapping_add(1);
@@ -11067,8 +11176,8 @@ impl App {
             return;
         }
         let floating_rect = egui::Rect::from_min_size(
-            egui::pos2(360.0, 140.0),
-            egui::vec2(460.0, 420.0),
+            egui::pos2(280.0, 140.0),
+            egui::vec2(640.0, 400.0),
         );
         let spec = dock_import_pyxel_panel::import_pyxel_panel_spec(
             &self.import_pyxel_host,
@@ -11146,9 +11255,15 @@ impl App {
                 return;
             }
         };
+        let composited = session.layers.composite_layers(&session.tile_palette);
         self.open_save_as_panel(
             dock_save_as_panel::SaveAsKind::Pyxel,
-            Some(dock_save_as_panel::SavePayload::Pyxel(bytes)),
+            Some(dock_save_as_panel::SavePayload::Pyxel {
+                bytes,
+                w: composited.width(),
+                h: composited.height(),
+                rgba: composited.as_bytes().to_vec(),
+            }),
         );
     }
 
@@ -11317,10 +11432,11 @@ impl App {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
+                let msg = format!("Failed to import .ase: {err}");
                 if self.projects.active_id().is_some() {
-                    self.projects.current_mut().last_error =
-                        Some(format!("Failed to import .ase: {err}"));
+                    self.projects.current_mut().last_error = Some(msg.clone());
                 }
+                self.show_status_toast(msg);
                 return;
             }
         };
@@ -11329,10 +11445,11 @@ impl App {
                 self.open_import_aseprite_panel(path.to_path_buf(), parsed);
             }
             Err(err) => {
+                let msg = format!("Failed to import .ase: {err}");
                 if self.projects.active_id().is_some() {
-                    self.projects.current_mut().last_error =
-                        Some(format!("Failed to import .ase: {err}"));
+                    self.projects.current_mut().last_error = Some(msg.clone());
                 }
+                self.show_status_toast(msg);
             }
         }
     }
@@ -11444,53 +11561,272 @@ impl App {
 
     fn file_export_aseprite(&mut self) {
         let session = self.projects.current();
-        let active_pal = session.palettes.get(session.active_palette);
-        let timeline = match crate::core::aseprite::export_aseprite_bytes(
-            &session.layers,
-            &session.tile_palette,
-            &session.animations,
-            active_pal,
-            session.tile_size,
-            false,
-        ) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export .ase: {err}"));
-                return;
-            }
-        };
-        let unified = match crate::core::aseprite::export_aseprite_bytes(
-            &session.layers,
-            &session.tile_palette,
-            &session.animations,
-            active_pal,
-            session.tile_size,
-            true,
-        ) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.projects.current_mut().last_error =
-                    Some(format!("Failed to export .ase: {err}"));
-                return;
-            }
-        };
+        if !session.layers.iter().any(|l| !l.is_group) {
+            let msg = "Failed to export .ase: No drawable layers to export".to_owned();
+            self.projects.current_mut().last_error = Some(msg.clone());
+            self.show_status_toast(msg);
+            return;
+        }
         let preview = crate::core::aseprite::aseprite_export_preview(
             &session.layers,
             &session.tile_palette,
             &session.animations,
             session.tile_size,
-            4,
+            usize::MAX,
         );
         self.save_as_host.view.borrow_mut().aseprite_unified_frames = false;
         self.open_save_as_panel(
             dock_save_as_panel::SaveAsKind::Aseprite,
             Some(dock_save_as_panel::SavePayload::Aseprite {
-                unified,
-                timeline,
                 preview: Some(preview),
             }),
         );
+    }
+
+    fn file_export_animation(&mut self) {
+        let session = self.projects.current();
+        let canvas = session.layers.composite_layers(&session.tile_palette);
+        let canvas_w = canvas.width();
+        let canvas_h = canvas.height();
+        let canvas_rgba = canvas.as_bytes().to_vec();
+
+        let mut options = Vec::new();
+        for seq in session.animations.iter() {
+            let mut frames = Vec::new();
+            for i in 0..seq.len() {
+                let Some(f) = seq.frame(i) else {
+                    continue;
+                };
+                let rect = f.region().rect();
+                if let Some(comp) = session
+                    .layers
+                    .composite_layers_region(rect, &session.tile_palette)
+                {
+                    frames.push(dock_export_animation_panel::ExportAnimationFrame {
+                        rect,
+                        width: comp.width(),
+                        height: comp.height(),
+                        rgba: comp.as_bytes().to_vec(),
+                        delay_ms: f.delay_ms().max(1),
+                    });
+                }
+            }
+            options.push(dock_export_animation_panel::ExportAnimationOption {
+                name: seq.name().to_owned(),
+                frames,
+                canvas_w,
+                canvas_h,
+                canvas_rgba: canvas_rgba.clone(),
+            });
+        }
+
+        let selected = if options.is_empty() {
+            None
+        } else {
+            Some(
+                session
+                    .animations
+                    .active()
+                    .min(options.len().saturating_sub(1)),
+            )
+        };
+        let default_loc = self.default_save_location();
+        {
+            let mut view = self.export_animation_host.view.borrow_mut();
+            view.animations = options;
+            view.selected_animation = selected;
+            view.name.clear();
+            view.pixel_scale = 1;
+            view.location = default_loc;
+            view.error = None;
+            view.preview_generation = view.preview_generation.wrapping_add(1);
+        }
+
+        let panel_id =
+            panel_dock::PanelId::new(dock_export_animation_panel::EXPORT_ANIMATION_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(280.0, 180.0),
+            egui::vec2(710.0, 390.0),
+        );
+        let spec = dock_export_animation_panel::export_animation_panel_spec(
+            &self.export_animation_host,
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_export_animation_events(&mut self) {
+        let events = self.export_animation_host.take_events();
+        if events.is_empty() {
+            return;
+        }
+        let panel_id =
+            panel_dock::PanelId::new(dock_export_animation_panel::EXPORT_ANIMATION_PANEL_ID);
+        for event in events {
+            match event {
+                dock_export_animation_panel::ExportAnimationEvent::Cancel => {
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_export_animation_panel::ExportAnimationEvent::BrowseLocation => {
+                    let start = {
+                        let view = self.export_animation_host.view.borrow();
+                        view.location.clone()
+                    };
+                    let start = if start.as_os_str().is_empty() {
+                        self.last_dir
+                            .clone()
+                            .unwrap_or_else(|| self.default_save_location())
+                    } else {
+                        start
+                    };
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ChooseFolder,
+                        start,
+                    );
+                }
+                dock_export_animation_panel::ExportAnimationEvent::ExportFrames {
+                    targets,
+                    pixel_scale,
+                } => {
+                    let res = (|| -> Result<usize, String> {
+                        let mut total_frames = 0usize;
+                        let view = self.export_animation_host.view.borrow();
+                        for (animation_index, dir) in &targets {
+                            let frames = view
+                                .animations
+                                .get(*animation_index)
+                                .map(|a| a.frames.as_slice())
+                                .unwrap_or(&[]);
+                            std::fs::create_dir_all(dir)
+                                .map_err(|e| format!("Failed to create folder: {e}"))?;
+                            for (idx, f) in frames.iter().enumerate() {
+                                let bytes = dock_export_animation_panel::encode_scaled_png(
+                                    f.width,
+                                    f.height,
+                                    &f.rgba,
+                                    pixel_scale,
+                                )?;
+                                let file_path = dir.join(format!("frame_{:03}.png", idx + 1));
+                                std::fs::write(&file_path, bytes)
+                                    .map_err(|e| format!("Failed to write frame {}: {e}", idx + 1))?;
+                            }
+                            total_frames += frames.len();
+                        }
+                        Ok(total_frames)
+                    })();
+                    match res {
+                        Ok(count) => {
+                            if let Some(parent) = targets.first().and_then(|(_, d)| d.parent()) {
+                                self.remember_last_dir(parent);
+                            }
+                            let _ = self.panel_dock.remove_spec(panel_id);
+                            self.show_status_toast(format!("Exported {count} frame(s)."));
+                        }
+                        Err(err) => {
+                            self.export_animation_host.view.borrow_mut().error = Some(err);
+                        }
+                    }
+                }
+                dock_export_animation_panel::ExportAnimationEvent::ExportSpriteSheet {
+                    targets,
+                    single_row,
+                    pixel_scale,
+                } => {
+                    let res = (|| -> Result<(), String> {
+                        let view = self.export_animation_host.view.borrow();
+                        for (animation_index, path) in &targets {
+                            let (w, h, rgba) = if let Some(anim) = view.animations.get(*animation_index) {
+                                if single_row {
+                                    dock_export_animation_panel::build_single_row_sheet(&anim.frames)
+                                } else {
+                                    dock_export_animation_panel::build_canvas_bounds_crop(anim)
+                                }
+                            } else {
+                                (0, 0, Vec::new())
+                            };
+                            let bytes = dock_export_animation_panel::encode_scaled_png(
+                                w,
+                                h,
+                                &rgba,
+                                pixel_scale,
+                            )?;
+                            std::fs::write(path, bytes)
+                                .map_err(|e| format!("Failed to export sprite sheet: {e}"))?;
+                        }
+                        Ok(())
+                    })();
+                    match res {
+                        Ok(()) => {
+                            if let Some(parent) = targets.first().and_then(|(_, p)| p.parent()) {
+                                self.remember_last_dir(parent);
+                            }
+                            let _ = self.panel_dock.remove_spec(panel_id);
+                            self.show_status_toast("Sprite sheet exported.");
+                        }
+                        Err(err) => {
+                            self.export_animation_host.view.borrow_mut().error = Some(err);
+                        }
+                    }
+                }
+                dock_export_animation_panel::ExportAnimationEvent::ExportGif {
+                    targets,
+                    pixel_scale,
+                } => {
+                    let res = (|| -> Result<(), String> {
+                        let view = self.export_animation_host.view.borrow();
+                        for (animation_index, path) in &targets {
+                            let gif_frames: Vec<GifFrameInput> = view
+                                .animations
+                                .get(*animation_index)
+                                .map(|a| {
+                                    a.frames
+                                        .iter()
+                                        .map(|f| {
+                                            let (sw, sh, scaled) =
+                                                dock_save_as_panel::scale_rgba_nearest(
+                                                    f.width,
+                                                    f.height,
+                                                    &f.rgba,
+                                                    pixel_scale,
+                                                );
+                                            GifFrameInput {
+                                                width: sw,
+                                                height: sh,
+                                                rgba: scaled,
+                                                delay_ms: f.delay_ms,
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let bytes = encode_gif(&gif_frames)
+                                .map_err(|e| format!("Failed to export GIF: {e}"))?;
+                            std::fs::write(path, bytes)
+                                .map_err(|e| format!("Failed to export GIF: {e}"))?;
+                        }
+                        Ok(())
+                    })();
+                    match res {
+                        Ok(()) => {
+                            if let Some(parent) = targets.first().and_then(|(_, p)| p.parent()) {
+                                self.remember_last_dir(parent);
+                            }
+                            let _ = self.panel_dock.remove_spec(panel_id);
+                            self.show_status_toast("GIF exported.");
+                        }
+                        Err(err) => {
+                            self.export_animation_host.view.borrow_mut().error = Some(err);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn ui_frame(&mut self, ui: &mut egui::Ui) {
@@ -11800,6 +12136,19 @@ impl App {
             self.write_dock_snapshots();
             self.sync_layer_settings_panel();
             self.sync_animation_settings_panel();
+        } else {
+            let mut color_picker_view = self.color_picker_host.view.borrow_mut();
+            if color_picker_view.open {
+                if color_picker_view.color != self.global_fg_color {
+                    let from_preview = self.global_fg_color == color_picker_view.old_color
+                        || self.global_fg_color == color_picker_view.new_color;
+                    if !from_preview {
+                        color_picker_view.new_color = self.global_fg_color;
+                    }
+                    color_picker_view.color = self.global_fg_color;
+                }
+                color_picker_view.secondary_color = self.global_bg_color;
+            }
         }
         }
         if self.panel_dock_demo {
@@ -11811,7 +12160,8 @@ impl App {
                 surface: SurfaceId::Canvas,
                 rounding: self.ui_style.clamped_rounding(),
             };
-            self.panel_dock.show_inside(ui, &chrome);
+            self.panel_dock
+                .show_inside_with_docked_enabled(ui, &chrome, has_active_project);
             // Drain every frame so dock actions cannot accumulate; Close
             // actions from panel headers are applied here.
             let actions = self.panel_dock.drain_actions();
@@ -11820,6 +12170,10 @@ impl App {
             // per frame (the panels only ever push into the host cells).
             if has_active_project {
                 self.drain_dock_events();
+            } else {
+                let color_events: Vec<ToolbarEvent> =
+                    self.color_picker_host.events.borrow_mut().drain(..).collect();
+                self.apply_toolbar_events(color_events);
             }
             // The Frame Edit viewport stores its interactions during render;
             // feed them through the same gesture pipeline as the main canvas.
@@ -11839,6 +12193,8 @@ impl App {
         self.drain_resize_canvas_events();
         // Apply the save-as/export panel's events (writes + panel close).
         self.drain_save_as_events();
+        // Apply the Export Animation panel's events.
+        self.drain_export_animation_events();
         // Apply the file chooser panel's events (open/import/choose-folder).
         self.drain_file_chooser_events();
         // Apply the Import GIF panel's events (sheet layout + grow canvas).
@@ -11881,6 +12237,8 @@ impl App {
         }
         self.top_bar
             .set_colors(self.global_fg_color, self.global_bg_color);
+        self.top_bar
+            .set_has_active_project(self.projects.active_id().is_some());
         let colors = self.theme.current().colors;
         self.top_bar.ui(ui, &top_bar_layout, &colors);
         let top_bar_events = self.top_bar.drain_events();

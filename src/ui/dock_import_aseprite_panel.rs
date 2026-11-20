@@ -154,21 +154,44 @@ impl ImportAsepriteView {
                 let (pw, ph, _, _) = self.effective_single_canvas_grid()?;
                 Ok(AsepriteLayoutMode::SingleCanvas { px_w: pw, px_h: ph })
             }
-            AsepriteImportMethod::TimelineCanvas => match self.mode {
-                AsepriteUiMode::SingleRow => Ok(AsepriteLayoutMode::SingleRow),
-                AsepriteUiMode::SplitByTags => Ok(AsepriteLayoutMode::SplitByTags),
-                AsepriteUiMode::RowLength => {
-                    let n: u32 = self
-                        .line_length_text
-                        .trim()
-                        .parse()
-                        .map_err(|_| "Row length must be a positive integer".to_owned())?;
-                    if n == 0 {
-                        return Err("Row length must be at least 1".to_owned());
+            AsepriteImportMethod::TimelineCanvas => {
+                let parsed = self
+                    .parsed
+                    .as_ref()
+                    .ok_or_else(|| "No Aseprite file loaded".to_owned())?;
+                let mode = match self.mode {
+                    AsepriteUiMode::SingleRow => AsepriteLayoutMode::SingleRow,
+                    AsepriteUiMode::SplitByTags => AsepriteLayoutMode::SplitByTags,
+                    AsepriteUiMode::RowLength => {
+                        let n: u32 = self
+                            .line_length_text
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Row length must be a positive integer".to_owned())?;
+                        if n == 0 {
+                            return Err("Row length must be at least 1".to_owned());
+                        }
+                        AsepriteLayoutMode::RowLength(n)
                     }
-                    Ok(AsepriteLayoutMode::RowLength(n))
+                };
+                let (cols, rows) = layout_grid(parsed, mode);
+                let regions = (cols as u64).saturating_mul(rows as u64);
+                if regions > self.max_frames as u64 {
+                    return Err(format!(
+                        "{regions} regions exceed the {} region limit",
+                        self.max_frames
+                    ));
                 }
-            },
+                let cw = (cols as u64).saturating_mul(parsed.frame_w.max(1) as u64);
+                let ch = (rows as u64).saturating_mul(parsed.frame_h.max(1) as u64);
+                if cw > self.max_canvas_w as u64 || ch > self.max_canvas_h as u64 {
+                    return Err(format!(
+                        "Sheet {cw}×{ch} px exceeds {}×{} limit (try Row length or Single canvas)",
+                        self.max_canvas_w, self.max_canvas_h
+                    ));
+                }
+                Ok(mode)
+            }
         }
     }
 
@@ -218,6 +241,7 @@ impl ImportAsepriteHost {
 struct ImportAsepriteComponent {
     host: ImportAsepriteHost,
     preview_tex: Option<(u64, egui::TextureHandle)>,
+    preview_viewport: crate::ui::panel_dock::preview::PreviewViewport,
 }
 
 impl ImportAsepriteComponent {
@@ -578,8 +602,13 @@ impl ImportAsepriteComponent {
         let inner = box_rect.shrink(8.0);
         let header_rect =
             egui::Rect::from_min_max(inner.min, pos2(inner.max.x, inner.min.y + 18.0));
+        let footer_h = 22.0;
         let canvas_area = egui::Rect::from_min_max(
             pos2(inner.min.x, header_rect.max.y + 6.0),
+            pos2(inner.max.x, (inner.max.y - footer_h - 4.0).max(header_rect.max.y + 12.0)),
+        );
+        let footer_rect = egui::Rect::from_min_max(
+            pos2(inner.min.x, canvas_area.max.y + 4.0),
             inner.max,
         );
 
@@ -600,6 +629,16 @@ impl ImportAsepriteComponent {
             );
         }
 
+        self.preview_viewport
+            .sync_generation(view_snap.preview_generation);
+        let interact_resp = ui.interact(
+            canvas_area,
+            ui.id().with("import-aseprite-preview-viewport"),
+            egui::Sense::click_and_drag(),
+        );
+        self.preview_viewport
+            .handle_interaction(ui, canvas_area, &interact_resp);
+
         if let Some(tex_id) = self.ensure_preview_texture(ui.ctx(), &view_snap) {
             let aspect = view_snap.preview_w as f32 / view_snap.preview_h.max(1) as f32;
             let mut draw_w = canvas_area.width().max(1.0);
@@ -608,11 +647,15 @@ impl ImportAsepriteComponent {
                 draw_h = canvas_area.height().max(1.0);
                 draw_w = draw_h * aspect;
             }
-            let img_rect =
+            let base_rect =
                 egui::Rect::from_center_size(canvas_area.center(), vec2(draw_w.max(1.0), draw_h.max(1.0)));
+            let img_rect = self
+                .preview_viewport
+                .transform_rect(base_rect, canvas_area.center());
 
-            painter.rect_filled(img_rect, 0.0, chrome.colors.panel_bg32());
-            painter.image(
+            let clipped = ui.painter_at(canvas_area);
+            clipped.rect_filled(img_rect, 0.0, chrome.colors.panel_bg32());
+            clipped.image(
                 tex_id,
                 img_rect,
                 egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
@@ -626,7 +669,7 @@ impl ImportAsepriteComponent {
             if cols > 1 {
                 for c in 1..cols {
                     let x = img_rect.min.x + img_rect.width() * (c as f32 / cols as f32);
-                    painter.line_segment(
+                    clipped.line_segment(
                         [pos2(x, img_rect.min.y), pos2(x, img_rect.max.y)],
                         grid_stroke,
                     );
@@ -635,20 +678,22 @@ impl ImportAsepriteComponent {
             if rows > 1 {
                 for r in 1..rows {
                     let y = img_rect.min.y + img_rect.height() * (r as f32 / rows as f32);
-                    painter.line_segment(
+                    clipped.line_segment(
                         [pos2(img_rect.min.x, y), pos2(img_rect.max.x, y)],
                         grid_stroke,
                     );
                 }
             }
 
-            painter.rect_stroke(
+            clipped.rect_stroke(
                 img_rect,
                 0.0,
                 egui::Stroke::new(1.0, chrome.colors.panel_border32()),
                 egui::StrokeKind::Outside,
             );
         }
+
+        self.preview_viewport.draw_footer(ui, chrome, footer_rect);
     }
 }
 
@@ -696,6 +741,7 @@ pub fn import_aseprite_panel_spec(
     nest.push(ImportAsepriteComponent {
         host: host.clone(),
         preview_tex: None,
+        preview_viewport: crate::ui::panel_dock::preview::PreviewViewport::new(),
     });
     PanelSpec {
         id: PanelId::new(IMPORT_ASEPRITE_PANEL_ID),

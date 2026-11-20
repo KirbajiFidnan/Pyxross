@@ -1,13 +1,14 @@
 //! Floating "Import Pyxel" dock panel (id 217).
 //!
-//! Displays a canvas preview and summary metadata for a parsed `.pyxel` file,
-//! letting the user confirm importing it as a Pyxross project (with tiles,
-//! layers, animations, and color palette).
+//! Displays a two-pane layout: left document metadata summary & actions, right
+//! live canvas preview (`NEAREST`) for a parsed `.pyxel` file, letting the
+//! user confirm importing it as a Pyxross project (with tiles, layers,
+//! animations, and color palette).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use egui::vec2;
+use egui::{pos2, vec2};
 
 use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
 use crate::ui::panel_dock::{
@@ -21,7 +22,8 @@ pub const IMPORT_PYXEL_PANEL_ID: u64 = 217;
 const IMPORT_PYXEL_TITLE: &str = "Import Pyxel";
 
 /// Minimum size of the floating Import Pyxel panel.
-const IMPORT_PYXEL_MIN_SIZE: egui::Vec2 = vec2(420.0, 380.0);
+const IMPORT_PYXEL_MIN_SIZE: egui::Vec2 = vec2(620.0, 380.0);
+const FORM_PANE_WIDTH: f32 = 250.0;
 
 /// View state populated when a `.pyxel` file is parsed.
 #[derive(Clone, Debug, Default)]
@@ -72,6 +74,7 @@ impl ImportPyxelHost {
 struct ImportPyxelComponent {
     host: ImportPyxelHost,
     preview_tex: Option<(u64, egui::TextureHandle)>,
+    preview_viewport: crate::ui::panel_dock::preview::PreviewViewport,
 }
 
 impl ImportPyxelComponent {
@@ -80,7 +83,10 @@ impl ImportPyxelComponent {
         ctx: &egui::Context,
         view: &ImportPyxelView,
     ) -> Option<egui::TextureId> {
-        if view.width == 0 || view.height == 0 || view.preview_rgba.len() != view.width * view.height * 4 {
+        if view.width == 0
+            || view.height == 0
+            || view.preview_rgba.len() != view.width * view.height * 4
+        {
             return None;
         }
         if let Some((gen, tex)) = &self.preview_tex {
@@ -99,77 +105,213 @@ impl ImportPyxelComponent {
         self.preview_tex = Some((view.preview_generation, tex));
         Some(id)
     }
-}
 
-impl Component for ImportPyxelComponent {
-    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
-        let view = self.host.view.borrow().clone();
-        ui.label(format!("File: {}", view.file_name));
-        ui.label(format!("Document: {}", view.doc_name));
-        ui.add_space(4.0);
-        ui.label(format!(
-            "Canvas: {}×{} px   |   Tile: {}×{} px",
-            view.width, view.height, view.tile_w, view.tile_h
-        ));
-        ui.label(format!(
-            "Layers: {}   |   Tiles: {}   |   Animations: {}   |   Palette: {} colors",
-            view.layer_count, view.tile_count, view.animation_count, view.palette_colors
-        ));
-        ui.add_space(8.0);
+    fn draw_left_pane(
+        &self,
+        ui: &mut egui::Ui,
+        view: &ImportPyxelView,
+        chrome: &PanelChrome,
+    ) -> Option<ImportPyxelEvent> {
+        let mut emitted = None;
+        let total_h = ui.available_height();
+        let footer_h = 44.0;
+        let top_h = (total_h - footer_h).max(120.0);
 
-        let avail = ui.available_width().max(120.0);
-        let box_h = (ui.available_height() - 56.0).clamp(140.0, 260.0);
-        let (preview_rect, _) =
-            ui.allocate_exact_size(vec2(avail, box_h), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(preview_rect, 2.0, chrome.colors.panel_header_bg32());
-        ui.painter().rect_stroke(
-            preview_rect,
-            2.0,
-            egui::Stroke::new(1.0, chrome.colors.panel_border32()),
-            egui::StrokeKind::Inside,
+        ui.allocate_ui_with_layout(
+            vec2(FORM_PANE_WIDTH, top_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                let card_w = ui.available_width();
+                egui::Frame::new()
+                    .fill(chrome.colors.panel_header_bg32())
+                    .stroke(egui::Stroke::new(1.0, chrome.colors.panel_border32()))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_width((card_w - 22.0).max(120.0));
+                        ui.strong(&view.doc_name);
+                        ui.add_space(2.0);
+                        ui.weak(&view.file_name);
+                    });
+
+                ui.add_space(10.0);
+                ui.strong("Document details");
+                ui.add_space(6.0);
+
+                let rows = [
+                    ("Canvas", format!("{} × {} px", view.width, view.height)),
+                    ("Tile size", format!("{} × {} px", view.tile_w, view.tile_h)),
+                    ("Layers", view.layer_count.to_string()),
+                    ("Tiles", view.tile_count.to_string()),
+                    ("Animations", view.animation_count.to_string()),
+                    ("Palette", format!("{} colors", view.palette_colors)),
+                ];
+                egui::Grid::new("import-pyxel-details")
+                    .num_columns(2)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        for (label, value) in rows {
+                            ui.weak(label);
+                            ui.label(value);
+                            ui.end_row();
+                        }
+                    });
+
+                if let Some(err) = &view.error {
+                    ui.add_space(10.0);
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                }
+            },
         );
 
-        if let Some(tex_id) = self.ensure_preview_texture(ui.ctx(), &view) {
-            let inner = preview_rect.shrink(6.0);
-            let aspect = view.width as f32 / view.height.max(1) as f32;
-            let mut draw_w = inner.width();
-            let mut draw_h = draw_w / aspect;
-            if draw_h > inner.height() {
-                draw_h = inner.height();
-                draw_w = draw_h * aspect;
-            }
-            let img_rect =
-                egui::Rect::from_center_size(inner.center(), vec2(draw_w.max(1.0), draw_h.max(1.0)));
-            ui.painter().image(
-                tex_id,
-                img_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                crate::ui::theme::SKIN_TINT,
-            );
-        }
-
-        if let Some(err) = &view.error {
-            ui.add_space(4.0);
-            ui.colored_label(chrome.colors.selection_stroke_color32(), err);
-        }
-
-        ui.add_space(8.0);
-        let mut emitted = None;
+        ui.separator();
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if chrome.button(ui, "Import", ButtonStyle::plain()).clicked() {
-                emitted = Some(ImportPyxelEvent::Import);
-            }
-            if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
-                emitted = Some(ImportPyxelEvent::Cancel);
-            }
+            ui.set_width(FORM_PANE_WIDTH);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chrome
+                    .button(
+                        ui,
+                        "Import",
+                        ButtonStyle {
+                            selected: true,
+                            ..ButtonStyle::plain()
+                        },
+                    )
+                    .clicked()
+                {
+                    emitted = Some(ImportPyxelEvent::Import);
+                }
+                ui.add_space(6.0);
+                if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
+                    emitted = Some(ImportPyxelEvent::Cancel);
+                }
+            });
         });
+
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             emitted = Some(ImportPyxelEvent::Cancel);
         } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             emitted = Some(ImportPyxelEvent::Import);
         }
+        emitted
+    }
+
+    fn draw_right_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &ImportPyxelView,
+        chrome: &PanelChrome,
+    ) {
+        let avail = ui.available_size();
+        let (box_rect, _) = ui.allocate_exact_size(
+            vec2(avail.x.max(140.0), avail.y.max(140.0)),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(box_rect, 0.0, chrome.colors.panel_header_bg32());
+        painter.rect_stroke(
+            box_rect,
+            0.0,
+            egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner = box_rect.shrink(8.0);
+        let header_rect =
+            egui::Rect::from_min_max(inner.min, pos2(inner.max.x, inner.min.y + 18.0));
+        let footer_h = 22.0;
+        let canvas_area = egui::Rect::from_min_max(
+            pos2(inner.min.x, header_rect.max.y + 6.0),
+            pos2(inner.max.x, (inner.max.y - footer_h - 4.0).max(header_rect.max.y + 12.0)),
+        );
+        let footer_rect = egui::Rect::from_min_max(
+            pos2(inner.min.x, canvas_area.max.y + 4.0),
+            inner.max,
+        );
+
+        painter.text(
+            header_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            "Preview",
+            egui::FontId::proportional(12.0),
+            ui.visuals().text_color(),
+        );
+        if view.width > 0 && view.height > 0 {
+            painter.text(
+                header_rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                format!("{} × {} px", view.width, view.height),
+                egui::FontId::proportional(11.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+
+        self.preview_viewport
+            .sync_generation(view.preview_generation);
+        let interact_resp = ui.interact(
+            canvas_area,
+            ui.id().with("import-pyxel-preview-viewport"),
+            egui::Sense::click_and_drag(),
+        );
+        self.preview_viewport
+            .handle_interaction(ui, canvas_area, &interact_resp);
+
+        if let Some(tex_id) = self.ensure_preview_texture(ui.ctx(), view) {
+            let aspect = view.width as f32 / view.height.max(1) as f32;
+            let mut draw_w = canvas_area.width().max(1.0);
+            let mut draw_h = draw_w / aspect;
+            if draw_h > canvas_area.height().max(1.0) {
+                draw_h = canvas_area.height().max(1.0);
+                draw_w = draw_h * aspect;
+            }
+            let base_rect = egui::Rect::from_center_size(
+                canvas_area.center(),
+                vec2(draw_w.max(1.0), draw_h.max(1.0)),
+            );
+            let img_rect = self
+                .preview_viewport
+                .transform_rect(base_rect, canvas_area.center());
+            let clipped = ui.painter_at(canvas_area);
+            clipped.rect_filled(img_rect, 0.0, chrome.colors.panel_bg32());
+            clipped.image(
+                tex_id,
+                img_rect,
+                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                crate::ui::theme::SKIN_TINT,
+            );
+            clipped.rect_stroke(
+                img_rect,
+                0.0,
+                egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        self.preview_viewport.draw_footer(ui, chrome, footer_rect);
+    }
+}
+
+impl Component for ImportPyxelComponent {
+    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+        let view = self.host.view.borrow().clone();
+        let mut emitted = None;
+        let total_h = ui.available_height().max(240.0);
+        ui.horizontal_top(|ui| {
+            ui.set_min_height(total_h);
+            ui.allocate_ui_with_layout(
+                vec2(FORM_PANE_WIDTH, total_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    emitted = self.draw_left_pane(ui, &view, chrome);
+                },
+            );
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.set_min_height(total_h);
+                self.draw_right_preview(ui, &view, chrome);
+            });
+        });
+
         if let Some(ev) = emitted {
             self.host.events.borrow_mut().push(ev);
         }
@@ -191,6 +333,7 @@ pub(crate) fn build_import_pyxel_nest(host: &ImportPyxelHost) -> NestContent {
     nest.push(ImportPyxelComponent {
         host: host.clone(),
         preview_tex: None,
+        preview_viewport: crate::ui::panel_dock::preview::PreviewViewport::new(),
     });
     nest
 }

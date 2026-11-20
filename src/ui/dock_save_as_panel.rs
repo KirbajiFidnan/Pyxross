@@ -51,7 +51,9 @@ pub const MAX_PIXEL_SCALE: u32 = 16;
 /// path/name rows, optional pixel scale / checkbox, inline error, and bottom
 /// actions fit cleanly with zero scrollbars.
 const SAVE_AS_MIN_SIZE: egui::Vec2 = vec2(440.0, 218.0 + FLOATING_PANEL_CHROME_HEIGHT);
-const SAVE_AS_ASEPRITE_MIN_SIZE: egui::Vec2 = vec2(440.0, 356.0 + FLOATING_PANEL_CHROME_HEIGHT);
+const SAVE_AS_EXPORT_PREVIEW_MIN_SIZE: egui::Vec2 =
+    vec2(680.0, 270.0 + FLOATING_PANEL_CHROME_HEIGHT);
+const EXPORT_FORM_PANE_WIDTH: f32 = 340.0;
 
 /// What kind of save/export the modal is currently drafting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +111,19 @@ pub fn supports_pixel_scale(kind: SaveAsKind) -> bool {
     )
 }
 
+/// True for export panels that render a right-hand live preview pane.
+pub fn has_export_preview(kind: SaveAsKind) -> bool {
+    matches!(
+        kind,
+        SaveAsKind::Image
+            | SaveAsKind::SelectionPng
+            | SaveAsKind::Aseprite
+            | SaveAsKind::SpriteSheet
+            | SaveAsKind::Gif
+            | SaveAsKind::Pyxel
+    )
+}
+
 /// The locked extension badge(s) for `kind`, in display order; the first is
 /// selected and enforced on save/export.
 pub fn formats_for(kind: SaveAsKind) -> &'static [&'static str] {
@@ -116,7 +131,7 @@ pub fn formats_for(kind: SaveAsKind) -> &'static [&'static str] {
     const PNG: &[&str] = &[".png"];
     const GIF: &[&str] = &[".gif"];
     const PYXEL: &[&str] = &[".pyxel"];
-    const ASE: &[&str] = &[".ase"];
+    const ASE: &[&str] = &[".ase", ".aseprite"];
     match kind {
         SaveAsKind::Project => PROJECT,
         SaveAsKind::Image | SaveAsKind::SpriteSheet | SaveAsKind::SelectionPng => PNG,
@@ -169,10 +184,13 @@ pub enum SavePayload {
     },
     /// Raw frame buffers + delays for scaled GIF encoding.
     Gif(Vec<GifFrameInput>),
-    Pyxel(Vec<u8>),
+    Pyxel {
+        bytes: Vec<u8>,
+        w: usize,
+        h: usize,
+        rgba: Vec<u8>,
+    },
     Aseprite {
-        unified: Vec<u8>,
-        timeline: Vec<u8>,
         preview: Option<crate::core::aseprite::AsepriteExportPreview>,
     },
     SelectionPng { w: usize, h: usize, rgba: Vec<u8> },
@@ -186,7 +204,8 @@ impl SavePayload {
             | SavePayload::SpriteSheet { w, h, .. }
             | SavePayload::SelectionPng { w, h, .. } => Some((*w, *h)),
             SavePayload::Gif(frames) => frames.first().map(|f| (f.width, f.height)),
-            SavePayload::Pyxel(_) | SavePayload::Aseprite { .. } => None,
+            SavePayload::Pyxel { w, h, .. } => Some((*w, *h)),
+            SavePayload::Aseprite { .. } => None,
         }
     }
 }
@@ -346,70 +365,246 @@ pub fn commit_save(view: &SaveAsView) -> Result<SaveAsEvent, String> {
 }
 
 /// The save-as/export form: path box, Browse, name box, format row, error
-/// line, Save/Cancel.
+/// line, Save/Cancel, plus right-hand preview for export kinds.
 struct SaveAsComponent {
     host: SaveAsHost,
-    ase_preview_gen: u64,
-    ase_unified_tex: Option<(usize, usize, egui::TextureHandle)>,
-    ase_frame_texs: Vec<(usize, usize, egui::TextureHandle)>,
+    preview_gen: u64,
+    preview_viewport: crate::ui::panel_dock::preview::PreviewViewport,
+    single_tex: Option<(usize, usize, egui::TextureHandle)>,
+    frame_texs: Vec<(usize, usize, egui::TextureHandle)>,
 }
 
 impl SaveAsComponent {
     fn new(host: SaveAsHost) -> Self {
         Self {
             host,
-            ase_preview_gen: 0,
-            ase_unified_tex: None,
-            ase_frame_texs: Vec::new(),
+            preview_gen: u64::MAX,
+            preview_viewport: crate::ui::panel_dock::preview::PreviewViewport::new(),
+            single_tex: None,
+            frame_texs: Vec::new(),
         }
     }
 
-    fn sync_aseprite_textures(&mut self, ctx: &egui::Context) {
+    fn upload_rgba(
+        ctx: &egui::Context,
+        name: &str,
+        w: usize,
+        h: usize,
+        rgba: &[u8],
+    ) -> Option<(usize, usize, egui::TextureHandle)> {
+        if w == 0 || h == 0 || rgba.len() != w * h * 4 {
+            return None;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+        let tex = ctx.load_texture(name, image, egui::TextureOptions::NEAREST);
+        Some((w, h, tex))
+    }
+
+    fn sync_export_textures(&mut self, ctx: &egui::Context) {
         let view = self.host.view.borrow();
-        let Some(SavePayload::Aseprite {
-            preview: Some(preview),
-            ..
-        }) = &view.payload
-        else {
-            self.ase_unified_tex = None;
-            self.ase_frame_texs.clear();
-            return;
-        };
-        if self.ase_preview_gen == view.preview_generation && self.ase_unified_tex.is_some() {
+        if self.preview_gen == view.preview_generation {
             return;
         }
-        self.ase_preview_gen = view.preview_generation;
-        self.ase_unified_tex = None;
-        self.ase_frame_texs.clear();
+        self.preview_gen = view.preview_generation;
+        self.preview_viewport.sync_generation(view.preview_generation);
+        self.single_tex = None;
+        self.frame_texs.clear();
 
-        if preview.unified_w > 0
-            && preview.unified_h > 0
-            && preview.unified_rgba.len() == preview.unified_w * preview.unified_h * 4
-        {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [preview.unified_w, preview.unified_h],
-                &preview.unified_rgba,
-            );
-            let tex = ctx.load_texture(
-                "export-aseprite-unified-preview",
-                image,
-                egui::TextureOptions::NEAREST,
-            );
-            self.ase_unified_tex = Some((preview.unified_w, preview.unified_h, tex));
-        }
-
-        for (idx, (fw, fh, rgba)) in preview.frames.iter().take(4).enumerate() {
-            if *fw == 0 || *fh == 0 || rgba.len() != fw * fh * 4 {
-                continue;
+        match &view.payload {
+            Some(
+                SavePayload::Image { w, h, rgba }
+                | SavePayload::SelectionPng { w, h, rgba }
+                | SavePayload::SpriteSheet { w, h, rgba, .. }
+                | SavePayload::Pyxel { w, h, rgba, .. },
+            ) => {
+                self.single_tex =
+                    Self::upload_rgba(ctx, "export-single-preview", *w, *h, rgba);
             }
-            let image = egui::ColorImage::from_rgba_unmultiplied([*fw, *fh], rgba);
-            let tex = ctx.load_texture(
-                format!("export-aseprite-frame-preview-{idx}"),
-                image,
-                egui::TextureOptions::NEAREST,
-            );
-            self.ase_frame_texs.push((*fw, *fh, tex));
+            Some(SavePayload::Gif(frames)) => {
+                for (idx, frame) in frames.iter().enumerate() {
+                    if let Some(tex) = Self::upload_rgba(
+                        ctx,
+                        &format!("export-gif-frame-preview-{idx}"),
+                        frame.width,
+                        frame.height,
+                        &frame.rgba,
+                    ) {
+                        self.frame_texs.push(tex);
+                    }
+                }
+            }
+            Some(SavePayload::Aseprite {
+                preview: Some(preview),
+                ..
+            }) => {
+                self.single_tex = Self::upload_rgba(
+                    ctx,
+                    "export-aseprite-unified-preview",
+                    preview.unified_w,
+                    preview.unified_h,
+                    &preview.unified_rgba,
+                );
+                for (idx, (fw, fh, rgba)) in preview.frames.iter().enumerate() {
+                    if let Some(tex) = Self::upload_rgba(
+                        ctx,
+                        &format!("export-aseprite-frame-preview-{idx}"),
+                        *fw,
+                        *fh,
+                        rgba,
+                    ) {
+                        self.frame_texs.push(tex);
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn draw_right_preview(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
+        self.sync_export_textures(ui.ctx());
+        let (kind, unified_frames, pixel_scale, caption) = {
+            let v = self.host.view.borrow();
+            let scale = v.pixel_scale.clamp(1, MAX_PIXEL_SCALE) as usize;
+            let cap = match (v.kind, &v.payload) {
+                (
+                    SaveAsKind::Aseprite,
+                    Some(SavePayload::Aseprite {
+                        preview: Some(p), ..
+                    }),
+                ) => {
+                    if v.aseprite_unified_frames {
+                        format!(
+                            "Preview · Unified: 1 frame ({}×{} px)",
+                            p.unified_w, p.unified_h
+                        )
+                    } else {
+                        format!(
+                            "Preview · Timeline: {} frame(s) ({}×{} px)",
+                            p.total_timeline_frames, p.frame_w, p.frame_h
+                        )
+                    }
+                }
+                (SaveAsKind::Gif, Some(SavePayload::Gif(frames))) => {
+                    let (fw, fh) = frames.first().map_or((0, 0), |f| (f.width, f.height));
+                    format!(
+                        "Preview · {} frame(s) ({}×{} px)",
+                        frames.len(),
+                        fw * scale,
+                        fh * scale
+                    )
+                }
+                (
+                    _,
+                    Some(
+                        SavePayload::Image { w, h, .. }
+                        | SavePayload::SelectionPng { w, h, .. }
+                        | SavePayload::SpriteSheet { w, h, .. }
+                        | SavePayload::Pyxel { w, h, .. },
+                    ),
+                ) => format!("Preview · {} × {} px", w * scale, h * scale),
+                _ => "Preview".to_owned(),
+            };
+            (v.kind, v.aseprite_unified_frames, scale, cap)
+        };
+        let _ = pixel_scale;
+
+        let avail = ui.available_size();
+        let (box_rect, _) = ui.allocate_exact_size(
+            vec2(avail.x.max(140.0), avail.y.max(140.0)),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(box_rect, 0.0, chrome.colors.panel_header_bg32());
+        painter.rect_stroke(
+            box_rect,
+            0.0,
+            egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner = box_rect.shrink(8.0);
+        let header_rect =
+            egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.min.y + 18.0));
+        let footer_h = 22.0;
+        let img_area = egui::Rect::from_min_max(
+            egui::pos2(inner.min.x, header_rect.max.y + 6.0),
+            egui::pos2(inner.max.x, (inner.max.y - footer_h - 4.0).max(header_rect.max.y + 12.0)),
+        );
+        let footer_rect = egui::Rect::from_min_max(
+            egui::pos2(inner.min.x, img_area.max.y + 4.0),
+            inner.max,
+        );
+
+        painter.text(
+            header_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            caption,
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+
+        let interact_resp = ui.interact(
+            img_area,
+            ui.id().with("export-preview-viewport"),
+            egui::Sense::click_and_drag(),
+        );
+        self.preview_viewport
+            .handle_interaction(ui, img_area, &interact_resp);
+
+        let clipped = ui.painter_at(img_area);
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let show_multi_frames = (kind == SaveAsKind::Aseprite && !unified_frames)
+            || (kind == SaveAsKind::Gif && self.frame_texs.len() > 1);
+
+        if show_multi_frames {
+            let count = self.frame_texs.len();
+            if count > 0 {
+                let gap = 8.0;
+                let slot_w = ((img_area.width() - gap * (count.saturating_sub(1) as f32))
+                    / count as f32)
+                    .max(20.0);
+                for (idx, (fw, fh, tex)) in self.frame_texs.iter().enumerate() {
+                    let x0 = img_area.min.x + idx as f32 * (slot_w + gap);
+                    let slot = egui::Rect::from_min_size(
+                        egui::pos2(x0, img_area.min.y),
+                        vec2(slot_w, img_area.height().max(12.0)),
+                    );
+                    let base_dst = fit_rect_aspect(slot, *fw, *fh);
+                    let dst = self
+                        .preview_viewport
+                        .transform_rect(base_dst, img_area.center());
+                    clipped.rect_filled(dst, 0.0, chrome.colors.panel_bg32());
+                    clipped.image(tex.id(), dst, uv, crate::ui::theme::SKIN_TINT);
+                    clipped.rect_stroke(
+                        dst,
+                        0.0,
+                        egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        } else {
+            let single = self
+                .single_tex
+                .as_ref()
+                .or_else(|| self.frame_texs.first());
+            if let Some((w, h, tex)) = single {
+                let base_dst = fit_rect_aspect(img_area, *w, *h);
+                let dst = self
+                    .preview_viewport
+                    .transform_rect(base_dst, img_area.center());
+                clipped.rect_filled(dst, 0.0, chrome.colors.panel_bg32());
+                clipped.image(tex.id(), dst, uv, crate::ui::theme::SKIN_TINT);
+                clipped.rect_stroke(
+                    dst,
+                    0.0,
+                    egui::Stroke::new(1.0, chrome.colors.panel_border32()),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+
+        self.preview_viewport.draw_footer(ui, chrome, footer_rect);
     }
 }
 
@@ -424,8 +619,8 @@ fn fit_rect_aspect(container: egui::Rect, w: usize, h: usize) -> egui::Rect {
     egui::Rect::from_center_size(container.center(), vec2(draw_w.max(1.0), draw_h.max(1.0)))
 }
 
-impl Component for SaveAsComponent {
-    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+impl SaveAsComponent {
+    fn draw_form_pane(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
         // Copy the form out of the host cell so the borrow is released before
         // the widgets run; edited values are written back at the end.
         let (
@@ -564,121 +759,9 @@ impl Component for SaveAsComponent {
         }
 
         if kind == SaveAsKind::Aseprite {
-            self.sync_aseprite_textures(ui.ctx());
             ui.add_space(6.0);
             ui.checkbox(&mut aseprite_unified_frames, "Unified frames")
                 .on_hover_text("Export the entire canvas as a single frame");
-            ui.add_space(6.0);
-
-            let (unified_dims, total_frames, frame_dims) = {
-                let v = self.host.view.borrow();
-                match &v.payload {
-                    Some(SavePayload::Aseprite {
-                        preview: Some(p), ..
-                    }) => (
-                        (p.unified_w, p.unified_h),
-                        p.total_timeline_frames,
-                        (p.frame_w, p.frame_h),
-                    ),
-                    _ => ((0, 0), 0, (0, 0)),
-                }
-            };
-
-            let avail_w = ui.available_width().max(120.0);
-            let (box_rect, _) = ui.allocate_exact_size(vec2(avail_w, 122.0), egui::Sense::hover());
-            let painter = ui.painter();
-            painter.rect_filled(box_rect, 0.0, chrome.colors.panel_header_bg32());
-            painter.rect_stroke(
-                box_rect,
-                0.0,
-                egui::Stroke::new(1.0, chrome.colors.panel_border32()),
-                egui::StrokeKind::Inside,
-            );
-
-            let inner = box_rect.shrink(6.0);
-            let header_rect =
-                egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.min.y + 16.0));
-            let img_area = egui::Rect::from_min_max(
-                egui::pos2(inner.min.x, header_rect.max.y + 4.0),
-                inner.max,
-            );
-            let caption = if aseprite_unified_frames {
-                format!(
-                    "Preview · Unified: 1 frame ({}×{} px)",
-                    unified_dims.0, unified_dims.1
-                )
-            } else if total_frames > 4 {
-                format!(
-                    "Preview · Timeline: {} frames ({}×{} px) · first 4",
-                    total_frames, frame_dims.0, frame_dims.1
-                )
-            } else {
-                format!(
-                    "Preview · Timeline: {} frame(s) ({}×{} px)",
-                    total_frames, frame_dims.0, frame_dims.1
-                )
-            };
-            painter.text(
-                header_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                caption,
-                egui::FontId::proportional(11.0),
-                ui.visuals().weak_text_color(),
-            );
-
-            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            if aseprite_unified_frames {
-                if let Some((w, h, tex)) = &self.ase_unified_tex {
-                    let dst = fit_rect_aspect(img_area, *w, *h);
-                    painter.rect_filled(dst, 0.0, chrome.colors.panel_bg32());
-                    painter.image(tex.id(), dst, uv, crate::ui::theme::SKIN_TINT);
-                    painter.rect_stroke(
-                        dst,
-                        0.0,
-                        egui::Stroke::new(1.0, chrome.colors.panel_border32()),
-                        egui::StrokeKind::Outside,
-                    );
-                }
-            } else {
-                let count = self.ase_frame_texs.len().min(4);
-                if count > 0 {
-                    let gap = 8.0;
-                    let slot_w =
-                        ((img_area.width() - gap * (count.saturating_sub(1) as f32)) / count as f32)
-                            .max(12.0);
-                    for (idx, (fw, fh, tex)) in self.ase_frame_texs.iter().take(4).enumerate() {
-                        let x0 = img_area.min.x + idx as f32 * (slot_w + gap);
-                        let slot = egui::Rect::from_min_size(
-                            egui::pos2(x0, img_area.min.y),
-                            vec2(slot_w, img_area.height().max(12.0)),
-                        );
-                        let dst = fit_rect_aspect(slot, *fw, *fh);
-                        // Left-to-right frame-by-frame fade effect (1.0 -> 0.75 -> 0.50 -> 0.25).
-                        let alpha = (1.0 - (idx as f32) * 0.25).clamp(0.20, 1.0);
-                        let tint = egui::Color32::from_rgba_unmultiplied(
-                            255,
-                            255,
-                            255,
-                            (alpha * 255.0).round() as u8,
-                        );
-                        painter.rect_filled(
-                            dst,
-                            0.0,
-                            chrome.colors.panel_bg32().gamma_multiply(alpha),
-                        );
-                        painter.image(tex.id(), dst, uv, tint);
-                        painter.rect_stroke(
-                            dst,
-                            0.0,
-                            egui::Stroke::new(
-                                1.0,
-                                chrome.colors.panel_border32().gamma_multiply(alpha),
-                            ),
-                            egui::StrokeKind::Outside,
-                        );
-                    }
-                }
-            }
         }
 
         // Inline error line (theme error color, panel stays open).
@@ -752,6 +835,32 @@ impl Component for SaveAsComponent {
     }
 }
 
+impl Component for SaveAsComponent {
+    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+        let kind = self.host.view.borrow().kind;
+        if !has_export_preview(kind) {
+            self.draw_form_pane(ui, chrome);
+            return;
+        }
+        let total_h = ui.available_height().max(240.0);
+        ui.horizontal_top(|ui| {
+            ui.set_min_height(total_h);
+            ui.allocate_ui_with_layout(
+                vec2(EXPORT_FORM_PANE_WIDTH, total_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    self.draw_form_pane(ui, chrome);
+                },
+            );
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.set_min_height(total_h);
+                self.draw_right_preview(ui, chrome);
+            });
+        });
+    }
+}
+
 /// Panel content: the static nest holding the save-as/export form.
 struct SaveAsPanelContent {
     nest: NestContent,
@@ -778,8 +887,8 @@ pub(crate) fn build_save_as_nest(host: &SaveAsHost) -> NestContent {
 pub fn save_as_panel_spec(host: &SaveAsHost, floating_rect: egui::Rect) -> PanelSpec {
     let view = host.view.borrow();
     let title = view.kind.title();
-    let min_size = if view.kind == SaveAsKind::Aseprite {
-        SAVE_AS_ASEPRITE_MIN_SIZE
+    let min_size = if has_export_preview(view.kind) {
+        SAVE_AS_EXPORT_PREVIEW_MIN_SIZE
     } else {
         SAVE_AS_MIN_SIZE
     };
@@ -964,7 +1073,7 @@ mod tests {
         assert_eq!(formats_for(SaveAsKind::SelectionPng), &[".png"][..]);
         assert_eq!(formats_for(SaveAsKind::Gif), &[".gif"][..]);
         assert_eq!(formats_for(SaveAsKind::Pyxel), &[".pyxel"][..]);
-        assert_eq!(formats_for(SaveAsKind::Aseprite), &[".ase"][..]);
+        assert_eq!(formats_for(SaveAsKind::Aseprite), &[".ase", ".aseprite"][..]);
     }
 
     #[test]
@@ -1236,8 +1345,6 @@ mod tests {
             v.name = "sprite".to_owned();
             v.aseprite_unified_frames = false;
             v.payload = Some(SavePayload::Aseprite {
-                unified: Vec::new(),
-                timeline: Vec::new(),
                 preview: Some(crate::core::aseprite::AsepriteExportPreview {
                     unified_w: 64,
                     unified_h: 16,
@@ -1258,7 +1365,7 @@ mod tests {
         assert!(
             !text_positions(
                 &out_timeline,
-                "Preview · Timeline: 6 frames (16×16 px) · first 4"
+                "Preview · Timeline: 6 frame(s) (16×16 px)"
             )
             .is_empty(),
             "timeline preview caption must be shown when unified frames is off"

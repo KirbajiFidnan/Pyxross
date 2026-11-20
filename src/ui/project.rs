@@ -544,6 +544,53 @@ impl<'a> ProjectFrameMut<'a> {
     }
 }
 
+/// Builds the default `"Animation 1"` set + playback controller for a newly
+/// created canvas of `width × height` with `tile` regions: assigns up to the
+/// first 4 regions (top-left, row-major) as frames, or all available regions
+/// when the canvas has fewer than 4.
+pub fn default_animation_set_for_canvas(
+    width: usize,
+    height: usize,
+    tile: TileSize,
+) -> (AnimationSet, AnimationController) {
+    let w = width.max(1);
+    let h = height.max(1);
+    let tw = (tile.w.max(1) as usize).min(w);
+    let th = (tile.h.max(1) as usize).min(h);
+    let cols = (w / tw).max(1);
+    let rows = (h / th).max(1);
+
+    let mut animations = AnimationSet::new();
+    let mut delays = Vec::new();
+    {
+        let sequence = animations.active_mut();
+        sequence.set_name("Animation 1");
+        sequence.set_looping(true);
+        let mut idx = 1usize;
+        'outer: for cy in 0..rows {
+            for cx in 0..cols {
+                let rect = Rect2i::new(
+                    (cx * tw) as i32,
+                    (cy * th) as i32,
+                    tw as i32,
+                    th as i32,
+                );
+                sequence.push(Frame::new(
+                    Region::new(rect, format!("Frame {idx}")),
+                    100,
+                ));
+                delays.push(100);
+                idx += 1;
+                if delays.len() >= 4 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let controller = AnimationController::new_from_delays(delays.len(), delays);
+    (animations, controller)
+}
+
 impl ProjectSession {
     /// The ACTIVE animation sequence.
     pub fn sequence(&self) -> &AnimationSequence {
@@ -809,22 +856,13 @@ impl ProjectSession {
 
     pub fn new(id: ProjectId, name: impl Into<String>, width: usize, height: usize) -> Self {
         let layers = LayerStack::new(width, height);
-        let mut animations = AnimationSet::new();
-        {
-            let sequence = animations.active_mut();
-            sequence.set_name("Animation 1");
-            sequence.set_looping(true);
-            sequence.push(Frame::new(
-                Region::new(Rect2i::new(0, 0, width as i32, height as i32), "Frame 1"),
-                100,
-            ));
-        }
-        let animation = AnimationController::new_from_delays(1, vec![100]);
+        let tile_size = TileSize::square(16);
+        let (animations, animation) = default_animation_set_for_canvas(width, height, tile_size);
         Self {
             id,
             name: name.into(),
             path: None,
-            tile_size: TileSize::square(16),
+            tile_size,
             layers,
             undo: UndoStack::new(),
             camera: Camera::new(),
@@ -1391,5 +1429,26 @@ mod tests {
         restored2.load_document(&doc2);
         assert_eq!(restored2.sequence().len(), 1, "the orphaned frame is skipped");
         assert_eq!(restored2.sequence().frame(0).unwrap().region().name(), "Frame 2");
+    }
+
+    #[test]
+    fn default_animation_set_assigns_up_to_four_top_left_regions() {
+        let (anims_many, ctrl_many) =
+            default_animation_set_for_canvas(64, 64, TileSize::square(16));
+        assert_eq!(anims_many.active_ref().len(), 4);
+        assert_eq!(ctrl_many.frame_count(), 4);
+        assert_eq!(
+            anims_many.active_ref().frame(0).unwrap().region().rect(),
+            Rect2i::new(0, 0, 16, 16)
+        );
+        assert_eq!(
+            anims_many.active_ref().frame(3).unwrap().region().rect(),
+            Rect2i::new(48, 0, 16, 16)
+        );
+
+        let (anims_few, ctrl_few) =
+            default_animation_set_for_canvas(32, 16, TileSize::square(16));
+        assert_eq!(anims_few.active_ref().len(), 2);
+        assert_eq!(ctrl_few.frame_count(), 2);
     }
 }

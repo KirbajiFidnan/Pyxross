@@ -13,7 +13,7 @@ use egui::{Rect, TextureId, Vec2};
 use crate::ui::theme::SKIN_TINT;
 
 use super::nest::{Component, ComponentPlacement, NestReset, NestResetHandle, NestView};
-use super::skin::PanelChrome;
+use super::skin::{ButtonStyle, PanelChrome};
 
 /// The canvas image the preview shows, published by the app each frame.
 #[derive(Clone, Default)]
@@ -104,6 +104,108 @@ impl Component for PreviewControls {
                 }
             });
         });
+    }
+}
+
+/// Reusable zoom-and-pan camera state for right-hand preview panes.
+#[derive(Clone, Copy, Debug)]
+pub struct PreviewViewport {
+    pub zoom: f32,
+    pub pan: Vec2,
+    pub generation: u64,
+}
+
+impl Default for PreviewViewport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PreviewViewport {
+    pub const fn new() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            generation: u64::MAX,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
+    }
+
+    pub fn sync_generation(&mut self, gen: u64) {
+        if self.generation != gen {
+            self.generation = gen;
+            self.reset();
+        }
+    }
+
+    /// Handle scroll-to-zoom, drag-to-pan, and double-click-to-fit inside
+    /// `viewport_rect`.
+    pub fn handle_interaction(
+        &mut self,
+        ui: &egui::Ui,
+        viewport_rect: Rect,
+        response: &egui::Response,
+    ) {
+        if response.double_clicked() {
+            self.reset();
+        }
+        if response.dragged_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Middle)
+        {
+            self.pan += response.drag_delta();
+        }
+        if response.hovered() {
+            let (scroll_y, pointer_pos) =
+                ui.input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
+            if scroll_y.abs() > 0.01 {
+                let factor = (1.0 + scroll_y * 0.0025).clamp(0.5, 2.0);
+                let old_zoom = self.zoom;
+                let new_zoom = (old_zoom * factor).clamp(0.25, 16.0);
+                if (new_zoom - old_zoom).abs() > 1e-4 {
+                    let center = viewport_rect.center();
+                    let anchor = pointer_pos.unwrap_or(center) - center;
+                    let ratio = new_zoom / old_zoom;
+                    self.pan = anchor - (anchor - self.pan) * ratio;
+                    self.zoom = new_zoom;
+                }
+            }
+        }
+    }
+
+    /// Transform a fitted base rect around `viewport_center` using `zoom` and `pan`.
+    pub fn transform_rect(&self, base_rect: Rect, viewport_center: egui::Pos2) -> Rect {
+        let min = viewport_center + (base_rect.min - viewport_center) * self.zoom + self.pan;
+        let size = base_rect.size() * self.zoom;
+        Rect::from_min_size(min, size)
+    }
+
+    /// Draw the compact footer bar with zoom percentage, hints, and a Fit button.
+    pub fn draw_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        chrome: &PanelChrome,
+        footer_rect: Rect,
+    ) {
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(footer_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                let pct = (self.zoom * 100.0).round() as i32;
+                ui.label(
+                    egui::RichText::new(format!("{pct}% · Scroll: zoom · Drag: pan")).weak(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if chrome.button(ui, "Fit", ButtonStyle::plain()).clicked() {
+                        self.reset();
+                    }
+                });
+            },
+        );
     }
 }
 

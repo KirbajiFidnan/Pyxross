@@ -89,10 +89,41 @@ impl DockManager {
     }
 
     pub fn show_inside(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
+        self.show_inside_with_docked_enabled(ui, chrome, true);
+    }
+
+    /// Renders all docked and floating panels inside `ui`. When
+    /// `docked_enabled` is `false` (no open document), docked panels are
+    /// disabled, shaded, and non-interactive while floating panels (such as
+    /// Create Document, Import, Style, and Color Picker) stay interactive.
+    pub fn show_inside_with_docked_enabled(
+        &mut self,
+        ui: &mut egui::Ui,
+        chrome: &PanelChrome,
+        docked_enabled: bool,
+    ) {
         let viewport = ui.max_rect();
         ui.set_min_size(viewport.size());
         let ctx = ui.ctx().clone();
-        self.show_docks(ui, viewport, chrome);
+        if docked_enabled {
+            self.show_docks(ui, viewport, chrome);
+        } else {
+            ui.add_enabled_ui(false, |ui| {
+                self.show_docks(ui, viewport, chrome);
+            });
+            let shade = egui::Color32::from_black_alpha(110);
+            for (tag, side) in [(0u8, DockSide::Left), (1, DockSide::Right), (2, DockSide::Bottom)] {
+                let r = self.dock_rect(side, viewport);
+                if r.width() > 0.0 && r.height() > 0.0 {
+                    ui.painter().rect_filled(r, 0.0, shade);
+                    let _ = ui.interact(
+                        r,
+                        ui.id().with(("dock-disabled-shade", tag)),
+                        egui::Sense::click_and_drag(),
+                    );
+                }
+            }
+        }
         self.show_floating(&ctx, viewport, chrome);
         self.order_floating(&ctx);
     }

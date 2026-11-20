@@ -190,6 +190,17 @@ fn action_label(action: Action) -> &'static str {
         Action::SaveProject => "Save project",
         Action::SaveProjectAs => "Save project as",
         Action::OpenProject => "Open project",
+        Action::ImportImages => "Import images",
+        Action::ImportGif => "Import GIF",
+        Action::ImportPyxel => "Import Pyxel",
+        Action::ImportAseprite => "Import Aseprite",
+        Action::ImportImage2Pixel => "Image to pixel",
+        Action::ExportImage => "Export image",
+        Action::ExportAnimation => "Export animation",
+        Action::ExportPyxel => "Export .pyxel",
+        Action::ExportAseprite => "Export .ase",
+        Action::ExportSelected => "Export selection",
+        Action::ResizeCanvas => "Resize canvas",
     }
 }
 
@@ -214,7 +225,7 @@ pub(crate) fn binding_label(binding: Option<KeyBinding>) -> String {
     parts.join("+")
 }
 
-fn logical_keys() -> [crate::input::LogicalKey; 25] {
+fn logical_keys() -> [crate::input::LogicalKey; 26] {
     [
         crate::input::LogicalKey::Z,
         crate::input::LogicalKey::Y,
@@ -240,6 +251,7 @@ fn logical_keys() -> [crate::input::LogicalKey; 25] {
         crate::input::LogicalKey::T,
         crate::input::LogicalKey::A,
         crate::input::LogicalKey::O,
+        crate::input::LogicalKey::P,
         crate::input::LogicalKey::Q,
     ]
 }
@@ -270,6 +282,7 @@ fn key_label(key: crate::input::LogicalKey) -> &'static str {
         crate::input::LogicalKey::T => "T",
         crate::input::LogicalKey::A => "A",
         crate::input::LogicalKey::O => "O",
+        crate::input::LogicalKey::P => "P",
         crate::input::LogicalKey::Q => "Q",
     }
 }

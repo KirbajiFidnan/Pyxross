@@ -1305,29 +1305,22 @@ fn load_file_preview(path: &Path) -> Option<Result<(u32, u32, Vec<u8>, String), 
             Ok(bytes) => match crate::core::aseprite::parse_aseprite_bytes(&bytes) {
                 Ok(parsed) => {
                     let frame_count = parsed.frames.len();
+                    let fw = parsed.frame_w.max(1);
+                    let fh = parsed.frame_h.max(1);
                     match crate::core::aseprite::build_aseprite_import(
                         &parsed,
                         "preview",
-                        crate::core::aseprite::AsepriteLayoutMode::SingleRow,
+                        crate::core::aseprite::AsepriteLayoutMode::SingleCanvas {
+                            px_w: fw,
+                            px_h: fh,
+                        },
                     ) {
                         Ok(imp) => {
-                            let comp = imp
-                                .layers
-                                .composite_layers(&crate::core::tilemap::TilePalette::default());
-                            let w = imp.frame_w.min(imp.width as u32).max(1);
-                            let h = imp.frame_h.min(imp.height as u32).max(1);
-                            let full_w = imp.width;
-                            let bytes = comp.as_bytes();
-                            let mut first_rgba = vec![0u8; (w * h * 4) as usize];
-                            for y in 0..h as usize {
-                                let src_off = y * full_w * 4;
-                                let dst_off = y * w as usize * 4;
-                                let row_len = w as usize * 4;
-                                first_rgba[dst_off..dst_off + row_len]
-                                    .copy_from_slice(&bytes[src_off..src_off + row_len]);
-                            }
-                            let (pw, ph, rgba) = downscale_preview_if_needed(w, h, first_rgba);
-                            Ok((pw, ph, rgba, format!("{w}x{h} • {frame_count}f Aseprite")))
+                            let w = imp.width as u32;
+                            let h = imp.height as u32;
+                            let (pw, ph, rgba) =
+                                downscale_preview_if_needed(w, h, imp.preview_rgba);
+                            Ok((pw, ph, rgba, format!("{fw}x{fh} • {frame_count}f Aseprite")))
                         }
                         Err(_) => Err("Preview error".to_owned()),
                     }

@@ -46,10 +46,22 @@ pub enum Action {
     SaveProjectAs,
     /// Open a project directory (Ctrl/Cmd+O).
     OpenProject,
+    ImportImages,
+    ImportGif,
+    ImportPyxel,
+    ImportAseprite,
+    #[serde(rename = "import_image2pixel")]
+    ImportImage2Pixel,
+    ExportImage,
+    ExportAnimation,
+    ExportPyxel,
+    ExportAseprite,
+    ExportSelected,
+    ResizeCanvas,
 }
 
 impl Action {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 43] = [
         Self::Undo,
         Self::Redo,
         Self::Copy,
@@ -82,6 +94,17 @@ impl Action {
         Self::SaveProject,
         Self::SaveProjectAs,
         Self::OpenProject,
+        Self::ImportImages,
+        Self::ImportGif,
+        Self::ImportPyxel,
+        Self::ImportAseprite,
+        Self::ImportImage2Pixel,
+        Self::ExportImage,
+        Self::ExportAnimation,
+        Self::ExportPyxel,
+        Self::ExportAseprite,
+        Self::ExportSelected,
+        Self::ResizeCanvas,
     ];
 }
 
@@ -112,6 +135,7 @@ pub enum LogicalKey {
     T,
     A,
     O,
+    P,
     Q,
 }
 
@@ -161,6 +185,7 @@ impl LogicalKey {
             Self::T => "T",
             Self::A => "A",
             Self::O => "O",
+            Self::P => "P",
             Self::Q => "Q",
         }
     }
@@ -303,6 +328,7 @@ impl Keymap {
             LogicalKey::T => egui::Key::T,
             LogicalKey::A => egui::Key::A,
             LogicalKey::O => egui::Key::O,
+            LogicalKey::P => egui::Key::P,
             LogicalKey::Q => egui::Key::Q,
         };
         hit(key)

@@ -8,13 +8,13 @@
 //!   Pyxel Edit).
 //! - `tile{i}.png` — RGBA pixel data for tileset tile `i`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::core::buffer::PixelBuffer;
 use crate::core::color::Color;
@@ -24,6 +24,17 @@ use crate::core::model::{AnimationSet, BlendMode, Frame, Layer, LayerId, LayerSt
 use crate::core::palette::Palette;
 use crate::core::png_codec::{decode_png, encode_png};
 use crate::core::tilemap::{Tile, TileCell, TileId, TileMap, TilePalette, TileSize};
+
+/// Upper bound on uncompressed bytes for any single ZIP entry in a `.pyxel` archive.
+const MAX_ZIP_ENTRY_BYTES: usize = 128 * 1024 * 1024;
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Everything extracted from a `.pyxel` archive, ready to inspect in the
 /// Import Pyxel preview panel or convert into a `ProjectSession`.
@@ -170,7 +181,7 @@ struct PyxelAnimation {
     length: usize,
     #[serde(default)]
     frame_duration: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     frame_duration_multipliers: Vec<u32>,
 }
 
@@ -193,6 +204,115 @@ fn default_palette_width() -> usize {
 
 fn default_palette_height() -> usize {
     5
+}
+
+/// Reorders Pyxel Edit's top-to-bottom layer list into Pyxross `LayerStack`'s
+/// bottom-to-top DFS pre-order (every parent group appears BEFORE its children,
+/// while sibling order is reversed from top-to-bottom to bottom-to-top).
+fn order_pyxel_layers_dfs_bottom_to_top<'a>(
+    sorted_layers: &[(usize, &'a PyxelLayer)],
+) -> Vec<(usize, &'a PyxelLayer)> {
+    let valid_ids: HashSet<usize> = sorted_layers.iter().map(|(idx, _)| *idx).collect();
+    let by_idx: HashMap<usize, &'a PyxelLayer> = sorted_layers.iter().copied().collect();
+    let mut children_map: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+    for &(idx, layer) in sorted_layers {
+        let parent = if layer.parent_index >= 0 {
+            let p = layer.parent_index as usize;
+            if p != idx && valid_ids.contains(&p) {
+                Some(p)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        children_map.entry(parent).or_default().push(idx);
+    }
+
+    let mut out = Vec::with_capacity(sorted_layers.len());
+    let mut visited = HashSet::with_capacity(sorted_layers.len());
+
+    fn visit<'a>(
+        idx: usize,
+        by_idx: &HashMap<usize, &'a PyxelLayer>,
+        children_map: &HashMap<Option<usize>, Vec<usize>>,
+        visited: &mut HashSet<usize>,
+        out: &mut Vec<(usize, &'a PyxelLayer)>,
+    ) {
+        if !visited.insert(idx) {
+            return;
+        }
+        if let Some(&layer) = by_idx.get(&idx) {
+            out.push((idx, layer));
+        }
+        if let Some(children) = children_map.get(&Some(idx)) {
+            for &child_idx in children.iter().rev() {
+                visit(child_idx, by_idx, children_map, visited, out);
+            }
+        }
+    }
+
+    if let Some(roots) = children_map.get(&None) {
+        for &root_idx in roots.iter().rev() {
+            visit(root_idx, &by_idx, &children_map, &mut visited, &mut out);
+        }
+    }
+    // Safety fallback for any cyclic parent references.
+    for &(idx, _) in sorted_layers.iter().rev() {
+        if !visited.contains(&idx) {
+            visit(idx, &by_idx, &children_map, &mut visited, &mut out);
+        }
+    }
+    out
+}
+
+/// Reorders Pyxross `LayerStack`'s bottom-to-top DFS pre-order into Pyxel Edit's
+/// top-to-bottom DFS pre-order (every parent group appears BEFORE its children,
+/// while sibling order is reversed to top-to-bottom).
+fn order_pyxross_layers_dfs_top_to_bottom<'a>(layers: &'a LayerStack) -> Vec<&'a Layer> {
+    let all: Vec<&'a Layer> = layers.iter().collect();
+    let valid_ids: HashSet<LayerId> = all.iter().map(|l| l.id).collect();
+    let by_id: HashMap<LayerId, &'a Layer> = all.iter().map(|l| (l.id, *l)).collect();
+    let mut children_map: HashMap<Option<LayerId>, Vec<LayerId>> = HashMap::new();
+    for l in &all {
+        let parent = l.parent.filter(|p| *p != l.id && valid_ids.contains(p));
+        children_map.entry(parent).or_default().push(l.id);
+    }
+
+    let mut out = Vec::with_capacity(all.len());
+    let mut visited = HashSet::with_capacity(all.len());
+
+    fn visit<'a>(
+        id: LayerId,
+        by_id: &HashMap<LayerId, &'a Layer>,
+        children_map: &HashMap<Option<LayerId>, Vec<LayerId>>,
+        visited: &mut HashSet<LayerId>,
+        out: &mut Vec<&'a Layer>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        if let Some(&layer) = by_id.get(&id) {
+            out.push(layer);
+        }
+        if let Some(children) = children_map.get(&Some(id)) {
+            for &child_id in children.iter().rev() {
+                visit(child_id, by_id, children_map, visited, out);
+            }
+        }
+    }
+
+    if let Some(roots) = children_map.get(&None) {
+        for &root_id in roots.iter().rev() {
+            visit(root_id, &by_id, &children_map, &mut visited, &mut out);
+        }
+    }
+    for l in all.iter().rev() {
+        if !visited.contains(&l.id) {
+            visit(l.id, &by_id, &children_map, &mut visited, &mut out);
+        }
+    }
+    out
 }
 
 /// Imports a `.pyxel` archive from raw bytes into [`PyxelImport`].
@@ -248,7 +368,7 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
     }
 
     // 2. Layers: Pyxel Edit stores layers top-to-bottom ("0" = top).
-    // Pyxross `LayerStack` is bottom-to-top, so we iterate in reverse.
+    // Pyxross `LayerStack` is bottom-to-top DFS pre-order (parent BEFORE children).
     let mut sorted_layers: Vec<(usize, &PyxelLayer)> = doc
         .canvas
         .layers
@@ -256,17 +376,43 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
         .filter_map(|(k, v)| k.parse::<usize>().ok().map(|idx| (idx, v)))
         .collect();
     sorted_layers.sort_by_key(|(idx, _)| *idx);
+    let ordered_layers = order_pyxel_layers_dfs_bottom_to_top(&sorted_layers);
+
+    // Determine soloed visibility set (if any layer is soloed, only soloed layers
+    // and their ancestor groups remain visible).
+    let any_soloed = sorted_layers.iter().any(|(_, l)| l.soloed);
+    let mut solo_visible: HashSet<usize> = HashSet::new();
+    if any_soloed {
+        let parent_map: HashMap<usize, i32> = sorted_layers
+            .iter()
+            .map(|(idx, l)| (*idx, l.parent_index))
+            .collect();
+        for &(idx, l) in &sorted_layers {
+            if l.soloed {
+                solo_visible.insert(idx);
+                let mut cur = l.parent_index;
+                let mut hops = 0usize;
+                while cur >= 0 && hops < sorted_layers.len() {
+                    let p = cur as usize;
+                    solo_visible.insert(p);
+                    cur = parent_map.get(&p).copied().unwrap_or(-1);
+                    hops += 1;
+                }
+            }
+        }
+    }
 
     let cols = ((width as u32) / tile_w).max(1);
     let rows = ((height as u32) / tile_h).max(1);
 
-    let mut layers = LayerStack::new(width, height);
+    let mut layers = LayerStack::try_new(width, height)
+        .ok_or_else(|| "Canvas dimensions exceed addressable memory".to_owned())?;
     let initial_id = layers.active_layer_id();
     let mut pyxel_idx_to_layer_id: HashMap<usize, LayerId> = HashMap::new();
-    let mut built_layers: Vec<(usize, Layer)> = Vec::with_capacity(sorted_layers.len());
+    let mut built_layers: Vec<(usize, Layer)> = Vec::with_capacity(ordered_layers.len());
     let mut next_layer_id: u64 = 2;
 
-    for (pyx_idx, pyx_layer) in sorted_layers.iter().rev() {
+    for (pyx_idx, pyx_layer) in &ordered_layers {
         let id = LayerId::new(next_layer_id);
         next_layer_id += 1;
         pyxel_idx_to_layer_id.insert(*pyx_idx, id);
@@ -329,12 +475,18 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
             pyx_layer.name.clone()
         };
 
+        let visible = if any_soloed {
+            solo_visible.contains(pyx_idx) && !pyx_layer.hidden && !pyx_layer.muted
+        } else {
+            !pyx_layer.hidden && !pyx_layer.muted
+        };
+
         built_layers.push((
             *pyx_idx,
             Layer {
                 id,
                 name,
-                visible: !pyx_layer.hidden,
+                visible,
                 opacity: (pyx_layer.alpha as f32 / 255.0).clamp(0.0, 1.0),
                 blend: parse_blend_mode(&pyx_layer.blend_mode),
                 buffer,
@@ -354,7 +506,7 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
         .collect();
     for (pyx_idx, layer) in &mut built_layers {
         if let Some(&p_idx) = parent_lookup.get(pyx_idx) {
-            if p_idx >= 0 {
+            if p_idx >= 0 && p_idx as usize != *pyx_idx {
                 layer.parent = pyxel_idx_to_layer_id.get(&(p_idx as usize)).copied();
             }
         }
@@ -365,12 +517,13 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
             layers.insert_layer(layer, i);
         }
         layers.remove_layer(initial_id);
-        let top_id = layers
-            .iter()
-            .nth(doc.canvas.current_layer_index.min(layers.len().saturating_sub(1)))
-            .map(|l| l.id)
+        let active_id = pyxel_idx_to_layer_id
+            .get(&doc.canvas.current_layer_index)
+            .copied()
+            .filter(|id| layers.layer(*id).is_some_and(|l| !l.is_group))
+            .or_else(|| layers.iter().filter(|l| !l.is_group).last().map(|l| l.id))
             .unwrap_or_else(|| layers.active_layer_id());
-        let _ = layers.set_active(top_id);
+        let _ = layers.set_active(active_id);
     }
 
     // 3. Animations
@@ -411,7 +564,9 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
                 .copied()
                 .unwrap_or(100)
                 .max(1);
-            let delay_ms = (base_ms.saturating_mul(mult) / 100).max(10);
+            let delay_ms = ((u64::from(base_ms) * u64::from(mult) + 50) / 100)
+                .max(10)
+                .min(u32::MAX as u64) as u32;
             seq.push(Frame::new(Region::new(rect, format!("Frame {}", f + 1)), delay_ms));
         }
         if first_anim {
@@ -428,25 +583,36 @@ pub fn import_pyxel_bytes(bytes: &[u8], fallback_name: &str) -> Result<PyxelImpo
         }
     }
 
-    // 4. Palette
-    let mut pal_entries: Vec<(usize, Color)> = doc
+    // 4. Palette: preserve grid indices including `null` empty slots as `[0, 0, 0, 0]`.
+    let mut parsed_slots: Vec<(usize, Option<Color>)> = doc
         .palette
         .colors
         .iter()
         .filter_map(|(k, v)| {
             let idx = k.parse::<usize>().ok()?;
-            let hex = v.as_deref()?;
-            parse_argb_hex(hex).map(|c| (idx, c))
+            let color = v.as_deref().and_then(parse_argb_hex);
+            Some((idx, color))
         })
         .collect();
-    pal_entries.sort_by_key(|(idx, _)| *idx);
-    let palette = if pal_entries.is_empty() {
+    parsed_slots.sort_by_key(|(idx, _)| *idx);
+    let has_any_color = parsed_slots.iter().any(|(_, c)| c.is_some());
+    let palette = if !has_any_color {
         None
     } else {
-        let colors: Vec<[u8; 4]> = pal_entries
-            .into_iter()
-            .map(|(_, c)| [c.r, c.g, c.b, c.a])
-            .collect();
+        let max_idx = parsed_slots
+            .iter()
+            .filter_map(|(idx, c)| c.is_some().then_some(*idx))
+            .max()
+            .unwrap_or(0);
+        let slot_count = (max_idx + 1).max(doc.palette.num_colors).min(65_536);
+        let mut colors = vec![[0u8, 0, 0, 0]; slot_count];
+        for (idx, maybe_c) in parsed_slots {
+            if idx < colors.len() {
+                if let Some(c) = maybe_c {
+                    colors[idx] = [c.r, c.g, c.b, c.a];
+                }
+            }
+        }
         Palette::new("Pyxel Palette", colors).ok()
     };
 
@@ -507,9 +673,9 @@ pub fn export_pyxel_bytes(
         entries.push((format!("tile{idx}.png"), png));
     }
 
-    // 2. Layers: reverse Pyxross bottom-to-top into Pyxel Edit top-to-bottom.
-    let mut layer_vec: Vec<&Layer> = layers.iter().collect();
-    layer_vec.reverse();
+    // 2. Layers: convert Pyxross bottom-to-top DFS pre-order into Pyxel Edit
+    // top-to-bottom DFS pre-order (groups still precede their children).
+    let layer_vec: Vec<&Layer> = order_pyxross_layers_dfs_top_to_bottom(layers);
     let id_to_pyxel_idx: HashMap<LayerId, usize> = layer_vec
         .iter()
         .enumerate()
@@ -525,29 +691,29 @@ pub fn export_pyxel_bytes(
             current_layer_index = idx;
         }
         let mut tile_refs = BTreeMap::new();
-        let mut combined_rgba = layer.buffer.as_bytes().to_vec();
+        // Use Pyxross's canonical effective buffer (tilemap composited OVER
+        // pixel buffer, matching composite_layer_over) so Pyxel Edit displays
+        // the exact composited layer.
+        let eff = layer.effective_pixel_buffer(tile_palette);
         if let Some(tm) = &layer.tilemap {
-            // Composite tilemap pixels into `layer{idx}.png` so Pyxel Edit and
-            // previews display the full layer even before tile re-bake.
-            let mut tm_buf = PixelBuffer::new(width, height);
-            tm.rasterize(tile_palette, &mut tm_buf);
-            let tm_rgba = tm_buf.as_bytes();
-            for p in (0..combined_rgba.len()).step_by(4) {
-                if p + 3 < combined_rgba.len() && combined_rgba[p + 3] == 0 && tm_rgba[p + 3] > 0 {
-                    combined_rgba[p..p + 4].copy_from_slice(&tm_rgba[p..p + 4]);
-                }
-            }
             for cy in 0..rows.min(tm.rows) {
                 for cx in 0..cols.min(tm.cols) {
                     if let Some(cell) = tm.cell((cx, cy)) {
                         if let Some(&tile_idx) = tile_id_to_idx.get(&cell.tile_id) {
                             let linear = cy * cols + cx;
+                            // Pyxel Edit has no `flipY`; represent `flip_y` losslessly
+                            // as `flip_x = !flip_x` + 180° CW rotation.
+                            let (flip_x, rot) = if cell.flip_y {
+                                (!cell.flip_x, (cell.rotation + 2) % 4)
+                            } else {
+                                (cell.flip_x, cell.rotation % 4)
+                            };
                             tile_refs.insert(
                                 linear.to_string(),
                                 PyxelTileRef {
                                     index: tile_idx,
-                                    flip_x: cell.flip_x,
-                                    rot: cell.rotation % 4,
+                                    flip_x,
+                                    rot,
                                 },
                             );
                         }
@@ -555,7 +721,7 @@ pub fn export_pyxel_bytes(
                 }
             }
         }
-        let png = encode_png(width, height, &combined_rgba)
+        let png = encode_png(width, height, eff.as_bytes())
             .map_err(|e| format!("Failed to encode layer{idx}.png: {e}"))?;
         entries.push((format!("layer{idx}.png"), png));
 
@@ -586,27 +752,32 @@ pub fn export_pyxel_bytes(
         );
     }
 
-    // 3. Animations
+    // 3. Animations (contiguous string keys "0", "1", ...)
     let mut pyx_anims: BTreeMap<String, PyxelAnimation> = BTreeMap::new();
-    for (idx, seq) in animations.iter().enumerate() {
+    let mut anim_out_idx = 0usize;
+    for seq in animations.iter() {
         if seq.is_empty() {
             continue;
         }
         let first_rect = seq.frame(0).map(|f| f.region().rect());
         let base_tile = first_rect
             .map(|r| {
-                let cx = (r.x.max(0) as u32) / tile_w;
-                let cy = (r.y.max(0) as u32) / tile_h;
+                let cx = ((r.x.max(0) as u32) / tile_w).min(cols.saturating_sub(1));
+                let cy = ((r.y.max(0) as u32) / tile_h).min(rows.saturating_sub(1));
                 (cy * cols + cx) as usize
             })
             .unwrap_or(0);
         let base_delay = seq.frame(0).map(|f| f.delay_ms().max(1)).unwrap_or(100);
         let mults: Vec<u32> = (0..seq.len())
             .filter_map(|i| seq.frame(i))
-            .map(|f| ((f.delay_ms().max(1) * 100) / base_delay).max(1))
+            .map(|f| {
+                let d = u64::from(f.delay_ms().max(1));
+                let b = u64::from(base_delay);
+                ((d * 100 + b / 2) / b).max(1).min(u32::MAX as u64) as u32
+            })
             .collect();
         pyx_anims.insert(
-            idx.to_string(),
+            anim_out_idx.to_string(),
             PyxelAnimation {
                 name: seq.name().to_owned(),
                 base_tile,
@@ -615,16 +786,19 @@ pub fn export_pyxel_bytes(
                 frame_duration_multipliers: mults,
             },
         );
+        anim_out_idx += 1;
     }
 
-    // 4. Palette
+    // 4. Palette: export `[0, 0, 0, 0]` empty slots as `null` to preserve grid layout.
     let mut pal_colors = BTreeMap::new();
     let num_colors = if let Some(pal) = palette {
         for (i, c) in pal.colors.iter().enumerate() {
-            pal_colors.insert(
-                i.to_string(),
-                Some(format!("{:02x}{:02x}{:02x}{:02x}", c[3], c[0], c[1], c[2])),
-            );
+            let entry = if *c == [0, 0, 0, 0] {
+                None
+            } else {
+                Some(format!("{:02x}{:02x}{:02x}{:02x}", c[3], c[0], c[1], c[2]))
+            };
+            pal_colors.insert(i.to_string(), entry);
         }
         pal.colors.len()
     } else {
@@ -781,14 +955,20 @@ fn unpack_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let entry_count = read_u16_le(bytes, eocd + 10)? as usize;
     let cd_size = read_u32_le(bytes, eocd + 12)? as usize;
     let cd_offset = read_u32_le(bytes, eocd + 16)? as usize;
-    if cd_offset + cd_size > eocd {
+    let cd_end = cd_offset
+        .checked_add(cd_size)
+        .ok_or_else(|| "Invalid ZIP: central directory offset overflow".to_owned())?;
+    if cd_end > eocd {
         return Err("Invalid ZIP: central directory out of bounds".to_owned());
     }
 
-    let mut out = Vec::with_capacity(entry_count);
+    let mut out = Vec::with_capacity(entry_count.min(4096));
     let mut cursor = cd_offset;
     for _ in 0..entry_count {
-        if bytes.get(cursor..cursor + 4) != Some(&[0x50, 0x4b, 0x01, 0x02]) {
+        let header_end = cursor
+            .checked_add(46)
+            .ok_or_else(|| "Invalid ZIP: central directory overflow".to_owned())?;
+        if header_end > cd_end || bytes.get(cursor..cursor + 4) != Some(&[0x50, 0x4b, 0x01, 0x02]) {
             return Err("Invalid ZIP: bad central directory header".to_owned());
         }
         let method = read_u16_le(bytes, cursor + 10)?;
@@ -800,8 +980,18 @@ fn unpack_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         let comment_len = read_u16_le(bytes, cursor + 32)? as usize;
         let local_off = read_u32_le(bytes, cursor + 42)? as usize;
 
+        if uncomp_size > MAX_ZIP_ENTRY_BYTES {
+            return Err(format!(
+                "ZIP entry exceeds {} byte uncompressed limit",
+                MAX_ZIP_ENTRY_BYTES
+            ));
+        }
+
+        let name_end = header_end
+            .checked_add(name_len)
+            .ok_or_else(|| "Invalid ZIP: entry name overflow".to_owned())?;
         let name_bytes = bytes
-            .get(cursor + 46..cursor + 46 + name_len)
+            .get(header_end..name_end)
             .ok_or("Truncated ZIP entry name")?;
         let name = std::str::from_utf8(name_bytes)
             .map_err(|_| "Non-UTF-8 ZIP entry name")?
@@ -809,26 +999,47 @@ fn unpack_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         if name.starts_with('/') || name.starts_with('\\') || name.contains("..") {
             return Err(format!("Unsafe ZIP entry name: {name}"));
         }
-        cursor += 46 + name_len + extra_len + comment_len;
+        cursor = name_end
+            .checked_add(extra_len)
+            .and_then(|v| v.checked_add(comment_len))
+            .ok_or_else(|| "Invalid ZIP: central directory cursor overflow".to_owned())?;
 
-        if bytes.get(local_off..local_off + 4) != Some(&[0x50, 0x4b, 0x03, 0x04]) {
+        let local_hdr_end = local_off
+            .checked_add(30)
+            .ok_or_else(|| "Invalid ZIP: local header offset overflow".to_owned())?;
+        if local_hdr_end > bytes.len()
+            || bytes.get(local_off..local_off + 4) != Some(&[0x50, 0x4b, 0x03, 0x04])
+        {
             return Err("Invalid ZIP: bad local file header".to_owned());
         }
         let l_name_len = read_u16_le(bytes, local_off + 26)? as usize;
         let l_extra_len = read_u16_le(bytes, local_off + 28)? as usize;
-        let data_start = local_off + 30 + l_name_len + l_extra_len;
+        let data_start = local_hdr_end
+            .checked_add(l_name_len)
+            .and_then(|v| v.checked_add(l_extra_len))
+            .ok_or_else(|| "Invalid ZIP: local data offset overflow".to_owned())?;
+        let data_end = data_start
+            .checked_add(comp_size)
+            .ok_or_else(|| "Invalid ZIP: compressed payload overflow".to_owned())?;
         let comp_slice = bytes
-            .get(data_start..data_start + comp_size)
+            .get(data_start..data_end)
             .ok_or("Truncated ZIP entry payload")?;
 
         let payload = match method {
             0 => comp_slice.to_vec(),
             8 => {
-                let mut decoder = DeflateDecoder::new(comp_slice);
-                let mut buf = Vec::with_capacity(uncomp_size);
+                let mut decoder =
+                    DeflateDecoder::new(comp_slice).take((MAX_ZIP_ENTRY_BYTES as u64) + 1);
+                let mut buf = Vec::with_capacity(uncomp_size.min(64 * 1024));
                 decoder
                     .read_to_end(&mut buf)
                     .map_err(|e| format!("Deflate decode failed for {name}: {e}"))?;
+                if buf.len() > MAX_ZIP_ENTRY_BYTES {
+                    return Err(format!(
+                        "Deflate output for {name} exceeds {} byte limit",
+                        MAX_ZIP_ENTRY_BYTES
+                    ));
+                }
                 buf
             }
             other => return Err(format!("Unsupported ZIP compression method {other}")),
@@ -979,5 +1190,128 @@ mod tests {
             reimported.palette.as_ref().map(|p| p.colors.len()),
             imp.palette.as_ref().map(|p| p.colors.len())
         );
+        // Palette grid preserves null slots (example.pyxel has 20 slots with 8..11 null).
+        let pal = imp.palette.as_ref().unwrap();
+        assert_eq!(pal.colors.len(), 20);
+        assert_eq!(pal.colors[8], [0, 0, 0, 0]);
+        assert_eq!(pal.colors[12], [0xf7, 0xe2, 0x6b, 0xff]);
+    }
+
+    #[test]
+    fn group_layers_preserve_dfs_preorder_and_current_layer_index_round_trip() {
+        // Build a .pyxel archive with:
+        //   0: Group A (group_layer, parentIndex: -1)
+        //   1: Top Child (tile_layer, parentIndex: 0)
+        //   2: Bottom Child (tile_layer, parentIndex: 0)
+        //   3: Base (tile_layer, parentIndex: -1)
+        // and currentLayerIndex = 1 (Top Child), plus animation with `frameDurationMultipliers: null`.
+        let doc_json = serde_json::json!({
+            "name": "Grouped",
+            "version": "0.4.95",
+            "canvas": {
+                "width": 16,
+                "height": 16,
+                "tileWidth": 16,
+                "tileHeight": 16,
+                "numLayers": 4,
+                "currentLayerIndex": 1,
+                "layers": {
+                    "0": { "name": "Group A", "type": "group_layer", "parentIndex": -1, "alpha": 255, "hidden": false, "blendMode": "normal", "tileRefs": {} },
+                    "1": { "name": "Top Child", "type": "tile_layer", "parentIndex": 0, "alpha": 255, "hidden": false, "blendMode": "normal", "tileRefs": {} },
+                    "2": { "name": "Bottom Child", "type": "tile_layer", "parentIndex": 0, "alpha": 255, "hidden": false, "blendMode": "normal", "tileRefs": {} },
+                    "3": { "name": "Base", "type": "tile_layer", "parentIndex": -1, "alpha": 255, "hidden": false, "blendMode": "normal", "tileRefs": {} }
+                }
+            },
+            "tileset": { "tileWidth": 16, "tileHeight": 16, "numTiles": 0, "tilesWide": 8, "fixedWidth": true },
+            "animations": {
+                "0": { "name": "Idle", "baseTile": 0, "length": 1, "frameDuration": 120, "frameDurationMultipliers": null }
+            },
+            "palette": { "numColors": 0, "width": 12, "height": 5, "colors": {} },
+            "settings": {}
+        });
+        let doc_bytes = serde_json::to_vec(&doc_json).unwrap();
+        let blank_png = encode_png(16, 16, &vec![0u8; 16 * 16 * 4]).unwrap();
+        let archive = pack_zip(&[
+            ("docData.json", &doc_bytes),
+            ("layer0.png", &blank_png),
+            ("layer1.png", &blank_png),
+            ("layer2.png", &blank_png),
+            ("layer3.png", &blank_png),
+        ])
+        .unwrap();
+
+        let imp = import_pyxel_bytes(&archive, "fallback").expect("should import grouped .pyxel");
+        assert_eq!(imp.layers.active_layer().name, "Top Child");
+        assert_eq!(imp.animations.get(0).unwrap().name(), "Idle");
+
+        // Verify DFS pre-order: every parent MUST appear BEFORE its children.
+        let mut seen = HashSet::new();
+        for l in imp.layers.iter() {
+            if let Some(pid) = l.parent {
+                assert!(
+                    seen.contains(&pid),
+                    "Layer {} parent {:?} must appear before child in DFS pre-order",
+                    l.name,
+                    pid
+                );
+            }
+            seen.insert(l.id);
+        }
+
+        // Round-trip export -> reimport must preserve group hierarchy and active layer.
+        let exported = export_pyxel_bytes(
+            &imp.name,
+            imp.tile_size,
+            &imp.layers,
+            &imp.tile_palette,
+            &imp.animations,
+            imp.palette.as_ref(),
+        )
+        .unwrap();
+        let re = import_pyxel_bytes(&exported, "re").unwrap();
+        assert_eq!(re.layers.active_layer().name, "Top Child");
+        let re_group = re.layers.iter().find(|l| l.name == "Group A").unwrap();
+        let re_top = re.layers.iter().find(|l| l.name == "Top Child").unwrap();
+        let re_bot = re.layers.iter().find(|l| l.name == "Bottom Child").unwrap();
+        assert!(re_group.is_group);
+        assert_eq!(re_top.parent, Some(re_group.id));
+        assert_eq!(re_bot.parent, Some(re_group.id));
+    }
+
+    #[test]
+    fn export_pyxel_preserves_flip_y_tile_orientation_pixel_for_pixel() {
+        let tile_size = TileSize::new(2, 2);
+        let mut tile_palette = TilePalette::new();
+        // Distinct 2x2 tile: top-left=red, top-right=green, bottom-left=blue, bottom-right=white.
+        let tile_px = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, // row 0
+            0, 0, 255, 255, 255, 255, 255, 255, // row 1
+        ];
+        let tid = tile_palette.add(Tile {
+            id: TileId(0),
+            w: 2,
+            h: 2,
+            pixels: tile_px,
+        });
+        let mut layers = LayerStack::new(2, 2);
+        let mut tm = TileMap::new(tile_size, 1, 1);
+        let mut cell = TileCell::new(tid);
+        cell.flip_y = true;
+        tm.set_cell((0, 0), Some(cell));
+        layers.active_layer_mut().tilemap = Some(tm);
+
+        let before = layers.composite_layers(&tile_palette);
+        let exported = export_pyxel_bytes(
+            "FlipY",
+            tile_size,
+            &layers,
+            &tile_palette,
+            &AnimationSet::new(),
+            None,
+        )
+        .unwrap();
+        let re = import_pyxel_bytes(&exported, "re").unwrap();
+        let after = re.layers.composite_layers(&re.tile_palette);
+        assert_eq!(before.as_bytes(), after.as_bytes());
     }
 }
