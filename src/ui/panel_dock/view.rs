@@ -176,12 +176,38 @@ impl DockManager {
     }
 
     /// Raises the most recently used floating panel. egui lifts marked layers
-    /// above unmarked ones but keeps their relative order, so exactly one layer
-    /// is marked per frame - the top of the MRU stack.
+    /// above unmarked ones while preserving their relative order, so ONLY the
+    /// single topmost panel (`floating_order().last()`) is moved to top each
+    /// frame — calling `move_to_top` on all panels would keep stale relative
+    /// order and let background panels intercept clicks.
     fn order_floating(&self, ctx: &egui::Context) {
         if let Some(top) = self.floating_order().last() {
             ctx.move_to_top(egui::LayerId::new(Order::Middle, floating_window_id(*top)));
         }
+    }
+
+    /// Returns `true` if `point` is covered by a floating panel above `id` (or
+    /// by any floating panel when `id` is docked) or by a foreground popup layer.
+    fn is_point_occluded_for_panel(&self, ctx: &egui::Context, id: PanelId, point: Pos2) -> bool {
+        if ctx
+            .layer_id_at(point)
+            .is_some_and(|layer| layer.order > Order::Middle)
+        {
+            return true;
+        }
+        let is_floating = self.placement(id) == Some(PanelPlacement::Floating);
+        for other in self.floating_order().iter().rev() {
+            if is_floating && *other == id {
+                return false;
+            }
+            if self
+                .floating_rect(*other)
+                .is_some_and(|rect| rect.contains(point))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn show_docks(&mut self, ui: &mut egui::Ui, viewport: Rect, chrome: &PanelChrome) {
@@ -477,11 +503,23 @@ impl DockManager {
     }
 
     fn show_floating(&mut self, ctx: &egui::Context, viewport: Rect, chrome: &PanelChrome) {
-        let floating_ids: Vec<PanelId> = self
+        // Render floating panels in z-order (bottom to top) so egui's layer
+        // order and our MRU stack stay aligned. Any floating panel not yet in
+        // `floating_order()` is older than tracked ones and goes at the bottom.
+        let mut floating_ids: Vec<PanelId> = self
             .panels
             .iter()
-            .filter_map(|(id, entry)| (entry.placement == PanelPlacement::Floating).then_some(*id))
+            .filter_map(|(id, entry)| {
+                (entry.placement == PanelPlacement::Floating && !self.floating_order().contains(id))
+                    .then_some(*id)
+            })
             .collect();
+        for id in self.floating_order() {
+            if self.placement(*id) == Some(PanelPlacement::Floating) {
+                floating_ids.push(*id);
+            }
+        }
+        let mut rendered_rects: Vec<(PanelId, Rect)> = Vec::with_capacity(floating_ids.len());
         for id in floating_ids {
             let Some(rect) = self.floating_rect(id) else {
                 continue;
@@ -530,18 +568,8 @@ impl DockManager {
                     );
                     self.paint_panel(window_ui, id, chrome, PanelScope::Floating)
                 });
-            // Any press inside the window raises it to the top of the stack.
-            let pressed_inside = result.as_ref().is_some_and(|inner| {
-                ctx.input(|input| {
-                    input.pointer.any_pressed()
-                        && input
-                            .pointer
-                            .interact_pos()
-                            .is_some_and(|point| inner.response.rect.contains(point))
-                })
-            });
-            if pressed_inside {
-                self.raise_floating(id);
+            if let Some(inner) = &result {
+                rendered_rects.push((id, inner.response.rect));
             }
             let drag_after = self
                 .drag
@@ -553,6 +581,41 @@ impl DockManager {
                 }
             }
             self.clamp_floating(id, viewport);
+        }
+        // Raise ONLY the topmost floating panel under the press point, and
+        // never when clicking a foreground popup (e.g. a ComboBox dropdown).
+        // Prefer egui's own topmost hit-tested layer (`layer_id_at`) so an
+        // occluded panel behind the front window can NEVER steal z-order.
+        let press_pos = ctx.input(|input| {
+            if input.pointer.any_pressed() {
+                input.pointer.interact_pos()
+            } else {
+                None
+            }
+        });
+        if let Some(point) = press_pos {
+            let hit_layer = ctx.layer_id_at(point);
+            let popup_on_top = hit_layer.is_some_and(|layer| layer.order > Order::Middle);
+            if !popup_on_top {
+                let layer_match = hit_layer
+                    .filter(|layer| layer.order == Order::Middle)
+                    .and_then(|layer| {
+                        rendered_rects
+                            .iter()
+                            .find(|(id, _)| floating_window_id(*id) == layer.id)
+                            .map(|(id, _)| *id)
+                    });
+                let top_hit = layer_match.or_else(|| {
+                    rendered_rects
+                        .iter()
+                        .rev()
+                        .find(|(_, rect)| rect.contains(point))
+                        .map(|(id, _)| *id)
+                });
+                if let Some(id) = top_hit {
+                    self.raise_floating(id);
+                }
+            }
         }
     }
 
@@ -582,7 +645,10 @@ impl DockManager {
                 .press_origin()
                 .is_some_and(|origin| pop_out_rect.is_some_and(|rect| rect.contains(origin)))
         });
+        let occluded = pointer
+            .is_some_and(|position| self.is_point_occluded_for_panel(ctx, id, position));
         let drag_started = !pop_out_pressed
+            && !occluded
             && (response.drag_started()
                 || (primary_pressed
                     && pointer.is_some_and(|position| response.rect.contains(position))));

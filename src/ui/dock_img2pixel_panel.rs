@@ -54,6 +54,8 @@ pub enum Img2PixelEvent {
     ImportToActiveLayer {
         output: Img2PixelOutput,
     },
+    SavePreset,
+    LoadPreset,
     Cancel,
 }
 
@@ -66,6 +68,9 @@ pub struct Img2PixelHost {
     pub has_active_project: bool,
     pub params: Img2PixelParams,
     pub show_original: bool,
+    pub preview_zoom: f32,
+    pub preview_pan: egui::Vec2,
+    pub status_message: Option<String>,
     active_tab: ControlTab,
     last_params: Option<Img2PixelParams>,
     cached_output: Option<Img2PixelOutput>,
@@ -85,6 +90,9 @@ impl Default for Img2PixelHost {
             has_active_project: false,
             params: Img2PixelParams::default(),
             show_original: false,
+            preview_zoom: 1.0,
+            preview_pan: egui::Vec2::ZERO,
+            status_message: None,
             active_tab: ControlTab::Size,
             last_params: None,
             cached_output: None,
@@ -113,12 +121,21 @@ impl Img2PixelHost {
         self.has_active_project = has_active_project;
         self.params = Img2PixelParams::for_source(self.src_w, self.src_h);
         self.show_original = false;
+        self.preview_zoom = 1.0;
+        self.preview_pan = egui::Vec2::ZERO;
+        self.status_message = None;
         self.active_tab = ControlTab::Size;
         self.last_params = None;
         self.cached_output = None;
         self.preview_texture = None;
         self.source_texture = None;
         self.events.clear();
+    }
+
+    pub fn apply_loaded_preset(&mut self, params: Img2PixelParams) {
+        self.params = params;
+        self.last_params = None;
+        self.cached_output = None;
     }
 
     pub fn take_events(&mut self) -> Vec<Img2PixelEvent> {
@@ -247,23 +264,6 @@ impl Img2PixelPanelContent {
                                             }
                                             ui.checkbox(&mut host.params.lock_aspect, "Lock");
                                         });
-                                        ui.add_space(4.0);
-                                        ui.horizontal(|ui| {
-                                            ui.weak("Presets:");
-                                            for preset in [16u32, 32, 64, 128] {
-                                                if ui.small_button(format!("{preset}")).clicked() {
-                                                    host.params.target_width = preset;
-                                                    host.params.target_height =
-                                                        if host.params.lock_aspect {
-                                                            ((preset as f32 * aspect).round()
-                                                                as u32)
-                                                                .clamp(1, 512)
-                                                        } else {
-                                                            preset
-                                                        };
-                                                }
-                                            }
-                                        });
 
                                         ui.add_space(10.0);
                                         ui.strong("Sampling");
@@ -293,6 +293,30 @@ impl Img2PixelPanelContent {
                                             )
                                             .text("Alpha Cut"),
                                         );
+
+                                        ui.add_space(10.0);
+                                        ui.strong("Preset");
+                                        ui.add_space(4.0);
+                                        ui.horizontal(|ui| {
+                                            if chrome
+                                                .button(ui, "Save Preset", ButtonStyle::plain())
+                                                .on_hover_text("Save all current effect settings to a .json preset file")
+                                                .clicked()
+                                            {
+                                                host.events.push(Img2PixelEvent::SavePreset);
+                                            }
+                                            if chrome
+                                                .button(ui, "Load Preset", ButtonStyle::plain())
+                                                .on_hover_text("Load effect settings from a .json preset file")
+                                                .clicked()
+                                            {
+                                                host.events.push(Img2PixelEvent::LoadPreset);
+                                            }
+                                        });
+                                        if let Some(msg) = &host.status_message {
+                                            ui.add_space(2.0);
+                                            ui.weak(msg);
+                                        }
                                     }
                                     ControlTab::Adjust => {
                                         ui.strong("Detail");
@@ -434,7 +458,7 @@ impl Img2PixelPanelContent {
                     vec2(preview_w, body_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        // Pinned toggle on the LEFT so long filenames never push it off-screen.
+                        // Pinned toggle on the LEFT + zoom controls on the RIGHT.
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut host.show_original, false, "After");
                             ui.selectable_value(&mut host.show_original, true, "Before");
@@ -447,13 +471,50 @@ impl Img2PixelPanelContent {
                                 host.params.target_height,
                             );
                             ui.add(egui::Label::new(dims).truncate());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .small_button("Fit")
+                                    .on_hover_text("Reset preview zoom and pan")
+                                    .clicked()
+                                {
+                                    host.preview_zoom = 1.0;
+                                    host.preview_pan = egui::Vec2::ZERO;
+                                }
+                                ui.weak(format!("{}%", (host.preview_zoom * 100.0).round() as i32));
+                            });
                         });
 
                         let palette_strip_h = 22.0;
                         let well_h = (ui.available_height() - palette_strip_h - 6.0).max(100.0);
-                        let well_rect = ui.allocate_space(vec2(ui.available_width(), well_h)).1;
+                        let (well_rect, well_resp) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), well_h),
+                            egui::Sense::click_and_drag(),
+                        );
                         ui.painter()
                             .rect_filled(well_rect, 2.0, chrome.colors.list_bg32());
+
+                        // Pan via drag (left or middle button) and zoom via scroll wheel.
+                        if well_resp.dragged() {
+                            host.preview_pan += well_resp.drag_delta();
+                        }
+                        if well_resp.hovered() {
+                            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                            if scroll_y.abs() > 0.01 {
+                                // Exponential in scroll_y so smooth-scroll sub-frames
+                                // sum cleanly: ~50pt (1 wheel notch) => ~1.11x zoom.
+                                let factor = 2.0_f32.powf((scroll_y / 320.0).clamp(-0.25, 0.25));
+                                let old_zoom = host.preview_zoom;
+                                let new_zoom = (old_zoom * factor).clamp(0.25, 16.0);
+                                if (new_zoom - old_zoom).abs() > 1e-4 {
+                                    if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+                                        let rel = pointer - (well_rect.center() + host.preview_pan);
+                                        let ratio = new_zoom / old_zoom;
+                                        host.preview_pan -= rel * (ratio - 1.0);
+                                    }
+                                    host.preview_zoom = new_zoom;
+                                }
+                            }
+                        }
 
                         let tex_info = if host.show_original {
                             host.source_texture
@@ -472,11 +533,14 @@ impl Img2PixelPanelContent {
                             let pad = 8.0;
                             let avail_w = (well_rect.width() - pad * 2.0).max(1.0);
                             let avail_h = (well_rect.height() - pad * 2.0).max(1.0);
-                            let scale = (avail_w / tw.max(1.0)).min(avail_h / th.max(1.0));
+                            let base_scale = (avail_w / tw.max(1.0)).min(avail_h / th.max(1.0));
+                            let scale = base_scale * host.preview_zoom;
                             let draw_size = vec2(tw * scale, th * scale);
-                            let draw_rect =
-                                egui::Rect::from_center_size(well_rect.center(), draw_size);
-                            ui.painter().image(
+                            let draw_rect = egui::Rect::from_center_size(
+                                well_rect.center() + host.preview_pan,
+                                draw_size,
+                            );
+                            ui.painter_at(well_rect).image(
                                 tex_id,
                                 draw_rect,
                                 egui::Rect::from_min_max(

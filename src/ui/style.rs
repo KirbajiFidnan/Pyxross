@@ -10,6 +10,13 @@ use crate::ui::theme::{rgba32, ThemeColors};
 
 /// Maximum corner rounding exposed in the Style panel.
 pub const MAX_ROUNDING: f32 = 8.0;
+/// Minimum / maximum spacing multiplier exposed in the Style panel.
+pub const MIN_SPACING: f32 = 0.75;
+pub const MAX_SPACING: f32 = 1.5;
+
+fn default_one() -> f32 {
+    1.0
+}
 
 /// Built-in dark style presets with low-glare contrast and harmonious accents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +143,7 @@ impl StylePreset {
         UiStyle {
             preset: self.name().to_string(),
             rounding: 0.0,
+            spacing: 1.0,
             colors,
             banner: None,
         }
@@ -157,11 +165,14 @@ pub struct StyleColors {
     pub text_muted: [u8; 4],
 }
 
-/// Persistent UI style configuration (preset name, corner rounding, colors, banner).
+/// Persistent UI style configuration (preset name, corner rounding, spacing,
+/// colors, banner).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UiStyle {
     pub preset: String,
     pub rounding: f32,
+    #[serde(default = "default_one")]
+    pub spacing: f32,
     pub colors: StyleColors,
     #[serde(default)]
     pub banner: Option<String>,
@@ -177,6 +188,17 @@ impl UiStyle {
     /// Clamps rounding to `[0.0, MAX_ROUNDING]`.
     pub fn clamped_rounding(&self) -> f32 {
         self.rounding.clamp(0.0, MAX_ROUNDING)
+    }
+
+    /// Clamps spacing multiplier to `[MIN_SPACING, MAX_SPACING]`.
+    pub fn clamped_spacing(&self) -> f32 {
+        self.spacing.clamp(MIN_SPACING, MAX_SPACING)
+    }
+
+    /// Returns `true` when this style is a custom user-modified theme (eligible
+    /// to be saved as a custom theme file).
+    pub fn is_custom(&self) -> bool {
+        self.preset.eq_ignore_ascii_case("Custom")
     }
 
     /// Projects these style colors onto `ThemeColors` so all panels, canvas
@@ -197,6 +219,7 @@ impl UiStyle {
     pub fn apply_to_egui(&self, ctx: &egui::Context) {
         let r = self.clamped_rounding().round() as u8;
         let corner = CornerRadius::same(r);
+        let sp = self.clamped_spacing();
         let clear = rgba32(self.colors.clear_color);
         let panel = rgba32(self.colors.panel_bg);
         let header = rgba32(self.colors.panel_header_bg);
@@ -207,8 +230,8 @@ impl UiStyle {
         let text_primary = rgba32(self.colors.text_primary);
 
         ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-            style.spacing.button_padding = egui::vec2(6.0, 3.0);
+            style.spacing.item_spacing = egui::vec2(6.0 * sp, 4.0 * sp);
+            style.spacing.button_padding = egui::vec2(6.0 * sp, 3.0 * sp);
 
             let mut v = egui::Visuals::dark();
             v.override_text_color = Some(text_primary);
@@ -278,10 +301,14 @@ impl UiStyle {
         let mut parsed: Self = serde_json::from_slice(&bytes)
             .map_err(|e| format!("Failed to parse style file: {e}"))?;
         parsed.rounding = parsed.clamped_rounding();
+        parsed.spacing = parsed.clamped_spacing();
         Ok(parsed)
     }
 
     pub fn load_user_or_default() -> Self {
+        if cfg!(test) {
+            return Self::default();
+        }
         user_style_path()
             .and_then(|path| Self::load_from_file(&path).ok())
             .unwrap_or_default()
@@ -318,6 +345,30 @@ mod tests {
 
         let loaded = UiStyle::load_from_file(&path).unwrap();
         assert_eq!(loaded, style);
+
+        // Legacy JSON without ui_scale / border_width / spacing falls back to 1.0 defaults.
+        let legacy_json = r#"{
+            "preset": "Ash",
+            "rounding": 2.0,
+            "colors": {
+                "clear_color": [26,27,30,255],
+                "panel_bg": [35,37,41,255],
+                "panel_header_bg": [44,46,51,255],
+                "panel_border": [58,61,68,255],
+                "list_bg": [28,30,34,255],
+                "list_stripe_bg": [32,34,38,255],
+                "accent_fill": [64,73,86,255],
+                "accent_stroke": [128,142,162,255],
+                "text_primary": [214,217,222,255],
+                "text_muted": [142,148,158,255]
+            }
+        }"#;
+        let legacy_path = dir.join("legacy_style.json");
+        fs::write(&legacy_path, legacy_json).unwrap();
+        let legacy = UiStyle::load_from_file(&legacy_path).unwrap();
+        assert_eq!(legacy.rounding, 2.0);
+        assert_eq!(legacy.spacing, 1.0);
+        assert!(legacy.banner.is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

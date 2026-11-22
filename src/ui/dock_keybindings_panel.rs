@@ -12,7 +12,9 @@ use egui::vec2;
 
 use crate::input::Keymap;
 use crate::ui::keybindings::{KeybindingsEvent, KeybindingsPanel};
-use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
+use crate::ui::panel_dock::nest::{
+    nest_is_usable, nest_viewport, Component, NestContent, NestMode, NestView,
+};
 use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
 };
@@ -27,7 +29,7 @@ pub const KEYBINDINGS_GUARD_PANEL_ID: u64 = 216;
 const KEYBINDINGS_TITLE: &str = "Key Bindings";
 
 /// Minimum size of the resizable floating Key Bindings window.
-const KEYBINDINGS_MIN_SIZE: egui::Vec2 = vec2(380.0, 260.0);
+const KEYBINDINGS_MIN_SIZE: egui::Vec2 = vec2(440.0, 320.0);
 
 /// Actions emitted by the Key Bindings unsaved-changes confirmation popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,12 +101,50 @@ impl Component for KeybindingsComponent {
 }
 
 struct KeybindingsPanelContent {
-    nest: NestContent,
+    host: KeybindingsHost,
 }
 
 impl PanelContent for KeybindingsPanelContent {
     fn ui(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
-        self.nest.ui(ui, chrome);
+        let full = ui.available_rect_before_wrap();
+        ui.set_min_size(full.size());
+        let viewport = nest_viewport(full);
+        if !nest_is_usable(viewport) {
+            return;
+        }
+        let mut emitted = Vec::new();
+        ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |inner| {
+            inner.set_clip_rect(viewport.intersect(inner.clip_rect()));
+            // Pinned footer at bottom (never covered by any scrollbar).
+            egui::Panel::bottom(inner.id().with("kb-footer"))
+                .frame(egui::Frame::NONE)
+                .resizable(false)
+                .show_separator_line(false)
+                .show(inner, |ui| {
+                    self.host
+                        .panel
+                        .borrow_mut()
+                        .ui_footer(ui, chrome.colors, &mut emitted);
+                });
+            // Pinned search + category toolbar at top.
+            egui::Panel::top(inner.id().with("kb-toolbar"))
+                .frame(egui::Frame::NONE)
+                .resizable(false)
+                .show_separator_line(false)
+                .show(inner, |ui| {
+                    self.host.panel.borrow_mut().ui_toolbar(ui, chrome.colors);
+                });
+            // Scrollable categorized bindings list in the remaining center area.
+            egui::ScrollArea::vertical()
+                .id_salt(inner.id().with("kb-scroll"))
+                .auto_shrink([false, false])
+                .show(inner, |ui| {
+                    self.host.panel.borrow_mut().ui_rows(ui, chrome.colors);
+                });
+        });
+        if !emitted.is_empty() {
+            self.host.events.borrow_mut().extend(emitted);
+        }
     }
 }
 
@@ -124,9 +164,7 @@ pub fn keybindings_panel_spec(host: &KeybindingsHost, floating_rect: egui::Rect)
         },
         placement: PanelPlacement::Floating,
         floating_rect,
-        content: Box::new(KeybindingsPanelContent {
-            nest: build_keybindings_nest(host),
-        }),
+        content: Box::new(KeybindingsPanelContent { host: host.clone() }),
     }
 }
 
@@ -166,6 +204,16 @@ impl Component for KeybindingsGuardComponent {
     }
 }
 
+struct KeybindingsGuardPanelContent {
+    nest: NestContent,
+}
+
+impl PanelContent for KeybindingsGuardPanelContent {
+    fn ui(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
+        self.nest.ui(ui, chrome);
+    }
+}
+
 /// Dock spec for the Key Bindings unsaved-changes confirmation popup (id 216).
 pub fn keybindings_guard_panel_spec(
     host: &KeybindingsHost,
@@ -181,7 +229,7 @@ pub fn keybindings_guard_panel_spec(
         },
         placement: PanelPlacement::Floating,
         floating_rect,
-        content: Box::new(KeybindingsPanelContent { nest }),
+        content: Box::new(KeybindingsGuardPanelContent { nest }),
     }
 }
 

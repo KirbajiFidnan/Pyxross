@@ -197,9 +197,10 @@ impl NativeWorkspaceHost {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|_| NativeHostError::DeviceRequest)?;
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width, size.height)
             .ok_or(NativeHostError::SurfaceConfiguration)?;
+        crate::render::configure_low_latency_surface(&mut config);
         surface.configure(&device, &config);
         let renderer = RendererState::new(device, queue, surface, config);
         let ctx = egui::Context::default();

@@ -121,6 +121,9 @@ pub struct CanvasInteractions {
     pub eyedropper_point: Option<(i32, i32)>,
     /// The secondary-button press/drag ended this frame.
     pub eyedropper_ended: bool,
+    /// Optional out-of-bounds canvas point recorded just before a draw tool
+    /// crossed into the canvas, so fast inward swipes paint right from the edge.
+    pub stroke_segment_entry_from: Option<(i32, i32)>,
 }
 
 /// Readout for the transform drag HUD (item 5), built by the App from the live

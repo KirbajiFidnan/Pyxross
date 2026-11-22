@@ -18,7 +18,9 @@ use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
     FLOATING_PANEL_CHROME_HEIGHT,
 };
-use crate::ui::style::{user_style_path, StylePreset, UiStyle, MAX_ROUNDING};
+use crate::ui::style::{
+    user_style_path, StylePreset, UiStyle, MAX_ROUNDING, MAX_SPACING, MIN_SPACING,
+};
 
 /// Dock id for the Style floating panel.
 pub const STYLE_PANEL_ID: u64 = 213;
@@ -37,6 +39,8 @@ pub enum StyleEvent {
     SelectPreset(StylePreset),
     UpdateStyle(UiStyle),
     OpenBannerPicker,
+    OpenSaveDialog,
+    OpenLoadDialog,
     SaveFile(PathBuf),
     LoadFile(PathBuf),
 }
@@ -101,12 +105,77 @@ fn color_edit_row(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
     changed
 }
 
+fn style_slider_row(
+    ui: &mut egui::Ui,
+    chrome: &PanelChrome,
+    id: &str,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    default_val: f32,
+    speed: f32,
+    decimals: usize,
+) -> bool {
+    let mut changed = false;
+    ui.weak(label);
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let drag = ui.add_sized(
+            vec2(46.0, ui.spacing().interact_size.y),
+            egui::DragValue::new(value)
+                .range(range.clone())
+                .speed(speed)
+                .fixed_decimals(decimals),
+        );
+        // Reserve space for the Reset button on the right so the slider never
+        // overlaps it when the panel is resized narrow.
+        let reset_w = 54.0;
+        let slider_w = (ui.available_width() - reset_w - 6.0).max(36.0);
+        let slider = ui
+            .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                pro_slider(ui, id, value, range.clone(), false)
+            })
+            .inner;
+        if drag.changed() || slider.changed() {
+            *value = value.clamp(*range.start(), *range.end());
+            changed = true;
+        }
+        if chrome
+            .button(ui, "Reset", ButtonStyle::plain())
+            .clicked()
+            && (*value - default_val).abs() > 1e-4
+        {
+            *value = default_val;
+            changed = true;
+        }
+    });
+    changed
+}
+
 struct StyleComponent {
     host: StyleHost,
 }
 
 impl Component for StyleComponent {
     fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+        // Reserve right gutter for the Nest ScrollArea scrollbar so sliders,
+        // Reset buttons, ComboBoxes, and labels are never overlapped.
+        egui::Frame::NONE
+            .inner_margin(egui::Margin {
+                left: 0,
+                right: 16,
+                top: 0,
+                bottom: 4,
+            })
+            .show(ui, |ui| {
+                self.render_inner(ui, chrome);
+            });
+    }
+}
+
+impl StyleComponent {
+    fn render_inner(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
         let mut style = self.host.style.borrow().clone();
         let mut modified = false;
 
@@ -114,7 +183,7 @@ impl Component for StyleComponent {
         ui.add_space(2.0);
         let current_preset = style.preset.clone();
         egui::ComboBox::from_id_salt("style_preset_combo")
-            .width(ui.available_width().max(140.0))
+            .width(ui.available_width().max(120.0))
             .selected_text(&current_preset)
             .show_ui(ui, |ui| {
                 for preset in StylePreset::ALL {
@@ -129,33 +198,38 @@ impl Component for StyleComponent {
             });
 
         ui.add_space(8.0);
-        ui.weak("Rounding");
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let mut r = style.clamped_rounding();
-            let drag = ui.add_sized(
-                vec2(44.0, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut r)
-                    .range(0.0..=MAX_ROUNDING)
-                    .speed(0.1)
-                    .fixed_decimals(1),
-            );
-            let slider_w = (ui.available_width() - 52.0).max(40.0);
-            let slider = ui
-                .allocate_ui(vec2(slider_w, 18.0), |ui| {
-                    pro_slider(ui, "style-rounding", &mut r, 0.0..=MAX_ROUNDING, false)
-                })
-                .inner;
-            if drag.changed() || slider.changed() {
-                style.rounding = r.clamp(0.0, MAX_ROUNDING);
-                modified = true;
-            }
-            if chrome.button(ui, "Reset", ButtonStyle::plain()).clicked() && style.rounding != 0.0 {
-                style.rounding = 0.0;
-                modified = true;
-            }
-        });
+        let mut r = style.clamped_rounding();
+        if style_slider_row(
+            ui,
+            chrome,
+            "style-rounding",
+            "Rounding",
+            &mut r,
+            0.0..=MAX_ROUNDING,
+            0.0,
+            0.1,
+            1,
+        ) {
+            style.rounding = r;
+            modified = true;
+        }
+
+        ui.add_space(6.0);
+        let mut spacing = style.clamped_spacing();
+        if style_slider_row(
+            ui,
+            chrome,
+            "style-spacing",
+            "Spacing",
+            &mut spacing,
+            MIN_SPACING..=MAX_SPACING,
+            1.0,
+            0.02,
+            2,
+        ) {
+            style.spacing = spacing;
+            modified = true;
+        }
 
         ui.add_space(8.0);
         ui.separator();
@@ -163,21 +237,31 @@ impl Component for StyleComponent {
         ui.weak("Colors");
         ui.add_space(4.0);
         let mut color_changed = false;
-        ui.columns(2, |cols| {
-            color_changed |= color_edit_row(&mut cols[0], "Workspace", &mut style.colors.clear_color);
-            color_changed |= color_edit_row(&mut cols[0], "Panel", &mut style.colors.panel_bg);
-            color_changed |= color_edit_row(&mut cols[0], "Header", &mut style.colors.panel_header_bg);
-            color_changed |= color_edit_row(&mut cols[0], "Border", &mut style.colors.panel_border);
-            color_changed |= color_edit_row(&mut cols[1], "Accent Fill", &mut style.colors.accent_fill);
-            color_changed |= color_edit_row(&mut cols[1], "Accent Stroke", &mut style.colors.accent_stroke);
-            color_changed |= color_edit_row(&mut cols[1], "Text", &mut style.colors.text_primary);
-        });
+        if ui.available_width() >= 250.0 {
+            ui.columns(2, |cols| {
+                color_changed |= color_edit_row(&mut cols[0], "Workspace", &mut style.colors.clear_color);
+                color_changed |= color_edit_row(&mut cols[0], "Panel", &mut style.colors.panel_bg);
+                color_changed |= color_edit_row(&mut cols[0], "Header", &mut style.colors.panel_header_bg);
+                color_changed |= color_edit_row(&mut cols[0], "Border", &mut style.colors.panel_border);
+                color_changed |= color_edit_row(&mut cols[1], "Accent Fill", &mut style.colors.accent_fill);
+                color_changed |= color_edit_row(&mut cols[1], "Accent Stroke", &mut style.colors.accent_stroke);
+                color_changed |= color_edit_row(&mut cols[1], "Text", &mut style.colors.text_primary);
+            });
+        } else {
+            color_changed |= color_edit_row(ui, "Workspace", &mut style.colors.clear_color);
+            color_changed |= color_edit_row(ui, "Panel", &mut style.colors.panel_bg);
+            color_changed |= color_edit_row(ui, "Header", &mut style.colors.panel_header_bg);
+            color_changed |= color_edit_row(ui, "Border", &mut style.colors.panel_border);
+            color_changed |= color_edit_row(ui, "Accent Fill", &mut style.colors.accent_fill);
+            color_changed |= color_edit_row(ui, "Accent Stroke", &mut style.colors.accent_stroke);
+            color_changed |= color_edit_row(ui, "Text", &mut style.colors.text_primary);
+        }
         if color_changed {
-            style.preset = "Custom".to_string();
             modified = true;
         }
 
         if modified {
+            style.preset = "Custom".to_string();
             *self.host.style.borrow_mut() = style.clone();
             self.host
                 .events
@@ -188,34 +272,38 @@ impl Component for StyleComponent {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(6.0);
-        ui.weak("File");
-        ui.add_space(2.0);
-        let mut path_str = self.host.file_path.borrow().clone();
+        ui.weak("Theme File");
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if chrome.button(ui, "Load", ButtonStyle::plain()).clicked() {
-                    self.host
-                        .events
-                        .borrow_mut()
-                        .push(StyleEvent::LoadFile(PathBuf::from(path_str.trim())));
-                }
-                if chrome.button(ui, "Save", ButtonStyle::plain()).clicked() {
-                    self.host
-                        .events
-                        .borrow_mut()
-                        .push(StyleEvent::SaveFile(PathBuf::from(path_str.trim())));
-                }
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut path_str)
-                            .desired_width(ui.available_width()),
-                    )
-                    .changed()
-                {
-                    *self.host.file_path.borrow_mut() = path_str.clone();
-                }
-            });
+            let save_style = ButtonStyle {
+                enabled: style.is_custom(),
+                ..ButtonStyle::plain()
+            };
+            if chrome
+                .button(ui, "Save", save_style)
+                .on_hover_text(if style.is_custom() {
+                    "Save custom theme to a .json file"
+                } else {
+                    "Modify any setting to switch to Custom before saving"
+                })
+                .clicked()
+            {
+                self.host
+                    .events
+                    .borrow_mut()
+                    .push(StyleEvent::OpenSaveDialog);
+            }
+            if chrome
+                .button(ui, "Load", ButtonStyle::plain())
+                .on_hover_text("Load a saved .json theme file")
+                .clicked()
+            {
+                self.host
+                    .events
+                    .borrow_mut()
+                    .push(StyleEvent::OpenLoadDialog);
+            }
         });
 
         if let Some(status) = self.host.status.borrow().as_deref() {
@@ -262,7 +350,7 @@ impl Component for StyleComponent {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if let Some(name) = current_name.as_deref() {
-                ui.weak(name);
+                ui.add(egui::Label::new(egui::RichText::new(name).weak()).truncate());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if chrome

@@ -363,6 +363,12 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         lifecycle: "tracks the pointer relative to the canvas draw rect while armed",
     },
     AppOwnership {
+        field: "last_outside_draw_pt",
+        owner: AppOwner::HostLocal,
+        rationale: "unclamped off-canvas point for seamless draw-tool edge entry/exit",
+        lifecycle: "updated while draw tool is armed outside canvas, cleared on release",
+    },
+    AppOwnership {
         field: "last_selection_drag_point",
         owner: AppOwner::HostLocal,
         rationale:
@@ -602,6 +608,12 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         field: "img2pixel_host",
         owner: AppOwner::ShellGlobal,
         rationale: "floating image-to-pixel import panel host is shell-global",
+        lifecycle: "opened on demand and cleared on close",
+    },
+    AppOwnership {
+        field: "import_banner_host",
+        owner: AppOwner::ShellGlobal,
+        rationale: "floating banner crop/import panel host is shell-global",
         lifecycle: "opened on demand and cleared on close",
     },
     AppOwnership {

@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use egui::vec2;
 
-use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
+use crate::ui::panel_dock::nest::{nest_is_usable, nest_viewport};
 use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
 };
@@ -36,6 +36,7 @@ pub struct BannerThumbItem {
 pub enum BannerPickerEvent {
     Selected(Option<String>),
     Refresh,
+    ImportBanner,
 }
 
 /// Shared view & event state for the Select Banner panel.
@@ -61,16 +62,14 @@ impl BannerPickerHost {
     }
 }
 
-struct BannerPickerComponent {
+struct BannerPickerPanelContent {
     host: BannerPickerHost,
 }
 
-impl Component for BannerPickerComponent {
-    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+impl BannerPickerPanelContent {
+    fn render_pinned_actions(&self, ui: &mut egui::Ui, chrome: &PanelChrome) {
         let active = self.host.active_banner.borrow().clone();
-        let items = self.host.items.borrow().clone();
-
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             if chrome
                 .button(ui, "None (clear)", ButtonStyle::toggled(active.is_none()))
@@ -87,13 +86,27 @@ impl Component for BannerPickerComponent {
                     .borrow_mut()
                     .push(BannerPickerEvent::Refresh);
             }
+            if chrome
+                .button(ui, "Import Banner", ButtonStyle::plain())
+                .on_hover_text("Import an image and crop it as a new top-bar banner")
+                .clicked()
+            {
+                self.host
+                    .events
+                    .borrow_mut()
+                    .push(BannerPickerEvent::ImportBanner);
+            }
         });
-        ui.add_space(8.0);
+    }
+
+    fn render_banner_list(&self, ui: &mut egui::Ui, chrome: &PanelChrome) {
+        let active = self.host.active_banner.borrow().clone();
+        let items = self.host.items.borrow().clone();
 
         if items.is_empty() {
             ui.weak("No banner images found.");
             ui.add_space(4.0);
-            ui.weak("Put PNG/JPG/WEBP files into ./banners/ or ~/.config/pyxross/banners/.");
+            ui.weak("Use Import Banner or place PNG/JPG/WEBP files into banners/.");
             return;
         }
 
@@ -103,9 +116,9 @@ impl Component for BannerPickerComponent {
             let [bw, bh] = item.size;
             let thumb_h = 48.0_f32;
             let thumb_w = if bw > 0 && bh > 0 {
-                (thumb_h * (bw as f32 / bh as f32)).min(avail_w - 16.0)
+                (thumb_h * (bw as f32 / bh as f32)).min((avail_w - 16.0).max(16.0))
             } else {
-                120.0
+                120.0_f32.min((avail_w - 16.0).max(16.0))
             };
             let row_h = thumb_h + 24.0;
             let (row_rect, response) =
@@ -134,13 +147,13 @@ impl Component for BannerPickerComponent {
                 egui::pos2(row_rect.left() + 6.0, row_rect.top() + 4.0),
                 vec2(thumb_w.max(16.0), thumb_h),
             );
-            ui.painter().image(
+            ui.painter_at(row_rect).image(
                 item.texture,
                 thumb_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 crate::ui::theme::SKIN_TINT,
             );
-            ui.painter().text(
+            ui.painter_at(row_rect).text(
                 egui::pos2(row_rect.left() + 6.0, thumb_rect.bottom() + 4.0),
                 egui::Align2::LEFT_TOP,
                 &item.name,
@@ -159,20 +172,38 @@ impl Component for BannerPickerComponent {
     }
 }
 
-struct BannerPickerPanelContent {
-    nest: NestContent,
-}
-
 impl PanelContent for BannerPickerPanelContent {
     fn ui(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
-        self.nest.ui(ui, chrome);
+        let full = ui.available_rect_before_wrap();
+        ui.set_min_size(full.size());
+        let viewport = nest_viewport(full);
+        if !nest_is_usable(viewport) {
+            return;
+        }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |inner| {
+            inner.set_clip_rect(viewport.intersect(inner.clip_rect()));
+            // Pinned top button bar: stays static and visible regardless of scroll.
+            self.render_pinned_actions(inner, chrome);
+            inner.add_space(6.0);
+            inner.separator();
+            inner.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt(inner.id().with("banner-picker-scroll"))
+                .auto_shrink([false, false])
+                .show(inner, |scroll_ui| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: 0,
+                            right: 16,
+                            top: 0,
+                            bottom: 4,
+                        })
+                        .show(scroll_ui, |list_ui| {
+                            self.render_banner_list(list_ui, chrome);
+                        });
+                });
+        });
     }
-}
-
-pub(crate) fn build_banner_picker_nest(host: &BannerPickerHost) -> NestContent {
-    let mut nest = NestContent::new(NestMode::Static);
-    nest.push(BannerPickerComponent { host: host.clone() });
-    nest
 }
 
 /// Dock spec for the Select Banner floating panel (dock id 215).
@@ -180,14 +211,12 @@ pub fn banner_picker_panel_spec(host: &BannerPickerHost, floating_rect: egui::Re
     PanelSpec {
         id: PanelId::new(BANNER_PICKER_PANEL_ID),
         metadata: PanelMetadata {
-            resizable: false,
+            resizable: true,
             ..PanelMetadata::new(BANNER_PICKER_TITLE, false, BANNER_PICKER_MIN_SIZE)
         },
         placement: PanelPlacement::Floating,
         floating_rect,
-        content: Box::new(BannerPickerPanelContent {
-            nest: build_banner_picker_nest(host),
-        }),
+        content: Box::new(BannerPickerPanelContent { host: host.clone() }),
     }
 }
 
@@ -196,15 +225,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spec_is_float_only_not_resizable_and_uses_a_static_nest() {
+    fn spec_is_float_only_and_resizable() {
         let host = BannerPickerHost::new();
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), BANNER_PICKER_MIN_SIZE);
         let spec = banner_picker_panel_spec(&host, rect);
         assert_eq!(spec.id.raw(), BANNER_PICKER_PANEL_ID);
         assert_eq!(spec.metadata.title, "Select Banner");
         assert!(!spec.metadata.can_pop_out);
-        assert!(!spec.metadata.resizable);
+        assert!(spec.metadata.resizable);
         assert_eq!(spec.placement, PanelPlacement::Floating);
-        assert_eq!(build_banner_picker_nest(&host).mode(), NestMode::Static);
     }
 }

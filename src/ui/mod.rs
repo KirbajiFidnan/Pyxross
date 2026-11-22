@@ -31,6 +31,7 @@ pub mod dock_frame_edit_panel;
 pub mod dock_hosts;
 pub mod dock_img2pixel_panel;
 pub mod dock_import_aseprite_panel;
+pub mod dock_import_banner_panel;
 pub mod dock_import_gif_panel;
 pub mod dock_import_image_panel;
 pub mod dock_import_pyxel_panel;
@@ -353,6 +354,7 @@ struct App {
     editor_options: dock_editor_options_panel::EditorOptions,
     credits_host: dock_credits_panel::CreditsHost,
     img2pixel_host: std::rc::Rc<std::cell::RefCell<dock_img2pixel_panel::Img2PixelHost>>,
+    import_banner_host: std::rc::Rc<std::cell::RefCell<dock_import_banner_panel::ImportBannerHost>>,
     dropped_file_hovering: bool,
     discovered_fonts: Vec<crate::core::text::FontEntry>,
     font_byte_cache: std::collections::HashMap<String, Vec<u8>>,
@@ -495,6 +497,9 @@ struct App {
     /// pauses there and restarts as a new segment on re-entry.
     tool_armed: bool,
     tool_outside: bool,
+    /// Last unclamped canvas point while a draw tool is armed outside the
+    /// canvas, so fast inward swipes interpolate cleanly from the canvas edge.
+    last_outside_draw_pt: Option<(i32, i32)>,
     /// Last canvas point a Fieldier selection drag projected onto the canvas
     /// while the pointer was outside it, held so the gesture keeps following
     /// when the platform reports no pointer position at all.
@@ -557,7 +562,11 @@ impl App {
     }
 
     fn init(create_initial_project: bool) -> Self {
-        let keymap = load_keymap(user_keymap_path().as_deref());
+        let keymap = if cfg!(test) {
+            Keymap::defaults()
+        } else {
+            load_keymap(user_keymap_path().as_deref())
+        };
         let projects = ProjectStore::new();
         let toolbox_host = dock_hosts::ToolboxHost::default();
         let layers_host = dock_hosts::LayerPanelHost::default();
@@ -679,6 +688,9 @@ impl App {
             img2pixel_host: std::rc::Rc::new(std::cell::RefCell::new(
                 dock_img2pixel_panel::Img2PixelHost::default(),
             )),
+            import_banner_host: std::rc::Rc::new(std::cell::RefCell::new(
+                dock_import_banner_panel::ImportBannerHost::default(),
+            )),
             dropped_file_hovering: false,
             discovered_fonts: crate::core::text::discover_fonts(),
             font_byte_cache: std::collections::HashMap::new(),
@@ -734,6 +746,7 @@ impl App {
             panel_dock_demo: true,
             tool_armed: false,
             tool_outside: false,
+            last_outside_draw_pt: None,
             last_selection_drag_point: None,
             line_mode: false,
             line_anchor: None,
@@ -1736,6 +1749,7 @@ impl App {
                         std::mem::swap(&mut self.global_fg_color, &mut self.global_bg_color);
                     }
                 }
+                top_bar::TopBarEvent::OpenBannerPicker => self.open_banner_picker_panel(),
                 top_bar::TopBarEvent::CloseProject(id) => self.request_project_close(id),
                 top_bar::TopBarEvent::MenuAction(action) => self.apply_menu_action(action),
             }
@@ -2058,6 +2072,90 @@ impl App {
                 dock_banner_picker_panel::BannerPickerEvent::Refresh => {
                     self.refresh_banner_picker_items();
                 }
+                dock_banner_picker_panel::BannerPickerEvent::ImportBanner => {
+                    let seed = self.default_save_location();
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportBanner,
+                        seed,
+                    );
+                }
+            }
+        }
+    }
+
+    fn file_import_banner_pick(&mut self, path: &Path) {
+        let img = match image::open(path) {
+            Ok(img) => img.to_rgba8(),
+            Err(err) => {
+                self.style_host
+                    .set_status(format!("Failed to load banner image: {err}"));
+                return;
+            }
+        };
+        let (w, h) = img.dimensions();
+        let default_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("custom_banner")
+            .to_owned();
+        self.import_banner_host
+            .borrow_mut()
+            .seed(default_name, w, h, img.into_raw());
+        let panel_id =
+            panel_dock::PanelId::new(dock_import_banner_panel::IMPORT_BANNER_PANEL_ID);
+        if self.panel_dock.placement(panel_id).is_some() {
+            self.panel_dock.raise_floating(panel_id);
+            return;
+        }
+        let floating_rect = egui::Rect::from_min_size(
+            egui::pos2(240.0, 120.0),
+            egui::vec2(720.0, 480.0),
+        );
+        let spec = dock_import_banner_panel::import_banner_panel_spec(
+            self.import_banner_host.clone(),
+            floating_rect,
+        );
+        if self.panel_dock.add_spec(spec).is_ok() {
+            self.panel_dock.raise_floating(panel_id);
+        }
+    }
+
+    fn drain_import_banner_events(&mut self) {
+        let events = self.import_banner_host.borrow_mut().take_events();
+        if events.is_empty() {
+            return;
+        }
+        let panel_id =
+            panel_dock::PanelId::new(dock_import_banner_panel::IMPORT_BANNER_PANEL_ID);
+        for event in events {
+            match event {
+                dock_import_banner_panel::ImportBannerEvent::Cancel => {
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_import_banner_panel::ImportBannerEvent::Import {
+                    name,
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    let outcome = banners::writable_banners_dir().and_then(|dir| {
+                        dock_import_banner_panel::save_banner_png(&dir, &name, width, height, &rgba)
+                    });
+                    match outcome {
+                        Ok(_saved_path) => {
+                            self.refresh_banner_picker_items();
+                            self.ui_style.banner = Some(name.clone());
+                            self.sync_banner_texture();
+                            self.apply_active_style(true);
+                            self.show_status_toast(format!("Banner '{name}' imported."));
+                            let _ = self.panel_dock.remove_spec(panel_id);
+                        }
+                        Err(err) => {
+                            self.import_banner_host.borrow_mut().error = Some(err);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2103,7 +2201,7 @@ impl App {
             .apply_to_theme_colors(&mut self.theme.current_mut().colors);
         self.ui_style.apply_to_egui(&self.ctx);
         self.style_host.set_style(self.ui_style.clone());
-        if persist_default {
+        if persist_default && !cfg!(test) {
             if let Some(path) = style::user_style_path() {
                 let _ = self.ui_style.save_to_file(&path);
             }
@@ -2127,6 +2225,19 @@ impl App {
                 }
                 dock_style_panel::StyleEvent::OpenBannerPicker => {
                     self.open_banner_picker_panel();
+                }
+                dock_style_panel::StyleEvent::OpenSaveDialog => {
+                    self.open_save_as_panel(dock_save_as_panel::SaveAsKind::StyleTheme, None);
+                }
+                dock_style_panel::StyleEvent::OpenLoadDialog => {
+                    let seed = style::user_style_path()
+                        .and_then(|p| p.parent().map(Path::to_path_buf))
+                        .filter(|p| p.is_dir())
+                        .unwrap_or_else(|| self.default_save_location());
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::LoadStyleTheme,
+                        seed,
+                    );
                 }
                 dock_style_panel::StyleEvent::SaveFile(path) => {
                     match self.ui_style.save_to_file(&path) {
@@ -2328,10 +2439,12 @@ impl App {
                 return dir;
             }
         }
-        if let Some(path) = self.projects.current().path.clone() {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    return parent.to_path_buf();
+        if self.projects.active_id().is_some() {
+            if let Some(path) = self.projects.current().path.clone() {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        return parent.to_path_buf();
+                    }
                 }
             }
         }
@@ -2362,6 +2475,7 @@ impl App {
         {
             let mut view = self.file_chooser_host.view.borrow_mut();
             view.mode = mode;
+            view.type_filter = dock_file_chooser_panel::FileTypeFilter::ModeDefault;
             view.selected = None;
             view.focus_requested = true;
             let _ = dock_file_chooser_panel::navigate(&mut view, start);
@@ -2463,6 +2577,65 @@ impl App {
                                 self.remember_last_dir(parent);
                             }
                             self.file_import_img2pixel_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::ImportBanner => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            self.file_import_banner_pick(&path);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::LoadImg2PixelPreset => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            match std::fs::read_to_string(&path)
+                                .map_err(|e| format!("Failed to read preset: {e}"))
+                                .and_then(|json| crate::core::img2pixel::Img2PixelParams::from_json(&json))
+                            {
+                                Ok(params) => {
+                                    let mut host = self.img2pixel_host.borrow_mut();
+                                    host.apply_loaded_preset(params);
+                                    let fname = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "preset.json".to_owned());
+                                    host.status_message = Some(format!("Loaded preset '{fname}'."));
+                                }
+                                Err(err) => {
+                                    self.img2pixel_host.borrow_mut().status_message = Some(err);
+                                }
+                            }
+                            let i2p_id = panel_dock::PanelId::new(
+                                dock_img2pixel_panel::IMPORT_IMG2PIXEL_PANEL_ID,
+                            );
+                            self.panel_dock.raise_floating(i2p_id);
+                            self.close_file_chooser();
+                        }
+                        dock_file_chooser_panel::FileChooserMode::LoadStyleTheme => {
+                            if let Some(parent) = path.parent() {
+                                self.remember_last_dir(parent);
+                            }
+                            match style::UiStyle::load_from_file(&path) {
+                                Ok(loaded) => {
+                                    self.ui_style = loaded;
+                                    self.sync_banner_texture();
+                                    self.apply_active_style(true);
+                                    let fname = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "theme.json".to_owned());
+                                    self.style_host
+                                        .set_status(format!("Loaded theme '{fname}'."));
+                                }
+                                Err(err) => {
+                                    self.style_host.set_status(err);
+                                }
+                            }
+                            let style_id =
+                                panel_dock::PanelId::new(dock_style_panel::STYLE_PANEL_ID);
+                            self.panel_dock.raise_floating(style_id);
                             self.close_file_chooser();
                         }
                         dock_file_chooser_panel::FileChooserMode::ChooseFolder => {
@@ -2826,6 +2999,36 @@ impl App {
                             .map_err(|err| format!("Failed to export selection: {err}"))
                     })
             }
+            (dock_save_as_panel::SaveAsKind::Img2PixelPreset, _) => {
+                let json = self.img2pixel_host.borrow().params.to_json_pretty();
+                json.and_then(|text| {
+                    std::fs::write(path, text)
+                        .map_err(|err| format!("Failed to save preset: {err}"))
+                })
+                .map(|()| {
+                    let fname = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "preset.json".to_owned());
+                    self.img2pixel_host.borrow_mut().status_message =
+                        Some(format!("Saved preset '{fname}'."));
+                })
+            }
+            (dock_save_as_panel::SaveAsKind::StyleTheme, _) => {
+                self.ui_style.save_to_file(path).map(|()| {
+                    if let Some(default_path) = style::user_style_path() {
+                        if !cfg!(test) {
+                            let _ = self.ui_style.save_to_file(&default_path);
+                        }
+                    }
+                    let fname = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "theme.json".to_owned());
+                    self.style_host
+                        .set_status(format!("Saved theme '{fname}'."));
+                })
+            }
             _ => Err("internal: save-as draft has no payload and is not a project save".to_owned()),
         };
         match outcome {
@@ -2845,9 +3048,14 @@ impl App {
                         self.remember_last_dir(location);
                     }
                 } else {
-                    self.show_status_toast(format!("{name} exported."));
+                    if let Some(location) = path.parent() {
+                        self.remember_last_dir(location);
+                    }
+                    self.show_status_toast(format!("{name} saved."));
                 }
-                self.projects.current_mut().last_error = None;
+                if self.projects.active_id().is_some() {
+                    self.projects.current_mut().last_error = None;
+                }
                 true
             }
             Err(message) => {
@@ -4455,6 +4663,9 @@ impl App {
     }
 
     fn persist_keymap(&mut self) {
+        if cfg!(test) {
+            return;
+        }
         if let Some(path) = user_keymap_path() {
             if let Err(error) = save_keymap(&self.keymap, &path) {
                 self.projects.current_mut().last_error = Some(error.to_string());
@@ -6790,6 +7001,7 @@ impl App {
             }
             self.tool_armed = false;
             self.tool_outside = false;
+            self.last_outside_draw_pt = None;
             self.last_selection_drag_point = None;
             return out;
         }
@@ -6803,6 +7015,7 @@ impl App {
             if over_panel {
                 self.tool_armed = false;
                 self.tool_outside = false;
+                self.last_outside_draw_pt = None;
                 self.last_selection_drag_point = None;
                 self.reset_line_gesture();
                 out.clicked = None;
@@ -6851,11 +7064,22 @@ impl App {
             if other_ui {
                 self.tool_armed = false;
                 self.tool_outside = false;
+                self.last_outside_draw_pt = None;
                 self.last_selection_drag_point = None;
                 self.reset_line_gesture();
             } else {
                 self.tool_armed = true;
                 self.tool_outside = pt.is_none();
+                self.last_outside_draw_pt = if pt.is_none()
+                    && matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw)
+                {
+                    pos.and_then(|p| {
+                        self.canvas_widget
+                            .screen_to_canvas_unclamped(p, camera, canvas_size)
+                    })
+                } else {
+                    None
+                };
                 self.last_selection_drag_point = None;
                 if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
                     if shift_pressed(ctx) && !transform_active {
@@ -6935,11 +7159,15 @@ impl App {
                 }
                 return out;
             }
+            let draw_tool = matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw);
             match pt {
                 Some(pt) if self.tool_outside => {
                     self.tool_outside = false;
                     out.stroke_segment_started = true;
                     out.stroke_point = Some(pt);
+                    if draw_tool {
+                        out.stroke_segment_entry_from = self.last_outside_draw_pt.take();
+                    }
                     if matches!(
                         self.projects.current().tool_state.tool(),
                         Tool::Fill | Tool::Eyedropper
@@ -6948,6 +7176,7 @@ impl App {
                     }
                 }
                 Some(pt) => {
+                    self.last_outside_draw_pt = None;
                     out.stroke_point = Some(pt);
                 }
                 None if selection_tool => {
@@ -6967,6 +7196,21 @@ impl App {
                     }
                 }
                 None => {
+                    if draw_tool {
+                        let out_pt = pos.and_then(|p| {
+                            self.canvas_widget
+                                .screen_to_canvas_unclamped(p, camera, canvas_size)
+                        });
+                        // On the exact inside -> outside transition frame, emit
+                        // the unclamped exit point so fast outward swipes paint
+                        // cleanly all the way to the canvas border.
+                        if !self.tool_outside {
+                            if let Some(exit_pt) = out_pt {
+                                out.stroke_point = Some(exit_pt);
+                            }
+                        }
+                        self.last_outside_draw_pt = out_pt;
+                    }
                     self.tool_outside = true;
                 }
             }
@@ -7458,7 +7702,12 @@ impl App {
         }
         if interactions.stroke_segment_started {
             if let Some(pt) = interactions.stroke_point {
-                self.start_stroke_segment(pt);
+                if let Some(entry_from) = interactions.stroke_segment_entry_from {
+                    self.start_stroke_segment(entry_from);
+                    self.continue_stroke(pt);
+                } else {
+                    self.start_stroke_segment(pt);
+                }
             }
         } else if interactions.stroke_started {
             if let Some(pt) = interactions.stroke_point {
@@ -11364,6 +11613,19 @@ impl App {
                 dock_img2pixel_panel::Img2PixelEvent::Cancel => {
                     let _ = self.panel_dock.remove_spec(panel_id);
                 }
+                dock_img2pixel_panel::Img2PixelEvent::SavePreset => {
+                    self.open_save_as_panel(
+                        dock_save_as_panel::SaveAsKind::Img2PixelPreset,
+                        None,
+                    );
+                }
+                dock_img2pixel_panel::Img2PixelEvent::LoadPreset => {
+                    let seed = self.default_save_location();
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::LoadImg2PixelPreset,
+                        seed,
+                    );
+                }
                 dock_img2pixel_panel::Img2PixelEvent::ImportAsNewDocument { name, output } => {
                     let w = output.width.max(1) as usize;
                     let h = output.height.max(1) as usize;
@@ -12205,6 +12467,7 @@ impl App {
         self.drain_editor_options_events();
         self.drain_credits_events();
         self.drain_img2pixel_events();
+        self.drain_import_banner_events();
 
         // Fixed top bar — painted LAST in the central-panel layer, after the
         // canvas and the docked panels, so it is above both. Floating dock
@@ -12379,7 +12642,13 @@ impl App {
         let mut full_output = ctx.run_ui(raw_input, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| self.ui_frame(ui));
+                .show(ui, |ui| {
+                    self.ui_frame(ui);
+                    // Flush canvas pixel edits made during this frame's input
+                    // handling into the same frame's `textures_delta` so strokes
+                    // and transforms present without a 1-frame texture delay.
+                    self.sync_texture();
+                });
         });
         let needs_redraw = self.needs_continuous_redraw(&full_output);
 
@@ -12566,13 +12835,14 @@ impl ApplicationHandler for App {
         .expect("Failed to request device");
 
         let initial_size = window.inner_size();
-        let config = surface
+        let mut config = surface
             .get_default_config(
                 &adapter,
                 initial_size.width.max(1),
                 initial_size.height.max(1),
             )
             .expect("Surface config unavailable");
+        crate::render::configure_low_latency_surface(&mut config);
         surface.configure(&device, &config);
 
         let renderer = RendererState::new(device, queue, surface, config);
@@ -26488,7 +26758,9 @@ mod tests {
     }
 
     #[test]
-    /// Given a live draw-tool drag, when the pointer moves outside the canvas, then nothing is painted at the clamped edge.
+    /// Given a live draw-tool drag, a fast outward swipe finishes cleanly to the
+    /// exit border, and subsequent off-canvas movement stays paused (does not
+    /// paint along the clamped edge).
     fn draw_tool_drag_does_not_paint_at_the_clamped_edge() {
         let ctx = egui::Context::default();
         let mut app = app_with_canvas(&ctx);
@@ -26498,12 +26770,18 @@ mod tests {
         run_app_frame(&mut app, &ctx, vec![press(egui::pos2(20.0, 20.0))]);
         run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(40.0, 40.0))]);
         run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(300.0, 300.0))]);
-        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(300.0, 300.0))]);
+        run_app_frame(&mut app, &ctx, vec![move_to(egui::pos2(300.0, 10.0))]);
+        run_app_frame(&mut app, &ctx, vec![release(egui::pos2(300.0, 10.0))]);
 
         let far = (CANVAS_WIDTH as i32 - 1, CANVAS_HEIGHT as i32 - 1);
         let buffer = app.projects.current().layers.active_layer().buffer.clone();
         assert_eq!(
             buffer.get_pixel(far.0 as usize, far.1 as usize),
+            Some(RED),
+            "fast outward swipe must complete cleanly to the canvas exit border"
+        );
+        assert_eq!(
+            buffer.get_pixel(far.0 as usize, 10),
             Some(Color::TRANSPARENT),
             "a draw tool must stay paused outside the canvas, not follow the clamp"
         );

@@ -84,6 +84,8 @@ pub enum TopBarEvent {
     ToggleColorPicker,
     /// Swap foreground and background colors (clicking the BG swatch in the top bar).
     SwapColors,
+    /// Open (or raise) the Select Banner panel (clicking the banner area in the top bar).
+    OpenBannerPicker,
     /// A menu-bar item was activated.
     MenuAction(MenuAction),
 }
@@ -723,9 +725,42 @@ impl TopBarHost {
         );
 
         // The bar claims its own rect so a click on empty bar space can never
-        // reach the canvas. Registered BEFORE the tab widgets so a tab, laid
-        // out later, wins the hit test where they overlap.
+        // reach the canvas. Registered BEFORE the tab and banner widgets so
+        // they win the hit test where they overlap.
         let _ = ui.interact(layout.top_rect, Id::new("top-bar-capture"), Sense::click());
+
+        // Invisible clickable banner hotspot on the right half of the middle
+        // slice (stays clear of the logo + FG/BG swatches on the left).
+        let hotspot_left = layout
+            .middle_rect
+            .center()
+            .x
+            .max(layout.middle_rect.left() + 140.0);
+        if hotspot_left < layout.middle_rect.right() && layout.middle_rect.height() > 0.0 {
+            let banner_hotspot = Rect::from_min_max(
+                pos2(hotspot_left, layout.middle_rect.top()),
+                layout.middle_rect.right_bottom(),
+            );
+            let banner_resp = ui
+                .interact(
+                    banner_hotspot,
+                    Id::new("top-bar-banner-hotspot"),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if banner_resp.hovered() {
+                painter.text(
+                    pos2(layout.menu_rect.right() - 10.0, layout.menu_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    "Click to change banner",
+                    FontId::proportional(11.5),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            if banner_resp.clicked() {
+                self.events.push(TopBarEvent::OpenBannerPicker);
+            }
+        }
 
         let text_color = ui.visuals().text_color();
 

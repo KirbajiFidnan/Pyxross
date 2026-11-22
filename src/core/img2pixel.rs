@@ -4,8 +4,10 @@
 //! hue, blur, sharpen), offset-aware downsampling, optional K-means palette
 //! extraction, ordered/error-diffusion dithering, and alpha thresholding.
 
+use serde::{Deserialize, Serialize};
+
 /// Downsampling filter used when reducing the source image to pixel-art size.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SampleMode {
     /// Crisp nearest-neighbor sampling with configurable sub-cell offset.
     Point,
@@ -29,7 +31,7 @@ impl SampleMode {
 }
 
 /// How output colors are quantized.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PaletteMode {
     /// Keep full 32-bit RGBA colors after adjustments & downsampling.
     Original,
@@ -53,7 +55,7 @@ impl PaletteMode {
 }
 
 /// Color distance metric used for palette matching and K-means clustering.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ColorDistanceMode {
     RgbEuclidean,
     #[default]
@@ -72,7 +74,7 @@ impl ColorDistanceMode {
 }
 
 /// Dithering algorithm applied during palette quantization.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DitherMode {
     None,
     Bayer2x2,
@@ -106,7 +108,8 @@ impl DitherMode {
 }
 
 /// Tunable parameters for [`process_image_to_pixel`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Img2PixelParams {
     pub target_width: u32,
     pub target_height: u32,
@@ -156,6 +159,30 @@ impl Default for Img2PixelParams {
 }
 
 impl Img2PixelParams {
+    /// Serializes all effect/size settings to pretty JSON for preset files.
+    pub fn to_json_pretty(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map_err(|e| format!("failed to serialize preset: {e}"))
+    }
+
+    /// Deserializes a preset JSON string, filling missing fields with defaults
+    /// and clamping numeric ranges safely.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let mut p: Self =
+            serde_json::from_str(json).map_err(|e| format!("invalid preset JSON: {e}"))?;
+        p.target_width = p.target_width.clamp(1, 512);
+        p.target_height = p.target_height.clamp(1, 512);
+        p.kmeans_colors = p.kmeans_colors.clamp(2, 64);
+        p.blur = p.blur.clamp(0.0, 4.0);
+        p.sharpen = p.sharpen.clamp(0.0, 2.0);
+        p.dither_amount = p.dither_amount.clamp(0.0, 1.0);
+        p.brightness = p.brightness.clamp(-1.0, 1.0);
+        p.contrast = p.contrast.clamp(0.2, 3.0);
+        p.saturation = p.saturation.clamp(0.0, 2.0);
+        p.hue_shift = p.hue_shift.clamp(-180.0, 180.0);
+        p.gamma = p.gamma.clamp(0.2, 3.0);
+        Ok(p)
+    }
+
     /// Returns defaults sized proportionally to `src_w × src_h` (clamped to
     /// `<= 64` on the longer edge while keeping at least `1`).
     pub fn for_source(src_w: u32, src_h: u32) -> Self {
@@ -853,5 +880,37 @@ mod tests {
                 "unexpected color {px:?}"
             );
         }
+    }
+
+    #[test]
+    fn params_json_roundtrip_and_missing_keys_preserve_defaults() {
+        let mut p = Img2PixelParams::default();
+        p.target_width = 96;
+        p.target_height = 48;
+        p.sample_mode = SampleMode::Point;
+        p.palette_mode = PaletteMode::ExtractKMeans;
+        p.kmeans_colors = 12;
+        p.dither_mode = DitherMode::FloydSteinberg;
+        p.dither_amount = 0.75;
+        p.brightness = 0.25;
+        p.contrast = 1.4;
+        p.saturation = 1.2;
+        p.hue_shift = -30.0;
+        p.gamma = 0.9;
+        p.blur = 1.5;
+        p.sharpen = 0.6;
+        p.alpha_threshold = 64;
+
+        let json = p.to_json_pretty().expect("serialize");
+        let loaded = Img2PixelParams::from_json(&json).expect("deserialize");
+        assert_eq!(loaded, p);
+
+        // Missing keys fall back to defaults cleanly.
+        let partial = Img2PixelParams::from_json(r#"{"kmeans_colors": 8}"#).expect("partial");
+        assert_eq!(partial.kmeans_colors, 8);
+        assert_eq!(partial.sample_mode, Img2PixelParams::default().sample_mode);
+
+        // Invalid JSON returns Err.
+        assert!(Img2PixelParams::from_json("{not json").is_err());
     }
 }

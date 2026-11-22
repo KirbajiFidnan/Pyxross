@@ -26,6 +26,16 @@ fn egui_target_format(config: &wgpu::SurfaceConfiguration) -> wgpu::TextureForma
     config.format
 }
 
+/// Tunes a `wgpu::SurfaceConfiguration` for low input-to-photon latency.
+///
+/// `Surface::get_default_config` leaves `desired_maximum_frame_latency` at 2+,
+/// which on Windows DX12/DWM queues 2–3 frames in the DXGI swapchain and makes
+/// brush strokes / drags visibly trail the cursor even at low CPU/GPU load.
+/// Setting it to `1` keeps VSync tear-free while eliminating swapchain backlog.
+pub fn configure_low_latency_surface(config: &mut wgpu::SurfaceConfiguration) {
+    config.desired_maximum_frame_latency = 1;
+}
+
 impl RendererState {
     pub fn new(
         device: wgpu::Device,
@@ -138,6 +148,7 @@ impl RendererState {
         drop(render_pass);
 
         self.queue.submit(Some(encoder.finish()));
+        window.pre_present_notify();
         self.queue.present(surface_texture);
 
         Ok(())
@@ -185,5 +196,13 @@ mod tests {
             egui_target_format(&bgra),
             wgpu::TextureFormat::Bgra8UnormSrgb
         );
+    }
+
+    #[test]
+    fn configure_low_latency_surface_sets_single_frame_latency() {
+        let mut cfg = config_with_format(wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(cfg.desired_maximum_frame_latency, 2);
+        configure_low_latency_surface(&mut cfg);
+        assert_eq!(cfg.desired_maximum_frame_latency, 1);
     }
 }

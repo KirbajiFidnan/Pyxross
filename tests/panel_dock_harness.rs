@@ -3012,6 +3012,177 @@ fn clicking_a_floating_panel_raises_it_above_the_other() {
     let _ = front_layer;
 }
 
+/// Clicking inside the overlapping region of two stacked floating panels keeps
+/// the topmost panel on top and never raises the occluded panel behind it.
+#[test]
+fn clicking_overlap_of_stacked_floating_panels_does_not_raise_background_panel() {
+    let ctx = egui::Context::default();
+    let theme = Theme::default_dark();
+    let front = PanelId::new(1);
+    let back = PanelId::new(2);
+    let mut manager = DockManager::try_new([
+        PanelSpec {
+            id: front,
+            metadata: PanelMetadata::new("Front", true, vec2(120.0, 120.0)),
+            placement: PanelPlacement::Floating,
+            floating_rect: Rect::from_min_size(pos2(100.0, 100.0), vec2(200.0, 200.0)),
+            content: Box::new(EmptyContent),
+        },
+        PanelSpec {
+            id: back,
+            metadata: PanelMetadata::new("Back", true, vec2(120.0, 120.0)),
+            placement: PanelPlacement::Floating,
+            floating_rect: Rect::from_min_size(pos2(200.0, 105.0), vec2(200.0, 200.0)),
+            content: Box::new(EmptyContent),
+        },
+    ])
+    .unwrap();
+    let capture = InputCapture::new();
+    let chrome = PanelChrome::flat(&theme, &capture, SurfaceId::Panel(front));
+    let frame = |manager: &mut DockManager, events: Vec<egui::Event>| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| manager.show_inside(ui, &chrome));
+            },
+        );
+        output.textures_delta.clear();
+    };
+
+    // Put `front` (lower PanelId) on top of `back` (higher PanelId).
+    manager.raise_floating(front);
+    frame(&mut manager, vec![]);
+    frame(&mut manager, vec![]);
+    assert_eq!(manager.floating_order().last(), Some(&front));
+
+    // Click inside the actual overlap region — covered by both panels' headers.
+    let front_rect = manager.floating_rect(front).unwrap();
+    let back_rect = manager.floating_rect(back).unwrap();
+    let overlap = pos2(front_rect.intersect(back_rect).center().x, back_rect.top() + 14.0);
+    assert!(front_rect.contains(overlap) && back_rect.contains(overlap));
+    frame(&mut manager, vec![egui::Event::PointerMoved(overlap)]);
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: overlap,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: overlap,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    // `front` MUST remain on top; `back` must NOT be raised.
+    assert_eq!(manager.floating_order().last(), Some(&front));
+
+    // Now click on `back` outside the overlap (away from the right-side header Dock button) -> `back` rises.
+    let front_rect = manager.floating_rect(front).unwrap();
+    let back_rect = manager.floating_rect(back).unwrap();
+    let back_only = pos2(back_rect.right() - 65.0, back_rect.top() + 14.0);
+    assert!(!front_rect.contains(back_only) && back_rect.contains(back_only));
+    frame(&mut manager, vec![egui::Event::PointerMoved(back_only)]);
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: back_only,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: back_only,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(
+        manager.floating_order().last(),
+        Some(&back),
+        "order={:?} front={:?} back={:?} back_only={:?} layer={:?}",
+        manager.floating_order(),
+        manager.floating_rect(front),
+        manager.floating_rect(back),
+        back_only,
+        ctx.layer_id_at(back_only),
+    );
+    let back_layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("panel-dock-floating", back.raw())),
+    );
+    let front_layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("panel-dock-floating", front.raw())),
+    );
+    assert_eq!(ctx.layer_id_at(overlap), Some(back_layer));
+
+    // Raise `front` again by clicking `front` outside the overlap, then verify
+    // egui's actual hit-test layer at `overlap` is `front` (NOT `back`!) and
+    // clicking `overlap` keeps `front` on top.
+    let front_only = pos2(front_rect.left() + 10.0, front_rect.top() + 14.0);
+    assert!(front_rect.contains(front_only) && !back_rect.contains(front_only));
+    frame(&mut manager, vec![egui::Event::PointerMoved(front_only)]);
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: front_only,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: front_only,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(manager.floating_order().last(), Some(&front));
+    assert_eq!(ctx.layer_id_at(overlap), Some(front_layer));
+
+    // Click inside overlap again -> `front` MUST stay on top in both MRU and egui layer stack.
+    frame(&mut manager, vec![egui::Event::PointerMoved(overlap)]);
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: overlap,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    frame(
+        &mut manager,
+        vec![egui::Event::PointerButton {
+            pos: overlap,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(manager.floating_order().last(), Some(&front));
+    assert_eq!(ctx.layer_id_at(overlap), Some(front_layer));
+}
+
 /// The static nest masks the wheel while another surface owns a gesture.
 #[test]
 fn static_nest_wheel_is_masked_while_another_surface_owns_the_gesture() {

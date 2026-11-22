@@ -48,6 +48,34 @@ pub fn banner_search_dirs() -> Vec<PathBuf> {
     dirs_out
 }
 
+/// Returns the preferred writable `banners/` directory (creating it if needed):
+/// 1. `<cwd>/banners` if it already exists,
+/// 2. `<exe_dir>/banners` if it already exists,
+/// 3. `<config>/pyxross/banners` (always created on demand).
+pub fn writable_banners_dir() -> Result<PathBuf, String> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let dir = cwd.join("banners");
+        if dir.is_dir() {
+            return Ok(dir);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let dir = parent.join("banners");
+            if dir.is_dir() {
+                return Ok(dir);
+            }
+        }
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        let dir = cfg.join("pyxross").join("banners");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create banners directory: {e}"))?;
+        return Ok(dir);
+    }
+    Err("Could not determine a writable banners directory".to_owned())
+}
+
 /// Scans the given directories for banner images, deduplicating by file name.
 pub fn scan_banners_in(dirs: &[PathBuf]) -> Vec<BannerEntry> {
     let mut seen = HashSet::new();

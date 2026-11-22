@@ -72,6 +72,10 @@ pub enum SaveAsKind {
     Aseprite,
     /// Selection PNG export.
     SelectionPng,
+    /// Image-to-Pixel effect preset `.json` save.
+    Img2PixelPreset,
+    /// Custom UI style theme `.json` save.
+    StyleTheme,
 }
 
 impl SaveAsKind {
@@ -85,6 +89,8 @@ impl SaveAsKind {
             SaveAsKind::Pyxel => "Export .pyxel",
             SaveAsKind::Aseprite => "Export .ase",
             SaveAsKind::SelectionPng => "Export Selection PNG",
+            SaveAsKind::Img2PixelPreset => "Save Preset",
+            SaveAsKind::StyleTheme => "Save Theme",
         }
     }
 
@@ -99,6 +105,8 @@ impl SaveAsKind {
             SaveAsKind::Pyxel => "project",
             SaveAsKind::Aseprite => "project",
             SaveAsKind::SelectionPng => "selection",
+            SaveAsKind::Img2PixelPreset => "preset",
+            SaveAsKind::StyleTheme => "custom_theme",
         }
     }
 }
@@ -132,12 +140,14 @@ pub fn formats_for(kind: SaveAsKind) -> &'static [&'static str] {
     const GIF: &[&str] = &[".gif"];
     const PYXEL: &[&str] = &[".pyxel"];
     const ASE: &[&str] = &[".ase", ".aseprite"];
+    const JSON: &[&str] = &[".json"];
     match kind {
         SaveAsKind::Project => PROJECT,
         SaveAsKind::Image | SaveAsKind::SpriteSheet | SaveAsKind::SelectionPng => PNG,
         SaveAsKind::Gif => GIF,
         SaveAsKind::Pyxel => PYXEL,
         SaveAsKind::Aseprite => ASE,
+        SaveAsKind::Img2PixelPreset | SaveAsKind::StyleTheme => JSON,
     }
 }
 

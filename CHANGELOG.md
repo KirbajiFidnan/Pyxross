@@ -2,6 +2,23 @@
 
 All notable changes to **Pyxross Workshop** are documented in this file.
 
+## [0.9.1] - 2026-11-22
+
+### Added
+- **File Manager:** sortable `Name`, `Size`, and `Modified` columns (ascending/descending), live autocomplete search in `File name` (including extension matching like `.png` with `Tab` completion), and a `File type` filter dropdown.
+- **Image-to-Pixel:** smooth pointer-centered preview zoom & pan with `Fit` reset, plus `Save Preset` and `Load Preset` (`.json`) controls in the `Size` tab.
+- **Import Banner Panel:** new two-column banner importer launched from `Select Banner` with `Banner Name` input, `Cut (8:1)` / `Full Image` modes, zoomable/pannable preview, draggable 8:1 crop frame with shaded exterior, and direct PNG export into `banners/`.
+- **Top-Bar Banner Shortcut:** invisible clickable hotspot on the top-bar banner region with a subtle `"Click to change banner"` hover hint in the top-right corner.
+- **Style Panel:** ergonomic `Save` (enabled when customized) and `Load` theme dialog workflow and a `Spacing` slider.
+- **Key Bindings Panel:** redesigned with live search, category filter tabs (`Tools`, `Edit`, `Transform`, `File`, `Import / Export`, `View`), click-to-record monospace keycap badges, inline conflict indicators, manual key/modifier popover, and a pinned `Reset` / `Apply` footer.
+
+### Fixed
+- **Windows Input & Render Latency:** configured swapchain `desired_maximum_frame_latency = 1`, added `window.pre_present_notify()`, and flushed canvas texture uploads in the same frame after input handling to eliminate multi-frame cursor lag.
+- **Overlapping Panel Z-Order:** clicking the front floating panel (or foreground popups) no longer raises occluded background panels or triggers background header drags.
+- **Fast Canvas Edge Strokes:** rapid inward and outward brush swipes now interpolate cleanly across canvas borders without missing edge pixels while staying paused during off-canvas motion.
+- **Panel Layout & Scrollbars:** fixed narrow-panel slider/button overlap in `Style`, pinned top action buttons in resizable `Select Banner`, eliminated resize scrollbar flicker and text overflow in `File Manager`, and kept `Key Bindings` footer buttons clear of scrollbars.
+- **Pencil Default Shortcut:** guarded test keymap persistence so unit tests cannot overwrite user `keybindings.json` (keeping Pencil on `D`).
+
 ## [0.9.0] - 2026-11-20
 
 ### Added

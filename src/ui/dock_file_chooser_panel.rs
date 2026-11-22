@@ -32,7 +32,9 @@ use std::rc::Rc;
 
 use egui::vec2;
 
-use crate::ui::panel_dock::nest::{Component, NestContent, NestMode, NestView};
+use crate::ui::panel_dock::nest::{
+    nest_is_usable, nest_viewport, Component, NestContent, NestMode, NestView,
+};
 use crate::ui::panel_dock::{
     ButtonStyle, PanelChrome, PanelContent, PanelId, PanelMetadata, PanelPlacement, PanelSpec,
 };
@@ -65,6 +67,12 @@ pub enum FileChooserMode {
     ImportAseprite,
     /// Pick an image (PNG/JPG/BMP/WebP/TGA/GIF) to convert to pixel art.
     ImportImage2Pixel,
+    /// Pick an image (PNG/JPG/BMP/WebP/TGA/GIF) to crop & import as a banner.
+    ImportBanner,
+    /// Pick a `.json` Image-to-Pixel preset file to load.
+    LoadImg2PixelPreset,
+    /// Pick a `.json` Style theme file to load.
+    LoadStyleTheme,
     /// Pick a destination folder (save-as "Change…").
     ChooseFolder,
 }
@@ -80,6 +88,9 @@ impl FileChooserMode {
             FileChooserMode::ImportPyxel => "Import Pyxel",
             FileChooserMode::ImportAseprite => "Import Aseprite",
             FileChooserMode::ImportImage2Pixel => "Import Image 2 Pixel",
+            FileChooserMode::ImportBanner => "Import Banner",
+            FileChooserMode::LoadImg2PixelPreset => "Load Preset",
+            FileChooserMode::LoadStyleTheme => "Load Theme",
             FileChooserMode::ChooseFolder => "Choose Folder",
         }
     }
@@ -93,7 +104,99 @@ impl FileChooserMode {
             FileChooserMode::ImportPyxel => "Import",
             FileChooserMode::ImportAseprite => "Import",
             FileChooserMode::ImportImage2Pixel => "Import",
+            FileChooserMode::ImportBanner => "Open",
+            FileChooserMode::LoadImg2PixelPreset => "Load",
+            FileChooserMode::LoadStyleTheme => "Load",
             FileChooserMode::ChooseFolder => "Choose",
+        }
+    }
+}
+
+/// Sort column for the file listing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SortColumn {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+/// Sort direction for the file listing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub fn toggle(self) -> Self {
+        match self {
+            SortDirection::Ascending => SortDirection::Descending,
+            SortDirection::Descending => SortDirection::Ascending,
+        }
+    }
+}
+
+/// File type filter selectable in the File Manager footer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FileTypeFilter {
+    /// Mode's built-in default filter.
+    #[default]
+    ModeDefault,
+    /// All files in the directory.
+    AllFiles,
+    /// PNG images (`*.png`).
+    Png,
+    /// All supported images (`*.png, *.jpg, *.jpeg, *.bmp, *.webp, *.tga, *.gif`).
+    Images,
+    /// GIF animations (`*.gif`).
+    Gif,
+    /// Pyxross projects (`*.pyxross`, `manifest.json`).
+    PyxrossProject,
+    /// Pyxel Edit projects (`*.pyxel`).
+    Pyxel,
+    /// Aseprite files (`*.ase`, `*.aseprite`).
+    Aseprite,
+    /// JSON files (`*.json`).
+    Json,
+}
+
+impl FileTypeFilter {
+    pub const ALL: [Self; 9] = [
+        Self::ModeDefault,
+        Self::AllFiles,
+        Self::Png,
+        Self::Images,
+        Self::Gif,
+        Self::PyxrossProject,
+        Self::Pyxel,
+        Self::Aseprite,
+        Self::Json,
+    ];
+
+    pub fn label(self, mode: FileChooserMode) -> &'static str {
+        match self {
+            Self::ModeDefault => match mode {
+                FileChooserMode::OpenProject => "Default (Projects)",
+                FileChooserMode::ImportPng => "Default (*.png)",
+                FileChooserMode::ImportGif => "Default (*.gif)",
+                FileChooserMode::ImportPyxel => "Default (*.pyxel)",
+                FileChooserMode::ImportAseprite => "Default (*.ase, *.aseprite)",
+                FileChooserMode::ImportImage2Pixel => "Default (Images)",
+                FileChooserMode::ImportBanner => "Default (Images)",
+                FileChooserMode::LoadImg2PixelPreset => "Default (*.json)",
+                FileChooserMode::LoadStyleTheme => "Default (*.json)",
+                FileChooserMode::ChooseFolder => "Folders",
+            },
+            Self::AllFiles => "All Files (*.*)",
+            Self::Png => "PNG Images (*.png)",
+            Self::Images => "All Images (*.png, *.jpg, ...)",
+            Self::Gif => "GIF Animations (*.gif)",
+            Self::PyxrossProject => "Pyxross (*.pyxross)",
+            Self::Pyxel => "Pyxel Edit (*.pyxel)",
+            Self::Aseprite => "Aseprite (*.ase, *.aseprite)",
+            Self::Json => "JSON Files (*.json)",
         }
     }
 }
@@ -104,6 +207,8 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    pub size_bytes: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// The in-progress chooser state (dialog draft, not model data).
@@ -112,13 +217,13 @@ pub struct FileChooserView {
     pub mode: FileChooserMode,
     /// Directory currently listed.
     pub cwd: PathBuf,
-    /// Filtered + sorted listing of `cwd` (rebuilt on navigation only).
+    /// Filtered + sorted listing of `cwd` (rebuilt on navigation/sort/filter).
     pub entries: Vec<Entry>,
     /// Currently highlighted entry (single click), `None` = nothing selected.
     pub selected: Option<PathBuf>,
     /// Editable path row; Enter / the ancestor dropdown navigate to it.
     pub path_edit: String,
-    /// Bottom "File name" text: the selected entry's name, or a typed name.
+    /// Bottom "File name" text: the selected entry's name, or a typed search/name.
     pub name_edit: String,
     /// Navigation history, oldest first; `history[history_pos] == cwd`.
     pub history: Vec<PathBuf>,
@@ -128,6 +233,12 @@ pub struct FileChooserView {
     pub error: Option<String>,
     /// Set by the opener so the panel focuses the path row once.
     pub focus_requested: bool,
+    /// Active sort column (Name, Size, Modified).
+    pub sort_column: SortColumn,
+    /// Active sort direction (Ascending, Descending).
+    pub sort_direction: SortDirection,
+    /// Active file type filter.
+    pub type_filter: FileTypeFilter,
 }
 
 impl Default for FileChooserView {
@@ -143,6 +254,9 @@ impl Default for FileChooserView {
             history_pos: 0,
             error: None,
             focus_requested: false,
+            sort_column: SortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+            type_filter: FileTypeFilter::ModeDefault,
         }
     }
 }
@@ -191,7 +305,39 @@ pub fn matches_filter(mode: FileChooserMode, path: &Path) -> bool {
         FileChooserMode::ImportAseprite => path.extension().is_some_and(|ext| {
             ext.eq_ignore_ascii_case("ase") || ext.eq_ignore_ascii_case("aseprite")
         }),
-        FileChooserMode::ImportImage2Pixel => path.extension().is_some_and(|ext| {
+        FileChooserMode::ImportImage2Pixel | FileChooserMode::ImportBanner => {
+            path.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("png")
+                    || ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("bmp")
+                    || ext.eq_ignore_ascii_case("webp")
+                    || ext.eq_ignore_ascii_case("tga")
+                    || ext.eq_ignore_ascii_case("gif")
+            })
+        }
+        FileChooserMode::LoadImg2PixelPreset | FileChooserMode::LoadStyleTheme => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
+    }
+}
+
+/// Whether a path matches the active `FileTypeFilter` (falling back to
+/// `matches_filter(mode, path)` for `ModeDefault`).
+pub fn matches_type_filter(mode: FileChooserMode, filter: FileTypeFilter, path: &Path) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    if mode == FileChooserMode::ChooseFolder {
+        return false;
+    }
+    match filter {
+        FileTypeFilter::ModeDefault => matches_filter(mode, path),
+        FileTypeFilter::AllFiles => true,
+        FileTypeFilter::Png => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
+        FileTypeFilter::Images => path.extension().is_some_and(|ext| {
             ext.eq_ignore_ascii_case("png")
                 || ext.eq_ignore_ascii_case("jpg")
                 || ext.eq_ignore_ascii_case("jpeg")
@@ -200,37 +346,158 @@ pub fn matches_filter(mode: FileChooserMode, path: &Path) -> bool {
                 || ext.eq_ignore_ascii_case("tga")
                 || ext.eq_ignore_ascii_case("gif")
         }),
+        FileTypeFilter::Gif => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gif")),
+        FileTypeFilter::PyxrossProject => {
+            path.file_name().is_some_and(|name| name == "manifest.json")
+                || path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pyxross"))
+        }
+        FileTypeFilter::Pyxel => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pyxel")),
+        FileTypeFilter::Aseprite => path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("ase") || ext.eq_ignore_ascii_case("aseprite")
+        }),
+        FileTypeFilter::Json => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
     }
 }
 
-/// Sorts a listing: directories first, then names case-insensitively.
-pub fn sort_entries(mut entries: Vec<Entry>) -> Vec<Entry> {
+/// Sorts a listing: directories first, then by `column` in `direction` with
+/// case-insensitive name tie-breaking.
+pub fn sort_entries_by(
+    mut entries: Vec<Entry>,
+    column: SortColumn,
+    direction: SortDirection,
+) -> Vec<Entry> {
     entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            let primary = match column {
+                SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
+                SortColumn::Modified => a.modified.cmp(&b.modified),
+            };
+            let directed = match direction {
+                SortDirection::Ascending => primary,
+                SortDirection::Descending => primary.reverse(),
+            };
+            directed.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        })
     });
     entries
 }
 
-/// Lists `dir` filtered for `mode` and sorted. A missing/unreadable directory
-/// is a `Err` with a user-facing message.
-pub fn read_dir_entries(mode: FileChooserMode, dir: &Path) -> Result<Vec<Entry>, String> {
+/// Sorts a listing: directories first, then names case-insensitively.
+pub fn sort_entries(entries: Vec<Entry>) -> Vec<Entry> {
+    sort_entries_by(entries, SortColumn::Name, SortDirection::Ascending)
+}
+
+/// Returns entries whose names contain `query` (case-insensitive substring),
+/// used for live autocomplete in the "File name" input.
+pub fn autocomplete_matches<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|e| e.name.to_lowercase().contains(&q))
+        .collect()
+}
+
+/// Human-readable byte size (`"—"` for directories).
+pub fn format_entry_size(entry: &Entry) -> String {
+    if entry.is_dir {
+        return "—".to_owned();
+    }
+    let bytes = entry.size_bytes;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// Formats a `SystemTime` as `YYYY-MM-DD HH:MM` (UTC, zero external deps).
+pub fn format_modified_time(modified: Option<std::time::SystemTime>) -> String {
+    let Some(time) = modified else {
+        return "—".to_owned();
+    };
+    let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH) else {
+        return "—".to_owned();
+    };
+    let secs = dur.as_secs();
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    // Howard Hinnant's civil_from_days algorithm (exact proleptic Gregorian).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
+}
+
+/// Lists `dir` filtered for `mode` + `filter` and sorted by `column` / `direction`.
+pub fn read_dir_entries_filtered(
+    mode: FileChooserMode,
+    filter: FileTypeFilter,
+    column: SortColumn,
+    direction: SortDirection,
+    dir: &Path,
+) -> Result<Vec<Entry>, String> {
     let entries =
         std::fs::read_dir(dir).map_err(|err| format!("cannot read {}: {err}", dir.display()))?;
     let mut out = Vec::new();
     for item in entries.flatten() {
         let path = item.path();
-        if !matches_filter(mode, &path) {
+        if !matches_type_filter(mode, filter, &path) {
             continue;
         }
+        let meta = item.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or_else(|| path.is_dir());
+        let size_bytes = if is_dir {
+            0
+        } else {
+            meta.as_ref().map(|m| m.len()).unwrap_or(0)
+        };
+        let modified = meta.and_then(|m| m.modified().ok());
         out.push(Entry {
             name: item.file_name().to_string_lossy().into_owned(),
-            is_dir: path.is_dir(),
+            is_dir,
             path,
+            size_bytes,
+            modified,
         });
     }
-    Ok(sort_entries(out))
+    Ok(sort_entries_by(out, column, direction))
+}
+
+/// Lists `dir` filtered for `mode` and sorted. A missing/unreadable directory
+/// is a `Err` with a user-facing message.
+pub fn read_dir_entries(mode: FileChooserMode, dir: &Path) -> Result<Vec<Entry>, String> {
+    read_dir_entries_filtered(
+        mode,
+        FileTypeFilter::ModeDefault,
+        SortColumn::Name,
+        SortDirection::Ascending,
+        dir,
+    )
 }
 
 /// The parent directory of `path` (the chooser's "Up" target).
@@ -279,7 +546,13 @@ fn set_directory(view: &mut FileChooserView, dir: PathBuf) -> Result<(), String>
     view.path_edit = dir.display().to_string();
     view.selected = None;
     view.name_edit.clear();
-    match read_dir_entries(view.mode, &dir) {
+    match read_dir_entries_filtered(
+        view.mode,
+        view.type_filter,
+        view.sort_column,
+        view.sort_direction,
+        &dir,
+    ) {
         Ok(entries) => {
             view.entries = entries;
             view.error = None;
@@ -378,7 +651,7 @@ fn unique_child_dir(base: &Path) -> PathBuf {
 /// filter, so `Chosen` never carries a path the shell would not accept.
 pub fn confirm_selection(view: &FileChooserView) -> Result<PathBuf, String> {
     if let Some(path) = &view.selected {
-        if !matches_filter(view.mode, path) {
+        if !matches_type_filter(view.mode, view.type_filter, path) {
             return Err(format!("'{}' is not valid for this dialog", path.display()));
         }
         return Ok(path.clone());
@@ -389,7 +662,7 @@ pub fn confirm_selection(view: &FileChooserView) -> Result<PathBuf, String> {
         if !candidate.exists() && !candidate.is_dir() {
             return Err(format!("'{}' does not exist", candidate.display()));
         }
-        if !matches_filter(view.mode, &candidate) {
+        if !matches_type_filter(view.mode, view.type_filter, &candidate) {
             return Err(format!("'{}' is not valid for this dialog", candidate.display()));
         }
         return Ok(candidate);
@@ -412,6 +685,8 @@ struct ChooserActions {
     up: bool,
     confirm: bool,
     cancel: bool,
+    sort_click: Option<SortColumn>,
+    type_filter_change: Option<FileTypeFilter>,
 }
 
 impl ChooserActions {
@@ -498,8 +773,8 @@ impl FileChooserComponent {
     }
 }
 
-impl Component for FileChooserComponent {
-    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+impl FileChooserComponent {
+    fn render(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
         // Copy the draft out of the host cell so the borrow is released
         // before the widgets run; state changes are written back at the end.
         let (
@@ -513,6 +788,9 @@ impl Component for FileChooserComponent {
             history_len,
             error,
             focus_requested,
+            sort_column,
+            sort_direction,
+            type_filter,
         ) = {
             let v = self.host.view.borrow();
             (
@@ -526,6 +804,9 @@ impl Component for FileChooserComponent {
                 v.history.len(),
                 v.error.clone(),
                 v.focus_requested,
+                v.sort_column,
+                v.sort_direction,
+                v.type_filter,
             )
         };
         let mut actions = ChooserActions::default();
@@ -563,6 +844,7 @@ impl Component for FileChooserComponent {
                     ui,
                     chrome,
                     mode,
+                    type_filter,
                     &entries,
                     selected.as_deref(),
                     &mut name_edit,
@@ -612,7 +894,15 @@ impl Component for FileChooserComponent {
         }
 
         // The listing well grows/shrinks with the panel and scrolls.
-        list_ui(ui, chrome, &entries, selected.as_deref(), &mut actions);
+        list_ui(
+            ui,
+            chrome,
+            &entries,
+            selected.as_deref(),
+            sort_column,
+            sort_direction,
+            &mut actions,
+        );
 
         // A navigation this frame consumes Enter (the path field / a folder
         // double-click must not also confirm).
@@ -635,6 +925,38 @@ impl Component for FileChooserComponent {
                 view.name_edit = file_name_of(&path);
             } else if name_edited {
                 view.selected = None;
+            }
+        }
+
+        // Apply sort column toggle.
+        if let Some(col) = actions.sort_click {
+            let mut view = self.host.view.borrow_mut();
+            if view.sort_column == col {
+                view.sort_direction = view.sort_direction.toggle();
+            } else {
+                view.sort_column = col;
+                view.sort_direction = match col {
+                    SortColumn::Name => SortDirection::Ascending,
+                    SortColumn::Size | SortColumn::Modified => SortDirection::Descending,
+                };
+            }
+            let next_entries = sort_entries_by(
+                std::mem::take(&mut view.entries),
+                view.sort_column,
+                view.sort_direction,
+            );
+            view.entries = next_entries;
+        }
+
+        // Apply file type filter change.
+        if let Some(next_filter) = actions.type_filter_change {
+            let mut view = self.host.view.borrow_mut();
+            if view.type_filter != next_filter {
+                view.type_filter = next_filter;
+                let dir = view.cwd.clone();
+                if dir.is_dir() {
+                    let _ = set_directory(&mut view, dir);
+                }
             }
         }
 
@@ -774,11 +1096,14 @@ fn toolbar_ui(
     });
 }
 
-/// The pinned footer: "File name" + quick-pick, inline error and OK / Cancel.
+/// The pinned footer: "File name" + live autocomplete + quick-pick, "File type"
+/// filter, inline error and OK / Cancel.
+#[allow(clippy::too_many_arguments)]
 fn footer_ui(
     ui: &mut egui::Ui,
     chrome: &PanelChrome,
     mode: FileChooserMode,
+    type_filter: FileTypeFilter,
     entries: &[Entry],
     selected: Option<&Path>,
     name_edit: &mut String,
@@ -786,25 +1111,51 @@ fn footer_ui(
     actions: &mut ChooserActions,
 ) {
     ui.add_space(2.0);
+    let mut name_edit_rect = egui::Rect::NOTHING;
+    let mut name_has_focus = false;
+    let matches = autocomplete_matches(entries, name_edit);
+    let exact_selected = selected
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name_edit.trim()));
+
     ui.horizontal(|ui| {
         ui.label("File name:");
-        ui.add(
+        let edit_w = (ui.available_width() - 40.0).max(60.0);
+        let resp = ui.add(
             egui::TextEdit::singleline(name_edit)
                 .hint_text(if mode == FileChooserMode::ChooseFolder {
-                    "current folder (or enter subfolder)"
+                    "current folder (or type to search)"
                 } else {
-                    "selected file"
+                    "type name or extension (e.g. .png)"
                 })
-                .desired_width((ui.available_width() - 40.0).max(60.0)),
+                .desired_width(edit_w),
         );
+        name_edit_rect = resp.rect;
+        name_has_focus = resp.has_focus();
+
+        // Tab autocompletes the top match while typing in File name.
+        if name_has_focus
+            && !matches.is_empty()
+            && !exact_selected
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            actions.select = Some(matches[0].path.clone());
+        }
+
+        // Quick-pick dropdown (filtered by typed query when non-empty).
+        let dropdown_items: Vec<&Entry> = if name_edit.trim().is_empty() || exact_selected {
+            entries.iter().collect()
+        } else {
+            matches.clone()
+        };
         egui::ComboBox::from_id_salt("chooser-name-pick")
             .selected_text("▾")
             .width(220.0)
             .show_ui(ui, |ui| {
-                if entries.is_empty() {
-                    ui.weak("(empty)");
+                if dropdown_items.is_empty() {
+                    ui.weak("(no matches)");
                 }
-                for entry in entries {
+                for entry in dropdown_items {
                     let is_selected = selected == Some(entry.path.as_path());
                     if ui.selectable_label(is_selected, &entry.name).clicked() {
                         actions.select = Some(entry.path.clone());
@@ -812,6 +1163,41 @@ fn footer_ui(
                 }
             });
     });
+
+    // Live autocomplete popup anchored above the File name input while typing.
+    if name_has_focus && !name_edit.trim().is_empty() && !exact_selected && !matches.is_empty() {
+        let shown: Vec<&Entry> = matches.iter().copied().take(8).collect();
+        let row_h = 22.0;
+        let popup_h = (shown.len() as f32 * row_h + 8.0).min(200.0);
+        let popup_pos = egui::pos2(name_edit_rect.left(), (name_edit_rect.top() - popup_h - 2.0).max(4.0));
+        egui::Area::new(ui.id().with("chooser-autocomplete-popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(popup_pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(chrome.colors.panel_bg32())
+                    .stroke(egui::Stroke::new(1.0, chrome.colors.panel_border32()))
+                    .inner_margin(egui::Margin::symmetric(4, 3))
+                    .show(ui, |ui| {
+                        ui.set_min_width(name_edit_rect.width().max(180.0));
+                        ui.set_max_width(name_edit_rect.width().max(260.0));
+                        for entry in shown {
+                            let label = if entry.is_dir {
+                                format!("{}/", entry.name)
+                            } else {
+                                entry.name.clone()
+                            };
+                            let resp = ui.add(
+                                egui::Button::selectable(false, label)
+                                    .min_size(egui::vec2(ui.available_width(), row_h - 2.0)),
+                            );
+                            if resp.clicked() {
+                                actions.select = Some(entry.path.clone());
+                            }
+                        }
+                    });
+            });
+    }
 
     if let Some(message) = error {
         ui.label(egui::RichText::new(message).color(ui.visuals().error_fg_color));
@@ -828,46 +1214,159 @@ fn footer_ui(
         if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
             actions.cancel = true;
         }
+        if mode != FileChooserMode::ChooseFolder {
+            ui.add_space(16.0);
+            ui.label("File type:");
+            egui::ComboBox::from_id_salt("chooser-file-type")
+                .selected_text(type_filter.label(mode))
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for candidate in FileTypeFilter::ALL {
+                        if ui
+                            .selectable_label(type_filter == candidate, candidate.label(mode))
+                            .clicked()
+                        {
+                            actions.type_filter_change = Some(candidate);
+                        }
+                    }
+                });
+        }
     });
+    ui.add_space(4.0);
 }
 
-/// The darker, zebra-striped listing well. Takes the available height and
-/// scrolls. Directories are listed first (see [`sort_entries`]).
+const SIZE_COL_WIDTH: f32 = 72.0;
+const MODIFIED_COL_WIDTH: f32 = 114.0;
+const HEADER_BAR_HEIGHT: f32 = 24.0;
+
+fn sort_header_label(title: &str, column: SortColumn, active: SortColumn, dir: SortDirection) -> String {
+    if column == active {
+        let arrow = match dir {
+            SortDirection::Ascending => "▲",
+            SortDirection::Descending => "▼",
+        };
+        format!("{title} {arrow}")
+    } else {
+        title.to_owned()
+    }
+}
+
+/// The darker, zebra-striped listing well with sortable Name / Size / Modified
+/// column headers. Takes the available height and scrolls.
 fn list_ui(
     ui: &mut egui::Ui,
     chrome: &PanelChrome,
     entries: &[Entry],
     selected: Option<&Path>,
+    sort_column: SortColumn,
+    sort_direction: SortDirection,
     actions: &mut ChooserActions,
 ) {
     let list_rect = ui.available_rect_before_wrap();
     ui.painter()
         .rect_filled(list_rect, 2.0, chrome.colors.list_bg32());
 
-    egui::ScrollArea::vertical()
-        .id_salt(ui.id().with("chooser-list"))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            if entries.is_empty() {
-                ui.add_space(4.0);
-                ui.weak("(no matching entries)");
-                return;
-            }
-            for (index, entry) in entries.iter().enumerate() {
-                row_ui(ui, chrome, entry, index, selected, actions);
-            }
-        });
+    // Hard-clip the entire listing area so long filenames or layout frames
+    // during resize can NEVER bleed into the Preview pane.
+    ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| {
+        ui.set_clip_rect(list_rect.intersect(ui.clip_rect()));
+        ui.set_max_width(list_rect.width());
+
+        // Sortable column header bar (reserves right gutter matching the list scrollbar).
+        let show_extra_cols = ui.available_width() >= 280.0;
+        egui::Frame::NONE
+            .fill(chrome.colors.panel_header_bg32())
+            .stroke(egui::Stroke::new(1.0, chrome.colors.panel_border32()))
+            .inner_margin(egui::Margin {
+                left: 6,
+                right: 18,
+                top: 2,
+                bottom: 2,
+            })
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(HEADER_BAR_HEIGHT - 4.0);
+                ui.horizontal(|ui| {
+                    let total_w = ui.available_width();
+                    let name_w = if show_extra_cols {
+                        (total_w - SIZE_COL_WIDTH - MODIFIED_COL_WIDTH - 16.0).max(80.0)
+                    } else {
+                        total_w.max(60.0)
+                    };
+                    let name_lbl =
+                        sort_header_label("Name", SortColumn::Name, sort_column, sort_direction);
+                    if ui
+                        .add_sized(
+                            egui::vec2(name_w, HEADER_BAR_HEIGHT - 4.0),
+                            egui::Button::new(name_lbl).frame(false),
+                        )
+                        .clicked()
+                    {
+                        actions.sort_click = Some(SortColumn::Name);
+                    }
+                    if show_extra_cols {
+                        let size_lbl = sort_header_label(
+                            "Size",
+                            SortColumn::Size,
+                            sort_column,
+                            sort_direction,
+                        );
+                        if ui
+                            .add_sized(
+                                egui::vec2(SIZE_COL_WIDTH, HEADER_BAR_HEIGHT - 4.0),
+                                egui::Button::new(size_lbl).frame(false),
+                            )
+                            .clicked()
+                        {
+                            actions.sort_click = Some(SortColumn::Size);
+                        }
+                        let mod_lbl = sort_header_label(
+                            "Modified",
+                            SortColumn::Modified,
+                            sort_column,
+                            sort_direction,
+                        );
+                        if ui
+                            .add_sized(
+                                egui::vec2(MODIFIED_COL_WIDTH, HEADER_BAR_HEIGHT - 4.0),
+                                egui::Button::new(mod_lbl).frame(false),
+                            )
+                            .clicked()
+                        {
+                            actions.sort_click = Some(SortColumn::Modified);
+                        }
+                    }
+                });
+            });
+
+        egui::ScrollArea::vertical()
+            .id_salt(ui.id().with("chooser-list"))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let inner_w = ui.available_width();
+                ui.set_min_width(inner_w);
+                ui.set_max_width(inner_w);
+                if entries.is_empty() {
+                    ui.add_space(4.0);
+                    ui.weak("(no matching entries)");
+                    return;
+                }
+                for (index, entry) in entries.iter().enumerate() {
+                    row_ui(ui, chrome, entry, index, selected, show_extra_cols, actions);
+                }
+            });
+    });
 }
 
 /// One listing row: a full-width Layers-style band (selection / hover / zebra
-/// fill) with a left-aligned, click-sensing name.
+/// fill) with left-aligned Name and right-aligned Size + Modified columns.
 fn row_ui(
     ui: &mut egui::Ui,
     chrome: &PanelChrome,
     entry: &Entry,
     index: usize,
     selected: Option<&Path>,
+    show_extra_cols: bool,
     actions: &mut ChooserActions,
 ) {
     let is_selected = selected == Some(entry.path.as_path());
@@ -888,16 +1387,28 @@ fn row_ui(
 
     egui::Frame::NONE
         .fill(background)
-        .inner_margin(egui::Margin::symmetric(4, 2))
+        .inner_margin(egui::Margin {
+            left: 6,
+            right: 18,
+            top: 2,
+            bottom: 2,
+        })
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_max_width(ui.available_width());
             ui.horizontal(|ui| {
-                // Left-aligned name: a left-to-right layout starts the text at
-                // the row's normal padding (NOT centered, unlike `add_sized`).
+                let total_w = ui.available_width();
+                let name_w = if show_extra_cols {
+                    (total_w - SIZE_COL_WIDTH - MODIFIED_COL_WIDTH - 16.0).max(60.0)
+                } else {
+                    total_w.max(60.0)
+                };
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), ROW_HEIGHT - 6.0),
+                    egui::vec2(name_w, ROW_HEIGHT - 6.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
+                        ui.set_min_width(name_w);
+                        ui.set_max_width(name_w);
                         ui.add(
                             egui::Label::new(&entry.name)
                                 .truncate()
@@ -905,6 +1416,44 @@ fn row_ui(
                         );
                     },
                 );
+                if show_extra_cols {
+                    let size_text = format_entry_size(entry);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIZE_COL_WIDTH, ROW_HEIGHT - 6.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(SIZE_COL_WIDTH);
+                            ui.set_max_width(SIZE_COL_WIDTH);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(size_text)
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        },
+                    );
+                    let mod_text = format_modified_time(entry.modified);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(MODIFIED_COL_WIDTH, ROW_HEIGHT - 6.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(MODIFIED_COL_WIDTH);
+                            ui.set_max_width(MODIFIED_COL_WIDTH);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(mod_text)
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        },
+                    );
+                }
             });
         });
 
@@ -928,14 +1477,31 @@ fn row_ui(
     }
 }
 
-/// Panel content: the static nest holding the file chooser form.
+/// Panel content: renders the file chooser directly inside the panel viewport
+/// without an outer Nest ScrollArea (so resizing never flashes outer scrollbars
+/// or clips the pinned footer).
 struct FileChooserPanelContent {
-    nest: NestContent,
+    component: FileChooserComponent,
 }
 
 impl PanelContent for FileChooserPanelContent {
     fn ui(&mut self, ui: &mut egui::Ui, chrome: &PanelChrome) {
-        self.nest.ui(ui, chrome);
+        let full = ui.available_rect_before_wrap();
+        ui.set_min_size(full.size());
+        let viewport = nest_viewport(full);
+        if !nest_is_usable(viewport) {
+            return;
+        }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |inner| {
+            inner.set_clip_rect(viewport.intersect(inner.clip_rect()));
+            self.component.render(inner, chrome);
+        });
+    }
+}
+
+impl Component for FileChooserComponent {
+    fn ui(&mut self, ui: &mut egui::Ui, _view: &NestView, chrome: &PanelChrome) {
+        self.render(ui, chrome);
     }
 }
 
@@ -1365,7 +1931,7 @@ pub fn file_chooser_panel_spec(host: &FileChooserHost, floating_rect: egui::Rect
         placement: PanelPlacement::Floating,
         floating_rect,
         content: Box::new(FileChooserPanelContent {
-            nest: build_file_chooser_nest(host),
+            component: FileChooserComponent::new(host.clone()),
         }),
     }
 }
@@ -1443,30 +2009,127 @@ mod tests {
                 name: "zeta.txt".to_owned(),
                 path: PathBuf::from("/z"),
                 is_dir: false,
+                size_bytes: 100,
+                modified: None,
             },
             Entry {
                 name: "Beta".to_owned(),
                 path: PathBuf::from("/b"),
                 is_dir: true,
+                size_bytes: 0,
+                modified: None,
             },
             Entry {
                 name: "alpha".to_owned(),
                 path: PathBuf::from("/a"),
                 is_dir: false,
+                size_bytes: 500,
+                modified: None,
             },
             Entry {
                 name: "Gamma".to_owned(),
                 path: PathBuf::from("/g"),
                 is_dir: true,
+                size_bytes: 0,
+                modified: None,
             },
         ];
-        let sorted = sort_entries(entries);
+        let sorted = sort_entries(entries.clone());
         let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["Beta", "Gamma", "alpha", "zeta.txt"],
             "directories first, then case-insensitive names"
         );
+
+        // Size descending keeps directories first, then largest file first.
+        let by_size = sort_entries_by(entries.clone(), SortColumn::Size, SortDirection::Descending);
+        let size_names: Vec<&str> = by_size.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(size_names, vec!["Beta", "Gamma", "alpha", "zeta.txt"]);
+
+        // Size ascending puts smallest file first.
+        let by_size_asc =
+            sort_entries_by(entries.clone(), SortColumn::Size, SortDirection::Ascending);
+        let size_asc_names: Vec<&str> = by_size_asc.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(size_asc_names, vec!["Beta", "Gamma", "zeta.txt", "alpha"]);
+
+        // Modified date sorting.
+        let t1 = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
+        let t2 = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_100_000));
+        let dated = vec![
+            Entry {
+                name: "old.png".to_owned(),
+                path: PathBuf::from("/old.png"),
+                is_dir: false,
+                size_bytes: 10,
+                modified: t1,
+            },
+            Entry {
+                name: "new.png".to_owned(),
+                path: PathBuf::from("/new.png"),
+                is_dir: false,
+                size_bytes: 10,
+                modified: t2,
+            },
+        ];
+        let by_mod_desc = sort_entries_by(dated, SortColumn::Modified, SortDirection::Descending);
+        assert_eq!(by_mod_desc[0].name, "new.png");
+        assert_eq!(by_mod_desc[1].name, "old.png");
+    }
+
+    #[test]
+    fn autocomplete_matches_extension_and_substring_case_insensitively() {
+        let entries = vec![
+            Entry {
+                name: "Hero_Idle.PNG".to_owned(),
+                path: PathBuf::from("/Hero_Idle.PNG"),
+                is_dir: false,
+                size_bytes: 2048,
+                modified: None,
+            },
+            Entry {
+                name: "tileset.pyxross".to_owned(),
+                path: PathBuf::from("/tileset.pyxross"),
+                is_dir: false,
+                size_bytes: 4096,
+                modified: None,
+            },
+            Entry {
+                name: "boss.png".to_owned(),
+                path: PathBuf::from("/boss.png"),
+                is_dir: false,
+                size_bytes: 512,
+                modified: None,
+            },
+        ];
+        let pngs = autocomplete_matches(&entries, ".png");
+        let names: Vec<&str> = pngs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Hero_Idle.PNG", "boss.png"]);
+        assert!(autocomplete_matches(&entries, "").is_empty());
+    }
+
+    #[test]
+    fn file_type_filter_overrides_mode_filter() {
+        assert!(matches_type_filter(
+            FileChooserMode::OpenProject,
+            FileTypeFilter::Png,
+            Path::new("/a/sprite.png")
+        ));
+        assert!(!matches_type_filter(
+            FileChooserMode::OpenProject,
+            FileTypeFilter::Png,
+            Path::new("/a/project.pyxross")
+        ));
+        assert!(matches_type_filter(
+            FileChooserMode::OpenProject,
+            FileTypeFilter::AllFiles,
+            Path::new("/a/notes.txt")
+        ));
+        assert!(matches_type_filter(
+            FileChooserMode::ImportPng,
+            FileTypeFilter::Json,
+            Path::new("/a/theme.json")
+        ));
     }
 
     #[test]
