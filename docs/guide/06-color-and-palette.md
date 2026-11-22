@@ -28,6 +28,10 @@ Open the **Palette** menu in the Top Bar to switch between built-in pixel art pa
 
 ## The Color Picker (`C`)
 
+<p align="center">
+  <img src="../media/guide/guide-06-color-picker.png" alt="Floating Color Picker showing SV square, hue bar, RGB/HSL/Hex inputs, and Shading/Lightness/Saturation/Hue ramps" width="840">
+</p>
+
 Press **`C`** (or click the Foreground swatch in the Top Bar) to open the floating **Color Picker** panel.
 
 It is designed specifically for pixel-art color selection and hue-shifting:

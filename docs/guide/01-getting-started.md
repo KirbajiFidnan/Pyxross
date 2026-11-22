@@ -27,6 +27,10 @@ A **Region** is a rectangular cell on the canvas (such as `16×16` or `32×32` p
 
 ## Creating a New Document
 
+<p align="center">
+  <img src="../media/guide/guide-01-new-document.png" alt="Create New Document dialog with Region Size, Region Grid, and live grid preview" width="820">
+</p>
+
 1. Click the **Pyxross flower icon** at the top-left of the Top Bar, or choose **File → New**, or press **`Ctrl+N`**.
 2. In the **Create New Document** dialog, configure:
    - **Region Size (px):** `Width` and `Height` of each cell (e.g., `16×16` for retro tiles/sprites, `32×32` for detailed characters). Non-square sizes like `16×24` are supported.
@@ -44,6 +48,10 @@ You can resize the canvas later via **Canvas → Resize Canvas** (`Alt+R`).
 ---
 
 ## Workspace Overview
+
+<p align="center">
+  <img src="../media/pyxross-workspace.png" alt="Pyxross Workshop full dockable workspace" width="820">
+</p>
 
 Pyxross opens into a dockable dark workspace organized around the central canvas:
 

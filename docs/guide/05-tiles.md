@@ -53,6 +53,10 @@ Press **`T`** (or select the Tile icon in the Toolbox) to enter Tile Placement m
 
 ## Editing a Placed Tile Live
 
+<p align="center">
+  <img src="../media/guide/guide-05-linked-tiles.gif" alt="Creating a tile, placing 4 rotated instances (0°, 90°, 180°, 270°), and drawing a green arrow that updates all 4 copies live" width="840">
+</p>
+
 1. Place a tile across several cells on your canvas using the **Tile Tool (`T`)** (try flipping a few copies with **`X`** to test seamlessness!).
 2. Switch to **Pencil (`D`)**, **Eraser (`E`)**, or **Fill (`F`)**.
 3. Paint directly inside any one of those cells on the canvas.

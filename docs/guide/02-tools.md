@@ -6,6 +6,10 @@
 
 ## How the Toolbox & Tool Property Panels Work
 
+<p align="center">
+  <img src="../media/guide/guide-02-toolbox-properties.png" alt="Toolbox and Tool Property left dock showing Pencil brush controls" width="230">
+</p>
+
 - The **Toolbox** (top-left) displays all 8 tools as compact icon buttons. Hover any button to see its name and current keyboard shortcut.
 - The **Tool Property** panel (bottom-left) automatically updates to show the controls for your active tool.
 - When you have an active **Transform** (a lifted selection being rotated or scaled), Tool Property temporarily switches to the **Transform** header so you can pick the rotation algorithm (**RotSprite**, **CleanEdge**, or **Rotxel**).

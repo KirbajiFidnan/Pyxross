@@ -15,6 +15,10 @@ Pyxross's workspace is built on a flexible dock system:
 
 ## UI Style (`Options → Style`)
 
+<p align="center">
+  <img src="../media/guide/guide-08-style-banners.png" alt="Style panel with theme presets, rounding/spacing sliders, Save/Load theme controls, and Select Banner picker" width="840">
+</p>
+
 Open the floating **Style** panel from the **Options** menu to customize the look and feel of the interface (persisted in `style.json`):
 - Adjust corner rounding, spacing, and visual chrome preferences.
 - Changes apply live across every panel and modal without restarting.
@@ -48,6 +52,10 @@ You can decorate the top bar with crisp, nearest-neighbor pixel-art banners!
 ---
 
 ## Keybindings (`Options → Keybindings`)
+
+<p align="center">
+  <img src="../media/guide/guide-08-keybindings.png" alt="Key Bindings panel with live search, category filter tabs, monospace keycap badges, and Reset/Apply footer" width="840">
+</p>
 
 Every tool, file action, transform, and import/export shortcut can be remapped:
 1. Open **Options → Keybindings**.

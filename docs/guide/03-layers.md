@@ -6,6 +6,10 @@
 
 ## Understanding the Layer Stack
 
+<p align="center">
+  <img src="../media/guide/guide-03-layers-groups.png" alt="Layers panel with Layer 3, collapsible Group, visibility toggles, and settings icons" width="280">
+</p>
+
 The **Layers** panel (right dock) manages all layers in the active document from top (foreground) to bottom (background). Every drawing, fill, selection, tile, and text operation applies to the **currently selected (highlighted) layer**.
 
 ### Top Action Bar

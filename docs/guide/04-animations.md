@@ -18,6 +18,10 @@ Pyxross models this natively: **one document can hold any number of named animat
 
 ## The Three Animation Panels (Bottom Dock)
 
+<p align="center">
+  <img src="../media/guide/guide-04-animation.gif" alt="Live 4-frame bouncing ball animation playing in zoomed Playback panel alongside Animations and Frame Editor" width="840">
+</p>
+
 ### 1. Animations Panel
 Manages the list of animations in your document:
 - **`+`:** Adds a new animation to the document.

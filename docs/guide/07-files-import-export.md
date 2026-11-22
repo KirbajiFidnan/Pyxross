@@ -21,6 +21,10 @@ Pyxross saves complete projects (all layers, groups, opacity, blend modes, tile 
 
 ## Built-in Cross-Platform File Manager
 
+<p align="center">
+  <img src="../media/guide/guide-07-file-manager.png" alt="Built-in File Manager with Places sidebar, sortable Name/Size/Modified columns, autocomplete File name, and File type filter" width="840">
+</p>
+
 Pyxross uses its own fast, in-app **File Manager** panel instead of external OS file portals (which avoids desktop-portal hangs on Linux Wayland/tiling WMs):
 
 - **Quick Places Sidebar:** Automatically lists Home, Desktop, Documents, Pictures, Downloads, **Windows drive letters (`C:`, `D:`, …)**, Linux **Root (`/`)**, plus your native **GTK (GNOME/XFCE/Cinnamon)** and **KDE Dolphin** bookmarks!
@@ -37,7 +41,11 @@ Pyxross uses its own fast, in-app **File Manager** panel instead of external OS 
 | **Animated GIF** | `Ctrl+Alt+A` | Decodes GIF frames into a sprite sheet layout and automatically builds a timed animation sequence |
 | **Pyxel Edit (`.pyxel`)** | `Ctrl+Alt+P` | Imports layers, nested groups, tile palette, tilemap placements (including flipped/rotated tiles), animations, and palette |
 | **Aseprite (`.ase` / `.aseprite`)** | `Ctrl+Alt+G` | Imports layers, groups, lock/visibility flags, palette, and frames — with **Split by Tags** or single-canvas options |
-| **Image 2 Pixel** | `Ctrl+Alt+X` | Converts any photo/artwork (PNG, JPG, BMP, WebP, TGA, GIF) into crisp pixel art with live preview, resolution scaling, sampling mode, K-means palette quantization, and dithering |
+| **Image 2 Pixel** | `Ctrl+Alt+X` | Converts any photo/artwork (PNG, JPG, BMP, WebP, TGA, GIF) into crisp pixel art with live zoomable preview, resolution scaling, sampling mode, K-means palette quantization, dithering, and reusable `.json` presets |
+
+<p align="center">
+  <img src="../media/guide/guide-07-img2pixel.png" alt="Import Image 2 Pixel panel showing Before/After preview, sampling options, Save/Load Preset, and extracted palette" width="840">
+</p>
 
 ---
 

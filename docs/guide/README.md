@@ -2,6 +2,10 @@
 
 Welcome to the **Pyxross Workshop** user documentation. This guide is designed to be clear, practical, and complete — whether you are drawing your very first game sprite or building a full tileset and animation sheet.
 
+<p align="center">
+  <img src="../media/pyxross-workspace.png" alt="Pyxross Workshop workspace overview" width="840">
+</p>
+
 ---
 
 ## Table of Contents

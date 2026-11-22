@@ -6,6 +6,10 @@
 
 ## Pixel-Perfect Transforms & Rotation
 
+<p align="center">
+  <img src="../media/guide/guide-09-transform-gizmo.png" alt="Active selection marquee on canvas with Edit menu showing Selection and Transform (Flip Horizontal, Flip Vertical, Rotate 90°) actions" width="840">
+</p>
+
 When you drag inside a selection (or press **`Ctrl+V`** to paste), Pyxross lifts those pixels into a live **Transform Session** with interactive canvas gizmos (move, corner scale, edge resize, and free rotation handle).
 
 While a transform is active, the **Tool Property** panel lets you pick the pixel-art rotation algorithm:
