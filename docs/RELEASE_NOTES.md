@@ -1,22 +1,29 @@
-# Pyxross Workshop v0.9.0 Release Notes
+# Pyxross Workshop v0.9.1 Release Notes
 
-## Version and Artifacts
+## Downloads
 
-The release version is generated from `Cargo.toml` metadata (`0.9.0`). Expected artifact names:
+Prebuilt portable binaries for **v0.9.1**:
 
-- `pyxross-0.9.0-linux-x86_64.tar.gz`
-- `pyxross-0.9.0-linux-x86_64.AppImage`
-- `pyxross-0.9.0-windows-x86_64-portable.zip`
+- **Linux AppImage (x86_64, GLIBC 2.35+):** `pyxross-0.9.1-linux-x86_64.AppImage`
+- **Linux Portable Archive (x86_64, GLIBC 2.35+):** `pyxross-0.9.1-linux-x86_64.tar.gz`
+- **Windows Portable ZIP (x86_64, Windows 10/11):** `pyxross-0.9.1-windows-x86_64-portable.zip`
 
-## Highlights in 0.9.0
+## What's New in 0.9.1
 
-- Dockable & floating panel workspace (`egui_dock`) with customizable layout, top bar, and pixel-art banners.
-- Single-file `.pyxross` archive format with atomic save and crash recovery.
-- Aseprite (`.ase` / `.aseprite`) and Pyxel Edit (`.pyxel`) import and export.
-- Animation dock suite (preview, frame editor with onion skinning, GIF & sprite sheet export).
-- Image-to-Pixel converter (sampling, K-means palette extraction, dithering).
-- Built-in cross-platform File Manager supporting Windows drive letters, Linux GTK2/3 bookmarks, and KDE Dolphin XBEL bookmarks.
-- Cross-platform hardening: GLIBC 2.35 portable Linux builds, swapchain `Outdated`/`Lost` reconfiguration, minimize (`0x0`) guard, software GPU adapter fallback, native window icon and Wayland `app_id` / X11 `WM_CLASS`, and backup-protected Windows file replacement.
+- **File Manager:** Sortable `Name`, `Size`, and `Modified` columns (ascending/descending), live autocomplete search in `File name` (including extension matching like `.png` with `Tab` completion), and a `File type` filter dropdown.
+- **Image-to-Pixel:** Smooth pointer-centered preview zoom & pan with `Fit` reset, plus `Save Preset` and `Load Preset` (`.json`) controls in the `Size` tab.
+- **Import Banner Panel:** New two-column banner importer launched from `Select Banner` with `Banner Name` input, `Cut (8:1)` / `Full Image` modes, zoomable/pannable preview, draggable 8:1 crop frame with shaded exterior, and direct PNG export into `banners/`.
+- **Top-Bar Banner Shortcut:** Clickable hotspot on the top-bar banner region with a subtle `"Click to change banner"` hover hint.
+- **Style Panel:** Ergonomic `Save` (enabled when customized) and `Load` theme dialog workflow plus a `Spacing` slider.
+- **Key Bindings Panel:** Redesigned with live search, category filter tabs (`Tools`, `Edit`, `Transform`, `File`, `Import / Export`, `View`), click-to-record monospace keycap badges, inline conflict indicators, manual key/modifier popover, and a pinned `Reset` / `Apply` footer.
+
+## Fixes
+
+- **Windows Input & Render Latency:** Configured swapchain `desired_maximum_frame_latency = 1`, added `window.pre_present_notify()`, and flushed canvas texture uploads in the same frame after input handling to eliminate multi-frame cursor lag.
+- **Overlapping Panel Z-Order:** Clicking the front floating panel (or foreground popups) no longer raises occluded background panels or triggers background header drags.
+- **Fast Canvas Edge Strokes:** Rapid inward and outward brush swipes now interpolate cleanly across canvas borders without missing edge pixels while staying paused during off-canvas motion.
+- **Panel Layout & Scrollbars:** Fixed narrow-panel slider/button overlap in `Style`, pinned top action buttons in resizable `Select Banner`, eliminated resize scrollbar flicker and text overflow in `File Manager`, and kept `Key Bindings` footer buttons clear of scrollbars.
+- **Pencil Default Shortcut:** Guarded test keymap persistence so unit tests cannot overwrite user `keybindings.json` (keeping Pencil on `D`).
 
 ## Package Contents
 
@@ -27,33 +34,8 @@ Each package contains:
 - Built-in top-bar banners in `banners/`
 - Linux AppImage additionally includes `AppRun`, `pyxross.desktop`, and `pyxross.png`
 
-## Build and Checksums
+## Platform Notes
 
-### Linux (Portable GLIBC 2.35 via Docker)
-```sh
-./scripts/package-linux-portable.sh
-```
-
-Verify Linux output from `dist/`:
-```sh
-(cd dist && sha256sum -c SHA256SUMS)
-```
-
-### Windows (Native PowerShell, MSVC)
-```powershell
-$env:SOURCE_DATE_EPOCH = '1735689600'
-& .\scripts\package-windows.ps1
-```
-
-Verify Windows output:
-```powershell
-(Get-FileHash .\dist\pyxross-0.9.0-windows-x86_64-portable.zip -Algorithm SHA256).Hash
-Get-Content .\dist\SHA256SUMS-windows
-```
-
-## Target Assumptions and Limitations
-
-- Linux target is `x86_64-unknown-linux-gnu` (built on Ubuntu 22.04 / GLIBC 2.35 baseline); Windows target is native `x86_64-pc-windows-msvc`.
-- Windows package is portable only (unsigned, no installer).
+- Linux builds target `x86_64-unknown-linux-gnu` on an Ubuntu 22.04 (`GLIBC 2.35`) baseline; Windows builds target native `x86_64-pc-windows-msvc`.
+- Windows builds are portable (unsigned, no installer).
 - On GNOME Wayland, OS-level image clipboard interop with external apps is limited because GNOME Mutter does not implement `wlr-data-control`; in-app copy/paste works normally.
-- Themes remain external package resources beside the binary (`themes/builtin/`).

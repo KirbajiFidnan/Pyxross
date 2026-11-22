@@ -77,7 +77,7 @@ While a transform is active, the **Tool Property** panel lets you pick the pixel
 ## Troubleshooting & Platform Notes
 
 ### Linux
-- **AppImage won't execute:** Make sure it has execute permission (`chmod +x pyxross-0.9.0-linux-x86_64.AppImage`). On minimal systems without FUSE2, run `./pyxross-0.9.0-linux-x86_64.AppImage --appimage-extract-and-run` or use the `.tar.gz` archive instead.
+- **AppImage won't execute:** Make sure it has execute permission (`chmod +x pyxross-0.9.1-linux-x86_64.AppImage`). On minimal systems without FUSE2, run `./pyxross-0.9.1-linux-x86_64.AppImage --appimage-extract-and-run` or use the `.tar.gz` archive instead.
 - **GNOME Wayland Clipboard:** GNOME Mutter does not implement `wlr-data-control`. In-app copy/paste works normally; pasting images from external apps on GNOME Wayland may fall back to the internal clipboard.
 - **No Hardware Vulkan/GPU (VMs / Older Laptops):** Pyxross automatically falls back to OpenGL and software rendering (`llvmpipe`/`lavapipe`).
 

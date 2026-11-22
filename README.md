@@ -30,7 +30,7 @@
 </p>
 
 > [!NOTE]
-> **Early-Stage Project Notice:** Pyxross Workshop is a brand-new, actively developed project (**v0.9.0**). Because it is still fresh and has not yet been exhaustively tested across every OS, Linux desktop environment, and GPU driver combination, **bugs or unexpected crashes may occur**. Save often, and please [open a bug report](https://github.com/KirbajiFidnan/Pyxross/issues/new?template=bug_report.yml) if you run into anything — every report helps make Pyxross more stable!
+> **Early-Stage Project Notice:** Pyxross Workshop is a brand-new, actively developed project (**v0.9.1**). Because it is still fresh and has not yet been exhaustively tested across every OS, Linux desktop environment, and GPU driver combination, **bugs or unexpected crashes may occur**. Save often, and please [open a bug report](https://github.com/KirbajiFidnan/Pyxross/issues/new?template=bug_report.yml) if you run into anything — every report helps make Pyxross more stable!
 
 ---
 
@@ -56,7 +56,7 @@ Instead of treating animations, tilesets, and sprites as disconnected files, Pyx
 ### 🖌️ Drawing & Pixel-Perfect Transforms
 - **Pixel Tools:** Pencil, Eraser, Fill, Eyedropper, Rectangle / Wand / Lasso selection, Tile Placer, Animation Placer, and Text tool.
 - **Structure-Preserving Rotation:** Free rotation and scaling powered by **RotSprite**, **CleanEdge**, and **Rotxel**, alongside exact 90°/180°/270° and flip operations.
-- **Image-to-Pixel Pipeline:** Convert reference photos or high-res art directly into crisp pixel art with sampling, K-means palette extraction, and dithering.
+- **Image-to-Pixel Pipeline:** Convert reference photos or high-res art directly into crisp pixel art with sampling, K-means palette extraction, dithering, zoomable preview, and reusable `.json` presets.
 
 ### 📦 Formats & Interoperability
 - **Native `.pyxross` Archive:** Single-file ZIP project format (plus directory projects) with autosave and crash recovery.
@@ -66,8 +66,8 @@ Instead of treating animations, tilesets, and sprites as disconnected files, Pyx
 
 ### 🖥️ Native, Portable & Customizable
 - **Fast Native Rust Stack:** Hardware-accelerated GPU rendering (`wgpu`) with automatic software fallback (`WARP` on Windows, `llvmpipe`/`lavapipe` on Linux).
-- **Dockable Workspace:** Rearrange, float, and customize panels, UI themes, pixel-art top-bar banners, and remappable keybindings.
-- **Built-in Cross-Platform File Manager:** Works out of the box across Windows (drive letters) and Linux desktop environments (reads GTK and KDE Dolphin bookmarks) without external portal hangs.
+- **Dockable Workspace:** Rearrange, float, and customize panels, UI themes (`Save`/`Load` + spacing controls), custom pixel-art top-bar banners (built-in 8:1 banner cropper), and searchable, remappable keybindings.
+- **Built-in Cross-Platform File Manager:** Sortable columns, live autocomplete search, file type filters, Windows drive letters, and Linux GTK / KDE Dolphin bookmarks without external portal hangs.
 
 <p align="center">
   <img src="docs/media/pyxross-workspace.png" alt="Pyxross Workshop full workspace with region grid, layers, palette, frame editor, and live playback" width="880">
@@ -84,20 +84,20 @@ Built on an **Ubuntu 22.04 LTS (`GLIBC 2.35`)** baseline for broad compatibility
 
 - **AppImage (recommended, single file):**
   ```sh
-  chmod +x pyxross-0.9.0-linux-x86_64.AppImage
-  ./pyxross-0.9.0-linux-x86_64.AppImage
+  chmod +x pyxross-0.9.1-linux-x86_64.AppImage
+  ./pyxross-0.9.1-linux-x86_64.AppImage
   ```
 - **Portable Archive (`.tar.gz`):**
   ```sh
-  tar -xzf pyxross-0.9.0-linux-x86_64.tar.gz
-  cd pyxross-0.9.0-linux-x86_64
+  tar -xzf pyxross-0.9.1-linux-x86_64.tar.gz
+  cd pyxross-0.9.1-linux-x86_64
   ./pyxross
   ```
 
 > **Linux DE Note (GNOME Wayland):** GNOME Mutter does not implement `wlr-data-control`. In-app copy/paste works normally, while OS-level image copy/paste with external apps on GNOME Wayland may fall back to the internal clipboard.
 
 ### 🪟 Windows (`x86_64`, Windows 10 / 11)
-1. Download `pyxross-0.9.0-windows-x86_64-portable.zip` from **[Releases](https://github.com/KirbajiFidnan/Pyxross/releases)**.
+1. Download `pyxross-0.9.1-windows-x86_64-portable.zip` from **[Releases](https://github.com/KirbajiFidnan/Pyxross/releases)**.
 2. Extract the archive to any folder (keep `themes/` and `banners/` alongside `pyxross.exe`).
 3. Run `pyxross.exe` — no installer required.
 
