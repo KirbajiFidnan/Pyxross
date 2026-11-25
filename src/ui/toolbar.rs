@@ -35,9 +35,13 @@ pub enum ToolbarEvent {
     BrushScatterShapeChanged(ScatterShape),
     /// The user moved the brush-tail taper control (-100..=100 percent, 0 = off).
     BrushTailChanged(i8),
-    /// The user picked a Fieldier child (Rectangle / Wand / Lasso) in the Tool
-    /// Property panel.
+    /// The user picked a Fieldier child (Rectangle / Wand / Lasso / BrushSelector)
+    /// in the Tool Property panel or Toolbox.
     FieldierChildChanged(FieldierChild),
+    /// The user changed the Brush Selector's brush size (1..=64).
+    BrushSelectSizeChanged(u8),
+    /// The user changed the Brush Selector's brush shape (Square / Round).
+    BrushSelectShapeChanged(BrushShape),
     /// The user moved the wand-tolerance control in the Tool Property panel.
     WandToleranceChanged(u8),
     /// The user toggled the wand's contiguous checkbox.

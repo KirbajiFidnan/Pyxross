@@ -2,6 +2,22 @@
 
 All notable changes to **Pyxross Workshop** are documented in this file.
 
+## [0.9.3] - 2026-11-25
+
+### Added
+- **Brush Selector (`B`):** new selection child tool with configurable `Size` (`1..=64`, `Shift+Scroll`, `[`/`]`) and `Shape` (`Square` / `Circle`, `Ctrl+Scroll`); painting selects non-transparent (`alpha > 0`) pixels covered by the brush footprint, holding `Shift` adds to the selection, and right-clicking subtracts from the selection.
+- **Categorized Toolbox:** reorganized the Toolbox into labeled **Draw** (Pencil, Eraser, Fill, Eyedropper), **Selection** (Rectangle, Wand, Lasso, Brush Selector), and **Misc** (Tile, Animation, Text) sections separated by subtle hairline dividers, exposing all selection tools directly and removing the parent Fieldier button.
+- **File Manager Arrow Navigation:** navigate file/folder rows with `Up`/`Down` arrow keys (auto-scrolling the selected row into view), enter folders with `Right`/`Enter`, and go up a directory with `Left`/`Backspace`.
+- **Layer Name Double-Click Settings:** double-clicking a layer's name in the Layers panel automatically opens (or focuses) its Layer Settings panel.
+- **Onion Skin Behind & Layer Mode Controls:** added two new NerdFont toggle buttons flanking the Frame Editor's onion skin controls — **Onion Behind** (left) renders onion ghosts behind the current frame image, and **Layer Mode** (right) limits onion skinning to the active layer only.
+
+### Fixed
+- **Transform Commit Undo Pixel Loss:** masked transform cuts now record their undo delta from the live layer buffer via `DeltaRecorder`, preventing unselected pixels inside the transform bounding box from being erased on Undo.
+- **Rectangle Double-Click & Shift-Select Ergonomics:** suppressed Rectangle double-click region selection when the first click commits a transform or dismisses a selection, added `Shift+Double-Click` to add regions to the current selection, and allowed `Shift`-selecting with any Fieldier tool when no selection exists to start a normal initial selection.
+- **GIF Animation Export:** set `DisposalMethod::Background` on every exported GIF frame, added lossless exact local palettes for pixel-art frames (`<= 255` opaque colors with transparency), and applied each sequence's effective frame delays (`effective_delay_ms`) in Export Animation so frames no longer stack, ghost, or lose timing.
+- **Tile Tool Layer Isolation:** right-click picking an empty cell now samples only the active layer's buffer instead of compositing all layers together into a single-layer stamp.
+- **Tile Tool Placement Preview:** replaced per-pixel feathered rectangles with a cached nearest-neighbor preview texture quad so large tile previews render crisply without shattered grid seams.
+
 ## [0.9.2] - 2026-11-25
 
 ### Added

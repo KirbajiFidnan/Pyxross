@@ -60,6 +60,7 @@ fn action_category(action: Action) -> KeybindingCategory {
         | Action::SelectRectangle
         | Action::SelectWand
         | Action::SelectLasso
+        | Action::SelectBrushSelector
         | Action::SelectTileTool
         | Action::SelectAnimationPlacer
         | Action::SelectText
@@ -596,6 +597,7 @@ fn action_label(action: Action) -> &'static str {
         Action::SelectRectangle => "Rectangle Select",
         Action::SelectWand => "Magic Wand",
         Action::SelectLasso => "Lasso Select",
+        Action::SelectBrushSelector => "Brush Selector",
         Action::SelectFill => "Fill Bucket",
         Action::SelectTileTool => "Tile Tool",
         Action::SelectAnimationPlacer => "Animation Placer",

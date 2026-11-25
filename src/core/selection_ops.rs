@@ -241,6 +241,79 @@ pub fn lasso_shape(buf: &PixelBuffer, points: &[(i32, i32)]) -> Option<(Rect2i, 
     Some((bbox, compact_mask(&selected, width, bbox)))
 }
 
+/// Sweeps a brush (`spec`) along `points` (connecting consecutive points with
+/// Bresenham line segments) and selects every in-bounds pixel covered by the
+/// brush. When `opaque_only` is `true`, only pixels with `alpha > 0` on `buf`
+/// are selected; when `false` (subtract mode), every covered in-bounds pixel
+/// is included so transparent pixels in an existing selection can also be
+/// subtracted.
+pub fn brush_selector_shape(
+    buf: &PixelBuffer,
+    points: &[(i32, i32)],
+    spec: crate::core::brush::BrushSpec,
+    opaque_only: bool,
+) -> Option<(Rect2i, Vec<bool>)> {
+    if points.is_empty() {
+        return None;
+    }
+    let w = buf.width() as i32;
+    let h = buf.height() as i32;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let offsets = spec.stamp_offsets();
+    let mut selected = vec![false; (w as usize) * (h as usize)];
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    let mut any = false;
+
+    let mut stamp_at = |cx: i32, cy: i32| {
+        for &(dx, dy) in &offsets {
+            let px = cx + dx;
+            let py = cy + dy;
+            if px < 0 || py < 0 || px >= w || py >= h {
+                continue;
+            }
+            let idx = (py as usize) * (w as usize) + (px as usize);
+            if selected[idx] {
+                continue;
+            }
+            if opaque_only {
+                let Some(color) = buf.get_pixel(px as usize, py as usize) else {
+                    continue;
+                };
+                if color.a == 0 {
+                    continue;
+                }
+            }
+            selected[idx] = true;
+            any = true;
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max(px);
+            max_y = max_y.max(py);
+        }
+    };
+
+    if points.len() == 1 {
+        stamp_at(points[0].0, points[0].1);
+    } else {
+        for seg in points.windows(2) {
+            for (gx, gy) in crate::core::brush::bresenham_line(seg[0], seg[1]) {
+                stamp_at(gx, gy);
+            }
+        }
+    }
+
+    if !any {
+        return None;
+    }
+    let bbox = Rect2i::new(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
+    Some((bbox, compact_mask(&selected, w, bbox)))
+}
+
 /// Nonzero-winding point-in-polygon test at a continuous position.
 pub fn point_in_polygon(points: &[(i32, i32)], x: f64, y: f64) -> bool {
     let n = points.len();
@@ -675,5 +748,35 @@ mod tests {
 
         assert!(tile_region_shape(&buf, &[]).is_none());
         assert!(tile_region_shape(&buf, &[Rect2i::new(20, 20, 2, 2)]).is_none());
+    }
+
+    #[test]
+    fn brush_selector_shape_picks_only_non_transparent_pixels_along_stroke() {
+        use crate::core::brush::{BrushShape, BrushSpec};
+
+        let mut buf = PixelBuffer::new(16, 16);
+        // Paint two opaque pixels at (2, 2) and (6, 2); leave everything else transparent.
+        buf.set_pixel(2, 2, Color::rgba(255, 0, 0, 255));
+        buf.set_pixel(6, 2, Color::rgba(0, 255, 0, 128)); // semi-transparent (non-zero alpha)
+
+        let spec = BrushSpec::sanitize(3, BrushShape::Square);
+        let (bbox, mask) =
+            brush_selector_shape(&buf, &[(2, 2), (6, 2)], spec, true).expect("must select");
+        assert_eq!(bbox, Rect2i::new(2, 2, 5, 1));
+        assert!(mask_contains(bbox, &mask, 2, 2));
+        assert!(mask_contains(bbox, &mask, 6, 2));
+        // Transparent pixels along the stroke between (2,2) and (6,2) must NOT be selected.
+        assert!(!mask_contains(bbox, &mask, 3, 2));
+        assert!(!mask_contains(bbox, &mask, 4, 2));
+        assert!(!mask_contains(bbox, &mask, 5, 2));
+
+        // Stroke entirely over transparent pixels selects nothing when opaque_only = true.
+        assert!(brush_selector_shape(&buf, &[(12, 12)], spec, true).is_none());
+
+        // Subtract mode (opaque_only = false) covers the full brush footprint.
+        let (sub_bbox, sub_mask) =
+            brush_selector_shape(&buf, &[(12, 12)], spec, false).expect("subtract footprint");
+        assert_eq!(sub_bbox, Rect2i::new(11, 11, 3, 3));
+        assert!(sub_mask.iter().all(|&v| v));
     }
 }

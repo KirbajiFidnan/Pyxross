@@ -459,6 +459,16 @@ struct App {
     /// separate from the playback/preview index (`animation.current_index()`),
     /// clamped to the active sequence length.
     frame_edit_index: usize,
+    /// Cached active-layer-only sheet texture `(cache_key, texture)` used by
+    /// the Frame Edit onion skin when Layer Mode is enabled.
+    onion_layer_texture: Option<((LayerId, usize, usize, u64), egui::TextureHandle)>,
+    /// Cached per-layer behind-onion composite texture `(content_hash, texture)`
+    /// for the Frame Edit viewport when Onion Behind is enabled.
+    onion_behind_texture: Option<(u64, egui::TextureHandle)>,
+    /// Set when a click commits a transform or dismisses a selection, so an
+    /// immediate second click (double-click) does not trigger Rectangle region
+    /// selection on the same gesture.
+    suppress_next_region_double_click: bool,
     panel_dock: panel_dock::DockManager,
     panel_dock_demo: bool,
     /// Gesture router shared by the canvas and every nest.
@@ -745,6 +755,9 @@ impl App {
             frame_preview_feed,
             frame_edit_host,
             frame_edit_index: 0,
+            onion_layer_texture: None,
+            onion_behind_texture: None,
+            suppress_next_region_double_click: false,
             panel_dock,
             input_capture: InputCapture::new(),
             panel_dock_demo: true,
@@ -3972,6 +3985,21 @@ impl App {
                     self.transform_session_commit();
                     self.projects.current_mut().tool_state.select_child(child);
                 }
+                ToolbarEvent::BrushSelectSizeChanged(size) => {
+                    let clamped = size.clamp(BrushSpec::MIN_SIZE, BrushSpec::MAX_SIZE);
+                    self.projects
+                        .current_mut()
+                        .tool_state
+                        .brush_select_mut()
+                        .size = clamped;
+                }
+                ToolbarEvent::BrushSelectShapeChanged(shape) => {
+                    self.projects
+                        .current_mut()
+                        .tool_state
+                        .brush_select_mut()
+                        .shape = shape;
+                }
                 ToolbarEvent::WandToleranceChanged(tolerance) => {
                     self.projects.current_mut().tool_state.wand_mut().tolerance = tolerance;
                 }
@@ -4119,6 +4147,7 @@ impl App {
         let alt_held = self.ctx.input(|i| i.modifiers.alt);
         let wand = session.tool_state.wand();
         let wand_contiguous_effective = wand.contiguous ^ alt_held;
+        let brush_select = session.tool_state.brush_select();
         let fill = session.tool_state.fill();
         let fill_contiguous_effective = fill.contiguous ^ alt_held;
         let transform_active = session.transform.is_some();
@@ -4150,6 +4179,7 @@ impl App {
             draw,
             child,
             wand,
+            brush_select,
             wand_contiguous_effective,
             fill,
             fill_contiguous_effective,
@@ -4943,6 +4973,39 @@ impl App {
                             self.panel_dock.raise_floating(settings_id);
                         }
                     }
+                    LayerPanelEvent::OpenSettings(id) => {
+                        let settings_id =
+                            panel_dock::PanelId::new(dock_layers_panel::LAYER_SETTINGS_PANEL_ID);
+                        let registered = self.panel_dock.placement(settings_id).is_some();
+                        if !registered {
+                            let spec = dock_layers_panel::layer_settings_panel_spec(
+                                &self.layers_host,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(360.0, 140.0),
+                                    egui::vec2(280.0, 180.0),
+                                ),
+                            );
+                            if self.panel_dock.add_spec(spec).is_ok() {
+                                *self.layers_host.open_settings.borrow_mut() = Some(id);
+                                if let Some(name) =
+                                    session.layers.layer(id).map(|layer| layer.name.clone())
+                                {
+                                    *self.layers_host.rename_buffer.borrow_mut() = name;
+                                }
+                                self.panel_dock.raise_floating(settings_id);
+                            }
+                        } else {
+                            *self.layers_host.open_settings.borrow_mut() = Some(id);
+                            if let Some(name) =
+                                session.layers.layer(id).map(|layer| layer.name.clone())
+                            {
+                                *self.layers_host.rename_buffer.borrow_mut() = name.clone();
+                                self.panel_dock
+                                    .set_title(settings_id, format!("Layer: {name}"));
+                            }
+                            self.panel_dock.raise_floating(settings_id);
+                        }
+                    }
                     LayerPanelEvent::ToggleExpanded(id) => {
                         let mut expanded = self.layers_host.expanded_groups.borrow_mut();
                         if !expanded.remove(&id) {
@@ -5075,7 +5138,7 @@ impl App {
         };
         let base = base.or_else(|| self.projects.current_mut().selection.take());
         let Some(current) = base else {
-            if mode == SelectMode::Replace {
+            if matches!(mode, SelectMode::Replace | SelectMode::Add) {
                 self.projects.current_mut().selection = Some(new);
             }
             return;
@@ -5558,6 +5621,7 @@ impl App {
                 };
             }
             SelectGesture::Lasso { points, .. } => return CanvasOverlay::Lasso(points.clone()),
+            SelectGesture::BrushSelect { .. } => {}
             SelectGesture::TileBorder { cells, base, .. } => {
                 return CanvasOverlay::RegionCells {
                     cells: cells.clone(),
@@ -5633,7 +5697,7 @@ impl App {
         // takes precedence over the inside-hit area move (D77 item 4).
         // Shift+left always adds to the selection rather than moving it.
         let region = child == FieldierChild::Rectangle && alt;
-        if !right_button && !region && !shift {
+        if !right_button && !region && !shift && child != FieldierChild::BrushSelector {
             let hit = self
                 .projects
                 .current()
@@ -5690,6 +5754,11 @@ impl App {
                 base,
                 mode,
             },
+            FieldierChild::BrushSelector => SelectGesture::BrushSelect {
+                points: vec![pt],
+                base,
+                mode,
+            },
             FieldierChild::Rectangle if region => SelectGesture::TileBorder {
                 origin: pt,
                 current: pt,
@@ -5704,6 +5773,34 @@ impl App {
                 mode,
             },
         };
+        if child == FieldierChild::BrushSelector {
+            self.update_brush_select_live();
+        }
+    }
+
+    /// Recomputes the active selection from the in-flight `BrushSelect` gesture
+    /// so marching ants update live as the user paints.
+    fn update_brush_select_live(&mut self) {
+        let (points, base, mode, spec) = {
+            let session = self.projects.current();
+            let SelectGesture::BrushSelect { points, base, mode } = &session.gesture else {
+                return;
+            };
+            let bs = session.tool_state.brush_select();
+            (
+                points.clone(),
+                base.clone(),
+                *mode,
+                BrushSpec::sanitize(bs.size, bs.shape),
+            )
+        };
+        let opaque_only = mode != SelectMode::Subtract;
+        let captured = {
+            let buf = &self.projects.current().layers.active_layer().buffer;
+            crate::core::selection_ops::brush_selector_shape(buf, &points, spec, opaque_only)
+                .and_then(|(bbox, mask)| Selection::capture_mask(buf, bbox, mask))
+        };
+        self.combine_selection(captured, mode, base);
     }
 
     /// Select-tool drag: update the move preview destination or the marquee.
@@ -5763,6 +5860,16 @@ impl App {
                 }
                 SelectGesture::Lasso { points, base, mode }
             }
+            SelectGesture::BrushSelect {
+                mut points,
+                base,
+                mode,
+            } => {
+                if points.last() != Some(&pt) {
+                    points.push(pt);
+                }
+                SelectGesture::BrushSelect { points, base, mode }
+            }
             SelectGesture::TileBorder {
                 origin,
                 current,
@@ -5790,7 +5897,11 @@ impl App {
             }
             other => other,
         };
+        let is_brush_select = matches!(next, SelectGesture::BrushSelect { .. });
         session.gesture = next;
+        if is_brush_select {
+            self.update_brush_select_live();
+        }
     }
 
     /// Select-tool release: the area move translates ONLY the selection — the
@@ -5835,6 +5946,22 @@ impl App {
                     let buf = &self.projects.current().layers.active_layer().buffer;
                     crate::core::selection_ops::lasso_shape(buf, &points)
                         .and_then(|(bbox, mask)| Selection::capture_mask(buf, bbox, mask))
+                };
+                self.combine_selection(captured, mode, base);
+            }
+            SelectGesture::BrushSelect { points, base, mode } => {
+                let bs = self.projects.current().tool_state.brush_select();
+                let spec = BrushSpec::sanitize(bs.size, bs.shape);
+                let opaque_only = mode != SelectMode::Subtract;
+                let captured = {
+                    let buf = &self.projects.current().layers.active_layer().buffer;
+                    crate::core::selection_ops::brush_selector_shape(
+                        buf,
+                        &points,
+                        spec,
+                        opaque_only,
+                    )
+                    .and_then(|(bbox, mask)| Selection::capture_mask(buf, bbox, mask))
                 };
                 self.combine_selection(captured, mode, base);
             }
@@ -5898,22 +6025,39 @@ impl App {
                 self.select_press(pt, right_button);
                 return;
             }
-            let outside = self
-                .projects
-                .current()
-                .selection
-                .as_ref()
-                .is_some_and(|sel| !sel.contains(pt.0, pt.1));
+            if self.projects.current().tool_state.child() == FieldierChild::BrushSelector {
+                return;
+            }
+            let shift_held = interactions
+                .click_modifiers
+                .map_or_else(|| shift_pressed(ctx), |m| m.shift);
+            let outside = !shift_held
+                && self
+                    .projects
+                    .current()
+                    .selection
+                    .as_ref()
+                    .is_some_and(|sel| !sel.contains(pt.0, pt.1));
             if outside {
                 self.deselect();
+                self.suppress_next_region_double_click = true;
+            } else {
+                self.suppress_next_region_double_click = false;
             }
         }
         // In Fieldier Rectangle, double-clicking inside a region selects that
         // region (and Shift+double-click adds the region to the selection).
+        // If the first click just committed a transform or dismissed a
+        // selection, suppress the double-click's region-select action so a
+        // fast commit+deselect double-click never re-selects a region.
         // Outside Rectangle (e.g. Lasso), double-clicking outside the selection
         // dismisses it.
         if let Some(pt) = interactions.double_clicked {
             if self.projects.current().tool_state.child() == FieldierChild::Rectangle {
+                if self.suppress_next_region_double_click {
+                    self.suppress_next_region_double_click = false;
+                    return;
+                }
                 let ts = self.projects.current().tile_size;
                 let tw = ts.w.max(1) as i32;
                 let th = ts.h.max(1) as i32;
@@ -5924,7 +6068,9 @@ impl App {
                     &self.projects.current().layers.active_layer().buffer,
                     region_rect,
                 );
-                let shift = self.ctx.input(|i| i.modifiers.shift);
+                let shift = interactions
+                    .click_modifiers
+                    .map_or_else(|| shift_pressed(ctx), |m| m.shift);
                 let (mode, base) = if shift {
                     (SelectMode::Add, self.projects.current().selection.clone())
                 } else {
@@ -6728,6 +6874,7 @@ impl App {
         let Some(session) = self.projects.current_mut().transform.take() else {
             return;
         };
+        self.suppress_next_region_double_click = true;
         let t = match session {
             TransformSession::Selection(t) => t,
             TransformSession::Text(text_sess) => {
@@ -7690,6 +7837,16 @@ impl App {
                     settings.size =
                         next.clamp(BrushSpec::MIN_SIZE as i32, BrushSpec::MAX_SIZE as i32) as u8;
                 }
+            } else if tool == Tool::Fieldier
+                && session.tool_state.child() == FieldierChild::BrushSelector
+            {
+                let steps = scroll_steps(interactions.brush_scroll);
+                if steps != 0 {
+                    let bs = session.tool_state.brush_select_mut();
+                    let next = bs.size as i32 + steps;
+                    bs.size =
+                        next.clamp(BrushSpec::MIN_SIZE as i32, BrushSpec::MAX_SIZE as i32) as u8;
+                }
             }
         }
         if let Some(shape) = BrushShape::from_scroll_steps(interactions.shape_cycle) {
@@ -7697,6 +7854,10 @@ impl App {
             let tool = session.tool_state.tool();
             if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
                 session.draw_settings_mut(tool).shape = shape;
+            } else if tool == Tool::Fieldier
+                && session.tool_state.child() == FieldierChild::BrushSelector
+            {
+                session.tool_state.brush_select_mut().shape = shape;
             }
         }
         // Ctrl+scroll over the Fieldier wand adjusts the tolerance; the draw
@@ -8183,9 +8344,9 @@ impl App {
             }
             return;
         }
-        // An empty cell: capture the COMPOSITED pixels at the cell footprint
-        // (clipped to the canvas) as a ghost and clear the real selection so no
-        // tile id is written.
+        // An empty cell: capture ONLY the active layer's pixels at the cell
+        // footprint (clipped to the canvas) as a ghost and clear the real
+        // selection so no tile id is written and other layers never bleed in.
         let (canvas_w, canvas_h) = (
             project.layers.width() as i32,
             project.layers.height() as i32,
@@ -8200,14 +8361,16 @@ impl App {
         if rect.is_empty() {
             return;
         }
-        let composite = {
+        let active_bytes = {
             let session = self.projects.current();
             session
                 .layers
-                .composite_layers_region(rect, &session.tile_palette)
+                .layer(layer_id)
+                .filter(|layer| !layer.is_group)
+                .and_then(|layer| layer.buffer.export_region(rect, None))
         };
-        if let Some(composite) = composite {
-            self.ghost_tile = Some((rect.w as u32, rect.h as u32, composite.as_bytes().to_vec()));
+        if let Some(bytes) = active_bytes {
+            self.ghost_tile = Some((rect.w as u32, rect.h as u32, bytes));
             self.projects.current_mut().tile_palette.selected = None;
         }
     }
@@ -9872,6 +10035,7 @@ impl App {
             select_rectangle,
             select_wand,
             select_lasso,
+            select_brush_selector,
             select_fill,
             select_tile_tool,
             select_animation_placer,
@@ -9919,6 +10083,8 @@ impl App {
                     .pressed(crate::input::Action::SelectRectangle, i),
                 self.keymap.pressed(crate::input::Action::SelectWand, i),
                 self.keymap.pressed(crate::input::Action::SelectLasso, i),
+                self.keymap
+                    .pressed(crate::input::Action::SelectBrushSelector, i),
                 self.keymap.pressed(crate::input::Action::SelectFill, i),
                 self.keymap.pressed(crate::input::Action::SelectTileTool, i),
                 // `A` also moves the floating transform LEFT, but that raw read
@@ -9963,6 +10129,18 @@ impl App {
                 };
                 if next != current {
                     self.apply_toolbar_events(vec![ToolbarEvent::BrushSizeChanged(next)]);
+                }
+            } else if tool == Tool::Fieldier
+                && self.projects.current().tool_state.child() == FieldierChild::BrushSelector
+            {
+                let current = self.projects.current().tool_state.brush_select().size;
+                let next = if brush_grow {
+                    current.saturating_add(1).min(64)
+                } else {
+                    current.saturating_sub(1).max(1)
+                };
+                if next != current {
+                    self.apply_toolbar_events(vec![ToolbarEvent::BrushSelectSizeChanged(next)]);
                 }
             }
         }
@@ -10031,6 +10209,9 @@ impl App {
         }
         if select_lasso {
             self.select_fieldier_child(FieldierChild::Lasso);
+        }
+        if select_brush_selector {
+            self.select_fieldier_child(FieldierChild::BrushSelector);
         }
         if select_fill {
             self.projects
@@ -10220,12 +10401,22 @@ impl App {
             ),
             grid_visible: session.grid_visible,
             tile_size: session.tile_size,
-            brush: matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw).then(|| {
+            brush: if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
                 let settings = session.draw_settings(tool);
-                BrushSpec::sanitize(settings.size, settings.shape)
-            }),
+                Some(BrushSpec::sanitize(settings.size, settings.shape))
+            } else if tool == Tool::Fieldier
+                && session.tool_state.child() == FieldierChild::BrushSelector
+            {
+                let bs = session.tool_state.brush_select();
+                Some(BrushSpec::sanitize(bs.size, bs.shape))
+            } else {
+                None
+            },
             draw_mode: match tool {
                 Tool::Eraser => DrawMode::Eraser,
+                Tool::Fieldier if session.tool_state.child() == FieldierChild::BrushSelector => {
+                    DrawMode::Eraser
+                }
                 _ => DrawMode::Pen,
             },
             brush_color: session.color,
@@ -10336,7 +10527,7 @@ impl App {
     /// previous frame are cleared; the App drains this frame's after rendering.
     fn publish_frame_edit_view(&mut self) {
         self.clamp_frame_edit_index();
-        let (frame_count, onion_prev, onion_next, delay) = {
+        let (frame_count, onion_prev, onion_next, onion_behind, onion_layer_mode, delay) = {
             let session = self.projects.current();
             let delay = session
                 .sequence()
@@ -10347,6 +10538,8 @@ impl App {
                 session.sequence().len(),
                 session.onion_prev,
                 session.onion_next,
+                session.onion_behind,
+                session.onion_layer_mode,
                 delay,
             )
         };
@@ -10354,6 +10547,8 @@ impl App {
         self.frame_edit_host.frame_count.set(frame_count);
         self.frame_edit_host.onion_prev.set(onion_prev);
         self.frame_edit_host.onion_next.set(onion_next);
+        self.frame_edit_host.onion_behind.set(onion_behind);
+        self.frame_edit_host.onion_layer_mode.set(onion_layer_mode);
         // Seed the delay text only when the cursor frame or its delay changed,
         // so an in-progress edit is never clobbered mid-frame.
         if self.frame_edit_host.delay_seed.get() != (self.frame_edit_index, delay) {
@@ -10377,7 +10572,111 @@ impl App {
         self.frame_edit_host.region.set(region);
         *self.frame_edit_host.view.borrow_mut() = self.frame_edit_canvas_view();
         self.refresh_frame_edit_overlay();
+        let any_onion = onion_prev || onion_next;
+        self.refresh_frame_edit_onion_layer_texture(onion_layer_mode && any_onion && !onion_behind);
+        self.refresh_frame_edit_onion_behind_texture(region, onion_behind && any_onion, onion_layer_mode);
         *self.frame_edit_host.interactions.borrow_mut() = None;
+    }
+
+    /// Builds and caches the per-layer behind-onion region composite when
+    /// Onion Behind is enabled, so each layer's onion ghosts sit directly
+    /// underneath that layer's own current-frame pixels.
+    fn refresh_frame_edit_onion_behind_texture(
+        &mut self,
+        current_region: Option<Rect2i>,
+        needed: bool,
+        layer_mode: bool,
+    ) {
+        let Some(current_rect) = current_region.filter(|_| needed) else {
+            self.frame_edit_host.onion_behind_composite_tex.set(None);
+            return;
+        };
+        let (prev_rect, next_rect) = match *self.frame_edit_host.overlay.borrow() {
+            CanvasOverlay::OnionOverlay { prev, next }
+            | CanvasOverlay::FrameOnion { prev, next } => (prev, next),
+            _ => (None, None),
+        };
+        if prev_rect.is_none() && next_rect.is_none() {
+            self.frame_edit_host.onion_behind_composite_tex.set(None);
+            return;
+        }
+        let theme_colors = self.theme.current().colors;
+        let prev_tint = theme_colors.onion_prev_view_tint_core();
+        let next_tint = theme_colors.onion_next_view_tint_core();
+        let session = self.projects.current();
+        let spec = crate::core::model::OnionBehindSpec {
+            prev_origin: prev_rect.map(|r| (r.x, r.y)),
+            prev_tint,
+            next_origin: next_rect.map(|r| (r.x, r.y)),
+            next_tint,
+            only_layer: layer_mode.then(|| session.layers.active_layer_id()),
+        };
+        let Some(comp) = session.layers.composite_layers_region_with_onion_behind(
+            current_rect,
+            &session.tile_palette,
+            &spec,
+        ) else {
+            self.frame_edit_host.onion_behind_composite_tex.set(None);
+            return;
+        };
+        let w = comp.width();
+        let h = comp.height();
+        let bytes = comp.as_bytes();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(w, h, bytes), &mut hasher);
+        let hash = std::hash::Hasher::finish(&hasher);
+        if !matches!(&self.onion_behind_texture, Some((cached, _)) if *cached == hash) {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], bytes);
+            let tex = self.ctx.load_texture(
+                "onion_behind_composite",
+                img,
+                egui::TextureOptions::NEAREST,
+            );
+            self.onion_behind_texture = Some((hash, tex));
+        }
+        self.frame_edit_host
+            .onion_behind_composite_tex
+            .set(self.onion_behind_texture.as_ref().map(|(_, t)| t.id()));
+    }
+
+    /// Uploads and caches the active layer's sheet texture when onion-skin
+    /// Layer Mode is active so prev/next ghosts sample only the active layer.
+    fn refresh_frame_edit_onion_layer_texture(&mut self, needed: bool) {
+        if !needed {
+            self.frame_edit_host.onion_layer_tex.set(None);
+            return;
+        }
+        let session = self.projects.current();
+        let active_id = session.layers.active_layer_id();
+        let w = session.layers.width();
+        let h = session.layers.height();
+        if w == 0 || h == 0 {
+            self.frame_edit_host.onion_layer_tex.set(None);
+            return;
+        }
+        let epoch = session
+            .layers
+            .layer(active_id)
+            .map(|l| l.buffer.change_epoch())
+            .unwrap_or(0);
+        let key = (active_id, w, h, epoch);
+        let needs_upload = !matches!(&self.onion_layer_texture, Some((k, _)) if *k == key);
+        if needs_upload {
+            let bytes: Vec<u8> = match session.layers.layer(active_id) {
+                Some(layer) if !layer.is_group => layer.buffer.as_bytes().to_vec(),
+                _ => vec![0u8; w * h * 4],
+            };
+            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes);
+            let tex = self.ctx.load_texture(
+                "onion_active_layer",
+                img,
+                egui::TextureOptions::NEAREST,
+            );
+            self.onion_layer_texture = Some((key, tex));
+        }
+        self.frame_edit_host
+            .onion_layer_tex
+            .set(self.onion_layer_texture.as_ref().map(|(_, t)| t.id()));
     }
 
     /// Apply the Frame Edit control-bar gestures. The panel is a pure view;
@@ -10404,6 +10703,12 @@ impl App {
                 }
                 Ev::OnionNext(on) => {
                     self.projects.current_mut().onion_next = on;
+                }
+                Ev::OnionBehind(on) => {
+                    self.projects.current_mut().onion_behind = on;
+                }
+                Ev::OnionLayerMode(on) => {
+                    self.projects.current_mut().onion_layer_mode = on;
                 }
                 Ev::PrevFrame => self.step_frame_edit(-1),
                 Ev::NextFrame => self.step_frame_edit(1),
@@ -12117,7 +12422,7 @@ impl App {
                         width: comp.width(),
                         height: comp.height(),
                         rgba: comp.as_bytes().to_vec(),
-                        delay_ms: f.delay_ms().max(1),
+                        delay_ms: seq.effective_delay_ms(i).max(1),
                     });
                 }
             }
@@ -12507,12 +12812,25 @@ impl App {
                 canvas_size,
                 grid_visible: self.projects.current().grid_visible,
                 tile_size: self.projects.current().tile_size,
-                brush: matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw).then(|| {
+                brush: if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
                     let settings = self.projects.current().draw_settings(tool);
-                    BrushSpec::sanitize(settings.size, settings.shape)
-                }),
+                    Some(BrushSpec::sanitize(settings.size, settings.shape))
+                } else if tool == Tool::Fieldier
+                    && self.projects.current().tool_state.child() == FieldierChild::BrushSelector
+                {
+                    let bs = self.projects.current().tool_state.brush_select();
+                    Some(BrushSpec::sanitize(bs.size, bs.shape))
+                } else {
+                    None
+                },
                 draw_mode: match tool {
                     Tool::Eraser => DrawMode::Eraser,
+                    Tool::Fieldier
+                        if self.projects.current().tool_state.child()
+                            == FieldierChild::BrushSelector =>
+                    {
+                        DrawMode::Eraser
+                    }
                     _ => DrawMode::Pen,
                 },
                 brush_color: self.projects.current().color,
@@ -15509,7 +15827,7 @@ mod tests {
     }
 
     #[test]
-    fn add_without_a_base_is_a_noop() {
+    fn add_without_a_base_creates_initial_selection() {
         let mut app = App::default();
         let new = Selection::capture(
             &app.projects.current().layers.active_layer().buffer,
@@ -15519,9 +15837,10 @@ mod tests {
 
         app.combine_selection(Some(new), SelectMode::Add, None);
 
-        assert!(
-            app.projects.current().selection.is_none(),
-            "an Add with nothing to add to must not create a selection (D78)"
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(2, 2, 2, 2)),
+            "an Add with no existing selection must start a normal selection"
         );
     }
 
@@ -17035,9 +17354,10 @@ mod tests {
             ..Default::default()
         });
         set_modifiers(&app, egui::Modifiers::NONE);
-        assert!(
-            app.projects.current().selection.is_none(),
-            "plain Shift with no base stays a deliberate no-op (D78)"
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(1, 1, 9, 9)),
+            "Shift with no existing selection starts a normal selection"
         );
 
         // Shift alone, marquee, with base → Add (unchanged).
@@ -18788,10 +19108,13 @@ mod tests {
             },
             egui::pos2(60.0, 60.0),
         );
-        assert!(
-            app.projects.current().selection.is_none(),
-            "Shift alone with no base must stay a D78 no-op"
-        );
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Shift alone with no base starts a normal selection");
+        assert!(sel.contains(60, 60));
     }
 
     /// BB (b)+(d): selection needs a move past the dead zone. A plain click and
@@ -29963,6 +30286,281 @@ mod tests {
                 .get_pixel(16, 0),
             Some(Color::rgba(0, 0, 0, 0)),
             "undo removes the ghost pixels"
+        );
+    }
+
+    #[test]
+    fn tile_eyedrop_empty_cell_reads_only_active_layer() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = TileSize::square(4);
+        app.apply_toolbar_events(vec![ToolbarEvent::ToolSelected(Tool::Tile)]);
+
+        // Paint red on Layer 0 at cell (1,0) (canvas 4..8, 0..4).
+        {
+            let layer0 = app.projects.current_mut().layers.active_layer_mut();
+            let red = [255u8, 0, 0, 255].repeat(16);
+            layer0.buffer.blit_region(Rect2i::new(4, 0, 4, 4), &red);
+        }
+        // Add Layer 1 (empty) and make it active.
+        let layer1_id = app.projects.current_mut().layers.add_layer("Layer 2");
+        app.projects.current_mut().layers.set_active(layer1_id);
+        app.projects.current_mut().tile_palette.selected = None;
+
+        // Right-click empty cell (1,0) on Layer 2: must NOT capture Layer 0's red.
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((5, 2)),
+            ..Default::default()
+        });
+        // Stamp at cell (4,0) on Layer 2.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((17, 2)),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects
+                .current()
+                .layers
+                .layer(layer1_id)
+                .unwrap()
+                .buffer
+                .get_pixel(16, 0),
+            Some(Color::rgba(0, 0, 0, 0)),
+            "picking an empty cell on an empty active layer must not copy pixels from lower layers"
+        );
+    }
+
+    #[test]
+    fn brush_selector_selects_non_transparent_adds_with_shift_and_subtracts_with_right_click() {
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![
+            ToolbarEvent::FieldierChildChanged(FieldierChild::BrushSelector),
+            ToolbarEvent::BrushSelectSizeChanged(3),
+            ToolbarEvent::BrushSelectShapeChanged(BrushShape::Square),
+        ]);
+        assert_eq!(app.projects.current().tool_state.tool(), Tool::Fieldier);
+        assert_eq!(
+            app.projects.current().tool_state.child(),
+            FieldierChild::BrushSelector
+        );
+
+        // Paint opaque pixels at (4,4) and (12,4); keep (5,4) and (8,4) transparent.
+        {
+            let buf = &mut app.projects.current_mut().layers.active_layer_mut().buffer;
+            buf.set_pixel(4, 4, Color::rgb(255, 0, 0));
+            buf.set_pixel(12, 4, Color::rgb(0, 0, 255));
+        }
+
+        // Plain left stroke over (4,4): selects (4,4), skips transparent (5,4).
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((4, 4)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        {
+            let sel = app
+                .projects
+                .current()
+                .selection
+                .as_ref()
+                .expect("selection created");
+            assert!(sel.contains(4, 4));
+            assert!(!sel.contains(5, 4));
+            assert!(!sel.contains(12, 4));
+        }
+
+        // Shift + left stroke over (12,4): adds (12,4) while keeping (4,4).
+        let shift_mods = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let mut out = app.ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::ModifiersChanged(shift_mods)],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+        app.handle_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((12, 4)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+        {
+            let sel = app
+                .projects
+                .current()
+                .selection
+                .as_ref()
+                .expect("selection after shift add");
+            assert!(sel.contains(4, 4), "shift-add preserves existing selection");
+            assert!(sel.contains(12, 4), "shift-add adds newly painted opaque pixel");
+        }
+
+        // Clear Shift, then right-click stroke over (4,4): subtracts (4,4), keeps (12,4).
+        let mut out = app.ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_started: true,
+            eyedropper_point: Some((4, 4)),
+            ..Default::default()
+        });
+        app.handle_interactions(CanvasInteractions {
+            eyedropper_ended: true,
+            ..Default::default()
+        });
+        {
+            let sel = app
+                .projects
+                .current()
+                .selection
+                .as_ref()
+                .expect("selection after right-click subtract");
+            assert!(!sel.contains(4, 4), "right-click subtracts covered pixel");
+            assert!(sel.contains(12, 4), "uncovered pixel stays selected");
+        }
+    }
+
+    #[test]
+    fn rectangle_double_click_suppressed_after_commit_or_deselect_and_shift_double_click_adds() {
+        let mut app = App::default();
+        app.projects.current_mut().tile_size = TileSize::square(16);
+        app.apply_toolbar_events(vec![ToolbarEvent::FieldierChildChanged(
+            FieldierChild::Rectangle,
+        )]);
+
+        // 1) Normal double-click inside region (0,0) with no selection selects that region.
+        app.handle_interactions(CanvasInteractions {
+            double_clicked: Some((4, 4)),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(0, 0, 16, 16))
+        );
+
+        // 2) First click outside dismisses the selection; an immediate double-click
+        //    on the same gesture must NOT select a new region.
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((20, 4)),
+            ..Default::default()
+        });
+        assert!(app.projects.current().selection.is_none());
+        app.handle_interactions(CanvasInteractions {
+            double_clicked: Some((20, 4)),
+            ..Default::default()
+        });
+        assert!(
+            app.projects.current().selection.is_none(),
+            "double-click immediately after deselect must not trigger region select"
+        );
+
+        // 3) Next double-click (no prior deselect/commit) selects region (0,0) again,
+        //    then Shift+double-click in region (1,0) adds it to the selection.
+        app.handle_interactions(CanvasInteractions {
+            double_clicked: Some((4, 4)),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.projects.current().selection.as_ref().map(|s| s.rect()),
+            Some(Rect2i::new(0, 0, 16, 16))
+        );
+        let shift_mods = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        app.handle_interactions(CanvasInteractions {
+            clicked: Some((20, 4)),
+            click_modifiers: Some(shift_mods),
+            ..Default::default()
+        });
+        assert!(
+            app.projects.current().selection.is_some(),
+            "Shift+first-click outside must preserve existing selection for Shift+double-click"
+        );
+        app.handle_interactions(CanvasInteractions {
+            double_clicked: Some((20, 4)),
+            click_modifiers: Some(shift_mods),
+            ..Default::default()
+        });
+        let sel = app
+            .projects
+            .current()
+            .selection
+            .as_ref()
+            .expect("Shift+double-click must union the second region");
+        assert!(sel.contains(4, 4));
+        assert!(sel.contains(20, 4));
+    }
+
+    #[test]
+    fn open_settings_event_always_opens_or_focuses_layer_settings() {
+        let mut app = App::default();
+        let lid = app.projects.current().layers.active_layer_id();
+        app.apply_layer_events(vec![LayerPanelEvent::OpenSettings(lid)]);
+        assert_eq!(*app.layers_host.open_settings.borrow(), Some(lid));
+        // Calling OpenSettings again keeps it open (unlike SettingsToggle).
+        app.apply_layer_events(vec![LayerPanelEvent::OpenSettings(lid)]);
+        assert_eq!(*app.layers_host.open_settings.borrow(), Some(lid));
+    }
+
+    #[test]
+    fn onion_behind_and_layer_mode_toggles_update_session_and_host() {
+        let mut app = App::default();
+        assert!(!app.projects.current().onion_behind);
+        assert!(!app.projects.current().onion_layer_mode);
+
+        app.apply_frame_edit_events(vec![
+            dock_frame_edit_panel::FrameEditPanelEvent::OnionPrev(true),
+            dock_frame_edit_panel::FrameEditPanelEvent::OnionBehind(true),
+            dock_frame_edit_panel::FrameEditPanelEvent::OnionLayerMode(true),
+        ]);
+        app.publish_frame_edit_view();
+
+        assert!(app.projects.current().onion_behind);
+        assert!(app.projects.current().onion_layer_mode);
+        assert!(app.frame_edit_host.onion_behind.get());
+        assert!(app.frame_edit_host.onion_layer_mode.get());
+        assert!(
+            app.frame_edit_host.onion_behind_composite_tex.get().is_some(),
+            "onion behind with onion active must publish the per-layer behind composite texture"
+        );
+
+        app.apply_frame_edit_events(vec![
+            dock_frame_edit_panel::FrameEditPanelEvent::OnionBehind(false),
+        ]);
+        app.publish_frame_edit_view();
+        assert!(
+            app.frame_edit_host.onion_behind_composite_tex.get().is_none(),
+            "disabling onion behind clears the per-layer behind composite texture"
+        );
+        assert!(
+            app.frame_edit_host.onion_layer_tex.get().is_some(),
+            "layer mode (front) with onion active must publish the active-layer sheet texture"
+        );
+
+        app.apply_frame_edit_events(vec![
+            dock_frame_edit_panel::FrameEditPanelEvent::OnionLayerMode(false),
+        ]);
+        app.publish_frame_edit_view();
+        assert!(
+            app.frame_edit_host.onion_layer_tex.get().is_none(),
+            "disabling layer mode reverts to full composite onion skin"
         );
     }
 

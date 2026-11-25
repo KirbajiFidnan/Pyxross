@@ -49,8 +49,10 @@ const CONTROL_DELAY_INPUT_WIDTH: f32 = 44.0;
 
 /// Onion-skin toggles (ghost of previous/next frame) and frame stepping
 /// arrows (`◀` / `▶`).
+const ONION_BEHIND_LABEL: &str = crate::ui::icons::ONION_BEHIND;
 const ONION_PREV_LABEL: &str = crate::ui::icons::ONION_PREV;
 const ONION_NEXT_LABEL: &str = crate::ui::icons::ONION_NEXT;
+const ONION_LAYER_MODE_LABEL: &str = crate::ui::icons::ONION_LAYER_MODE;
 const PREV_LABEL: &str = "\u{25c0}";
 const NEXT_LABEL: &str = "\u{25b6}";
 
@@ -66,6 +68,10 @@ pub enum FrameEditPanelEvent {
     OnionPrev(bool),
     /// Toggle the next-frame onion skin.
     OnionNext(bool),
+    /// Toggle drawing onion skin behind the current frame image.
+    OnionBehind(bool),
+    /// Toggle active-layer-only onion skin mode.
+    OnionLayerMode(bool),
     /// Move the frame-edit cursor one frame back.
     PrevFrame,
     /// Move the frame-edit cursor one frame forward.
@@ -93,6 +99,10 @@ pub struct FrameEditHost {
     pub onion_prev: Rc<Cell<bool>>,
     /// Whether the next-frame onion skin is shown.
     pub onion_next: Rc<Cell<bool>>,
+    /// Whether onion skin is drawn behind the current frame image.
+    pub onion_behind: Rc<Cell<bool>>,
+    /// Whether onion skin samples only the active layer.
+    pub onion_layer_mode: Rc<Cell<bool>>,
     /// Gestures emitted by the control bar.
     pub events: Rc<RefCell<Vec<FrameEditPanelEvent>>>,
     /// The panel's private editable canvas widget.
@@ -105,6 +115,10 @@ pub struct FrameEditHost {
     pub view: Rc<RefCell<CanvasView>>,
     /// The shared full-sheet texture id, published each frame.
     pub image_id: Rc<Cell<Option<egui::TextureId>>>,
+    /// Optional active-layer-only sheet texture id for onion skin Layer Mode.
+    pub onion_layer_tex: Rc<Cell<Option<egui::TextureId>>>,
+    /// Optional per-layer behind-onion region composite texture id.
+    pub onion_behind_composite_tex: Rc<Cell<Option<egui::TextureId>>>,
     /// The sheet sub-rect this viewport displays: the frame-edit cursor frame's
     /// `region().rect()`. `None` means no frame is available.
     pub region: Rc<Cell<Option<Rect2i>>>,
@@ -122,12 +136,16 @@ impl Default for FrameEditHost {
             delay_seed: Rc::new(Cell::new((usize::MAX, 0))),
             onion_prev: Rc::new(Cell::new(false)),
             onion_next: Rc::new(Cell::new(false)),
+            onion_behind: Rc::new(Cell::new(false)),
+            onion_layer_mode: Rc::new(Cell::new(false)),
             events: Rc::new(RefCell::new(Vec::new())),
             widget: Rc::new(RefCell::new(CanvasWidget::new())),
             camera: Rc::new(Cell::new(Camera::new())),
             overlay: Rc::new(RefCell::new(CanvasOverlay::None)),
             view: Rc::new(RefCell::new(CanvasView::default())),
             image_id: Rc::new(Cell::new(None)),
+            onion_layer_tex: Rc::new(Cell::new(None)),
+            onion_behind_composite_tex: Rc::new(Cell::new(None)),
             region: Rc::new(Cell::new(None)),
             interactions: Rc::new(RefCell::new(None)),
         }
@@ -172,6 +190,19 @@ impl PanelContent for FrameEditPanelContent {
                 // Fix 1: scope the viewport to the cursor frame's region (the
                 // full sheet size still comes from `view.canvas_size` for UVs).
                 widget.set_sheet_region(host.region.get());
+                widget.set_onion_options(
+                    host.onion_behind.get(),
+                    if host.onion_layer_mode.get() {
+                        host.onion_layer_tex.get()
+                    } else {
+                        None
+                    },
+                    if host.onion_behind.get() {
+                        host.onion_behind_composite_tex.get()
+                    } else {
+                        None
+                    },
+                );
                 let interactions =
                     widget.ui(ui, chrome.colors, chrome.capture, image_id, view, camera);
                 host.camera.set(interactions.updated_camera);
@@ -236,15 +267,32 @@ fn draw_controls(
         },
     );
 
-    // CENTER: onion-skin toggles, in order prev then next, horizontally centered.
+    // CENTER: onion-skin toggles, left→right:
+    // `[Onion Behind] [Onion Prev] [Onion Next] [Layer Mode]`, horizontally centered.
     ui.scope_builder(
         UiBuilder::new()
             .max_rect(center)
             .layout(Layout::left_to_right(Align::Center)),
         |ui| {
             ui.spacing_mut().item_spacing.x = CONTROL_GAP;
-            let group = 2.0 * CONTROL_BUTTON_WIDTH + CONTROL_GAP;
+            let group = 4.0 * CONTROL_BUTTON_WIDTH + 3.0 * CONTROL_GAP;
             ui.add_space(((ui.available_width() - group) * 0.5).max(0.0));
+            let behind_on = host.onion_behind.get();
+            if control_button(
+                ui,
+                chrome,
+                ONION_BEHIND_LABEL,
+                ButtonStyle::toggled(behind_on),
+            )
+            .on_hover_text("Onion Behind: draw onion skin behind frame")
+            .clicked()
+            {
+                let on = !behind_on;
+                host.onion_behind.set(on);
+                host.events
+                    .borrow_mut()
+                    .push(FrameEditPanelEvent::OnionBehind(on));
+            }
             let prev_on = host.onion_prev.get();
             if control_button(ui, chrome, ONION_PREV_LABEL, ButtonStyle::toggled(prev_on))
                 .on_hover_text("Previous frame onion skin")
@@ -266,6 +314,22 @@ fn draw_controls(
                 host.events
                     .borrow_mut()
                     .push(FrameEditPanelEvent::OnionNext(on));
+            }
+            let layer_mode_on = host.onion_layer_mode.get();
+            if control_button(
+                ui,
+                chrome,
+                ONION_LAYER_MODE_LABEL,
+                ButtonStyle::toggled(layer_mode_on),
+            )
+            .on_hover_text("Layer Mode: onion skin from active layer only")
+            .clicked()
+            {
+                let on = !layer_mode_on;
+                host.onion_layer_mode.set(on);
+                host.events
+                    .borrow_mut()
+                    .push(FrameEditPanelEvent::OnionLayerMode(on));
             }
         },
     );

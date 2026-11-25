@@ -30,6 +30,8 @@ pub enum LayerPanelEvent {
     Rename(LayerId, String),
     /// Toggled the floating settings popup for `id`.
     SettingsToggle(LayerId),
+    /// Always open (or retarget/focus) the floating settings panel for `id`.
+    OpenSettings(LayerId),
     /// Toggled expansion of the group row `id`.
     ToggleExpanded(LayerId),
     /// Dropped `dragged` onto `target` (ids only; the App resolves the placement).

@@ -25,7 +25,7 @@ use crate::core::model::{BlendMode, Layer, LayerId, LayerStack};
 use crate::core::tilemap::TilePalette;
 use crate::core::transform::LayerCommit;
 use crate::core::undo::{
-    Command, CommandContext, CompositeCommand, DeltaRecorder, ReverseDeltaCommand, UndoStack,
+    Command, CommandContext, CompositeCommand, DeltaRecorder, UndoStack,
 };
 
 // ---------------------------------------------------------------------------
@@ -669,40 +669,27 @@ pub fn apply_layer_commits_with(
 
     // Cut: zero the lifted source rect on its layer.  Skip when the source is
     // already fully transparent, so a pure no-op gesture leaves no entry.  A
-    // masked lift only clears the selected cells — the snapshot already
-    // carries zeros outside the mask, and a full-rect clear would erase
-    // pixels the selection never covered.
+    // masked lift only clears the selected cells — record the delta from the
+    // LIVE layer buffer via `DeltaRecorder` so unselected pixels inside
+    // `source.rect` are preserved on both undo and redo.
     if cut_source && source.snapshot.iter().any(|&b| b != 0) {
         if let Some(layer) = layers.layer_mut(source.layer_id) {
-            // The cut's after-state doubles as the blit source: with a mask
-            // only the selected cells are zeroed (and written), so the delta's
-            // redo reproduces the cut instead of erasing masked-out cells.
-            let after = match &source.mask {
-                Some(mask) if mask.len() == source.rect.area() as usize => {
-                    let mut after = source.snapshot.clone();
-                    for (i, px) in after.chunks_exact_mut(4).enumerate() {
-                        if mask[i] {
-                            px.copy_from_slice(&[0u8; 4]);
-                        }
-                    }
-                    after
+            if let Some(recorder) = DeltaRecorder::begin(
+                TRANSFORM_UNDO_NAME,
+                source.layer_id,
+                &layer.buffer,
+                source.rect,
+            ) {
+                let zeros = vec![0u8; source.snapshot.len()];
+                let cleared = match &source.mask {
+                    Some(mask) => layer
+                        .buffer
+                        .blit_region_masked(source.rect, &zeros, Some(mask)),
+                    None => layer.buffer.blit_region(source.rect, &zeros),
+                };
+                if cleared && !recorder.is_empty_delta(&layer.buffer) {
+                    composite.push(Box::new(recorder.finish(&layer.buffer)));
                 }
-                _ => vec![0u8; source.snapshot.len()],
-            };
-            let cleared = match &source.mask {
-                Some(mask) => layer
-                    .buffer
-                    .blit_region_masked(source.rect, &after, Some(mask)),
-                None => layer.buffer.blit_region(source.rect, &after),
-            };
-            if cleared {
-                composite.push(Box::new(ReverseDeltaCommand::new(
-                    TRANSFORM_UNDO_NAME,
-                    source.layer_id,
-                    source.rect,
-                    source.snapshot.clone(),
-                    after,
-                )));
             }
         }
     }
@@ -1787,5 +1774,60 @@ mod tests {
             buf: vec![0u8; 16],
         };
         assert!(crop_commit(&commit, Rect2i::new(0, 0, 4, 4)).is_none());
+    }
+
+    #[test]
+    fn masked_transform_commit_and_undo_preserves_unselected_pixels_in_bbox() {
+        let mut layers = LayerStack::new(4, 4);
+        let lid = layers.active_layer_id();
+        // Paint two pixels inside the 2x2 bbox (0..2, 0..2):
+        //   (0, 0) = RED   (selected / mask = true)
+        //   (1, 0) = GREEN (NOT selected / mask = false, still inside bbox!)
+        let red = Color::rgb(255, 0, 0);
+        let green = Color::rgb(0, 255, 0);
+        layers.active_layer_mut().buffer.set_pixel(0, 0, red);
+        layers.active_layer_mut().buffer.set_pixel(1, 0, green);
+        let original = layers.active_layer().buffer.as_bytes().to_vec();
+
+        // Masked snapshot: only (0,0) is masked-in; mask-out cells carry zeros
+        // (matching `Selection::capture_mask`).
+        let rect = Rect2i::new(0, 0, 2, 2);
+        let mask = vec![true, false, false, false];
+        let mut snapshot = vec![0u8; 2 * 2 * 4];
+        snapshot[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let source = TransformSource {
+            layer_id: lid,
+            rect,
+            snapshot,
+            mask: Some(mask),
+        };
+
+        // Commit moves the selected red pixel to (2, 2).
+        let mut commit_buf = vec![0u8; 2 * 2 * 4];
+        commit_buf[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let commits = vec![LayerCommit {
+            layer_id: lid.as_u64() as usize,
+            dst: (2.0, 2.0),
+            w: 2,
+            h: 2,
+            buf: commit_buf,
+        }];
+
+        let mut cmd = apply_layer_commits_with(&source, &commits, lid, &mut layers, true)
+            .expect("transform commit must produce an undo command");
+
+        // After commit: (0,0) cleared, (1,0) green untouched, (2,2) red pasted.
+        assert_eq!(layers.active_layer().buffer.get_pixel(0, 0), Some(Color::TRANSPARENT));
+        assert_eq!(layers.active_layer().buffer.get_pixel(1, 0), Some(green));
+        assert_eq!(layers.active_layer().buffer.get_pixel(2, 2), Some(red));
+
+        // Undo MUST restore (0,0) red AND preserve unselected (1,0) green!
+        assert!(cmd.undo(&mut ctx(&mut layers)));
+        assert_eq!(
+            layers.active_layer().buffer.get_pixel(1, 0),
+            Some(green),
+            "unselected pixel inside transform bbox must NOT be erased on undo"
+        );
+        assert_eq!(layers.active_layer().buffer.as_bytes(), &original[..]);
     }
 }

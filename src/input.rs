@@ -36,6 +36,7 @@ pub enum Action {
     SelectRectangle,
     SelectWand,
     SelectLasso,
+    SelectBrushSelector,
     SelectFill,
     SelectTileTool,
     SelectAnimationPlacer,
@@ -61,7 +62,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Undo,
         Self::Redo,
         Self::Copy,
@@ -87,6 +88,7 @@ impl Action {
         Self::SelectRectangle,
         Self::SelectWand,
         Self::SelectLasso,
+        Self::SelectBrushSelector,
         Self::SelectFill,
         Self::SelectTileTool,
         Self::SelectAnimationPlacer,
@@ -610,6 +612,23 @@ pub enum FieldierChild {
     Rectangle,
     Wand,
     Lasso,
+    BrushSelector,
+}
+
+/// Brush Selector child's brush parameters (size + shape).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BrushSelectSettings {
+    pub size: u8,
+    pub shape: crate::core::brush::BrushShape,
+}
+
+impl Default for BrushSelectSettings {
+    fn default() -> Self {
+        Self {
+            size: 4,
+            shape: crate::core::brush::BrushShape::Round,
+        }
+    }
 }
 
 /// The wand child's flood-fill parameters.
@@ -669,6 +688,7 @@ pub struct ToolState {
     previous: Option<Tool>,
     child: FieldierChild,
     wand: WandSettings,
+    brush_select: BrushSelectSettings,
     fill: FillSettings,
 }
 
@@ -680,6 +700,7 @@ impl ToolState {
             previous: None,
             child: FieldierChild::default(),
             wand: WandSettings::default(),
+            brush_select: BrushSelectSettings::default(),
             fill: FillSettings::default(),
         }
     }
@@ -716,6 +737,16 @@ impl ToolState {
     /// Mutable access to the Fieldier wand settings.
     pub fn wand_mut(&mut self) -> &mut WandSettings {
         &mut self.wand
+    }
+
+    /// The Fieldier Brush Selector settings.
+    pub fn brush_select(&self) -> BrushSelectSettings {
+        self.brush_select
+    }
+
+    /// Mutable access to the Fieldier Brush Selector settings.
+    pub fn brush_select_mut(&mut self) -> &mut BrushSelectSettings {
+        &mut self.brush_select
     }
 
     /// The Fill (bucket) tool's settings.

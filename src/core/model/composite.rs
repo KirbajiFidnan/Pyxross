@@ -521,6 +521,156 @@ fn composite_stack_region_internal(
     out
 }
 
+/// Per-layer behind-frame onion skin specification.
+///
+/// Each eligible visible leaf layer composites its own previous/next frame
+/// ghosts directly underneath its own current-frame pixels, so lower layers
+/// (e.g. an opaque background) never hide an upper layer's behind-onion skin.
+#[derive(Clone, Copy, Debug)]
+pub struct OnionBehindSpec {
+    pub prev_origin: Option<(i32, i32)>,
+    pub prev_tint: Color,
+    pub next_origin: Option<(i32, i32)>,
+    pub next_tint: Color,
+    /// When `Some(id)`, only that leaf layer renders behind-onion ghosts
+    /// (Layer Mode); when `None`, every visible leaf layer renders its own.
+    pub only_layer: Option<super::LayerId>,
+}
+
+fn composite_tinted_over_offset(
+    dst: &mut PixelBuffer,
+    src: &PixelBuffer,
+    ox: i32,
+    oy: i32,
+    layer_opacity: f32,
+    tint: Color,
+) {
+    for y in 0..dst.height() {
+        for x in 0..dst.width() {
+            let px = ox + x as i32;
+            let py = oy + y as i32;
+            let src_px = if px >= 0
+                && py >= 0
+                && (px as usize) < src.width()
+                && (py as usize) < src.height()
+            {
+                src.get_pixel_unchecked(px as usize, py as usize)
+            } else {
+                Color::TRANSPARENT
+            };
+            if src_px.a == 0 {
+                continue;
+            }
+            let r = ((u16::from(src_px.r) * u16::from(tint.r)) / 255) as u8;
+            let g = ((u16::from(src_px.g) * u16::from(tint.g)) / 255) as u8;
+            let b = ((u16::from(src_px.b) * u16::from(tint.b)) / 255) as u8;
+            let a = (((u16::from(src_px.a) * u16::from(tint.a)) / 255) as f32 * layer_opacity)
+                .round() as u8;
+            if a == 0 {
+                continue;
+            }
+            let dst_px = dst.get_pixel_unchecked(x, y);
+            dst.set_pixel_unchecked(x, y, over(Color::rgba(r, g, b, a), dst_px));
+        }
+    }
+}
+
+fn composite_layer_onion_ghost(
+    dst: &mut PixelBuffer,
+    layer: &Layer,
+    ox: i32,
+    oy: i32,
+    palette: &TilePalette,
+    tint: Color,
+) {
+    if let Some(tm) = &layer.tilemap {
+        let mut cache = layer.tilemap_cache.borrow_mut();
+        let canvas_w = layer.buffer.width();
+        let canvas_h = layer.buffer.height();
+        let stale = match cache.as_ref() {
+            Some(entry) => {
+                entry.tilemap_epoch != tm.change_epoch
+                    || entry.palette_epoch != palette.change_epoch
+                    || entry.canvas_w != canvas_w
+                    || entry.canvas_h != canvas_h
+            }
+            None => true,
+        };
+        if stale {
+            let mut buffer = PixelBuffer::new(canvas_w, canvas_h);
+            tm.rasterize(palette, &mut buffer);
+            *cache = Some(TilemapRenderCache {
+                tilemap_epoch: tm.change_epoch,
+                palette_epoch: palette.change_epoch,
+                canvas_w,
+                canvas_h,
+                buffer,
+            });
+        }
+        let mut combined = layer.buffer.clone();
+        if let Some(raster) = cache.as_ref() {
+            composite_over_offset(&mut combined, &raster.buffer, 0, 0, 1.0, BlendMode::Normal);
+        }
+        composite_tinted_over_offset(dst, &combined, ox, oy, layer.opacity, tint);
+    } else {
+        composite_tinted_over_offset(dst, &layer.buffer, ox, oy, layer.opacity, tint);
+    }
+}
+
+fn compose_node_region_onion_behind(
+    dst: &mut PixelBuffer,
+    stack: &LayerStack,
+    node: &Layer,
+    ox: i32,
+    oy: i32,
+    palette: &TilePalette,
+    spec: &OnionBehindSpec,
+) {
+    if !node.visible {
+        return;
+    }
+    if node.is_group {
+        let mut scratch = PixelBuffer::new(dst.width(), dst.height());
+        for child_id in stack.children_of(Some(node.id)) {
+            let child = stack
+                .layer(child_id)
+                .expect("group child id must reference an existing layer");
+            compose_node_region_onion_behind(&mut scratch, stack, child, ox, oy, palette, spec);
+        }
+        composite_over_offset(dst, &scratch, 0, 0, node.opacity, node.blend);
+    } else {
+        let include_onion = spec.only_layer.is_none() || spec.only_layer == Some(node.id);
+        if include_onion {
+            if let Some((px, py)) = spec.prev_origin {
+                composite_layer_onion_ghost(dst, node, px, py, palette, spec.prev_tint);
+            }
+            if let Some((nx, ny)) = spec.next_origin {
+                composite_layer_onion_ghost(dst, node, nx, ny, palette, spec.next_tint);
+            }
+        }
+        composite_layer_over(dst, node, ox, oy, palette, None);
+    }
+}
+
+/// Composites `clipped` with per-layer behind-frame onion skinning: each
+/// eligible visible layer paints its own prev/next ghosts directly underneath
+/// its own current-frame pixels.
+pub(super) fn composite_stack_region_with_onion_behind(
+    stack: &LayerStack,
+    palette: &TilePalette,
+    clipped: Rect2i,
+    spec: &OnionBehindSpec,
+) -> PixelBuffer {
+    let mut out = PixelBuffer::new(clipped.w as usize, clipped.h as usize);
+    for root_id in stack.children_of(None) {
+        let node = stack
+            .layer(root_id)
+            .expect("root id must reference an existing layer");
+        compose_node_region_onion_behind(&mut out, stack, node, clipped.x, clipped.y, palette, spec);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,5 +1285,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn onion_behind_places_each_layer_ghost_above_lower_layers_and_behind_own_pixels() {
+        // 4x2 sheet: frame 0 at (0..2, 0..2), frame 1 at (2..4, 0..2).
+        let mut stack = LayerStack::new(4, 2);
+        let bg_id = stack.active_layer_id();
+        // Layer 0 (bottom): solid opaque dark blue across the whole sheet.
+        stack
+            .layer_mut(bg_id)
+            .unwrap()
+            .buffer
+            .fill(Color::rgb(0, 0, 100));
+
+        // Layer 1 (top):
+        //   Frame 0 (prev) has white at (0, 0) and (1, 0).
+        //   Frame 1 (current) has opaque green at (2, 0) only; (3, 0) is transparent.
+        let fg_id = stack.add_layer("Character");
+        let fg = stack.layer_mut(fg_id).unwrap();
+        fg.buffer.set_pixel(0, 0, Color::rgb(255, 255, 255));
+        fg.buffer.set_pixel(1, 0, Color::rgb(255, 255, 255));
+        fg.buffer.set_pixel(2, 0, Color::rgb(0, 255, 0));
+
+        let palette = TilePalette::default();
+        let spec = OnionBehindSpec {
+            prev_origin: Some((0, 0)),
+            prev_tint: Color::rgba(255, 0, 0, 128),
+            next_origin: None,
+            next_tint: Color::TRANSPARENT,
+            only_layer: None,
+        };
+        let out = stack
+            .composite_layers_region_with_onion_behind(Rect2i::new(2, 0, 2, 2), &palette, &spec)
+            .unwrap();
+
+        // At local (0, 0) -> canvas (2, 0): Layer 1's own opaque green MUST cover its own prev ghost.
+        assert_eq!(
+            out.get_pixel(0, 0),
+            Some(Color::rgb(0, 255, 0)),
+            "a layer's own pixels must sit ON TOP of its behind-onion ghost"
+        );
+        // At local (1, 0) -> canvas (3, 0): Layer 1 is transparent in current frame,
+        // so Layer 1's red-tinted prev ghost MUST appear ON TOP of Layer 0's opaque blue!
+        let p = out.get_pixel(1, 0).unwrap();
+        assert!(
+            p.r > 100 && p.b > 0,
+            "upper layer's behind-onion ghost must remain visible above opaque lower layer: {p:?}"
+        );
     }
 }

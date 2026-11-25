@@ -203,7 +203,12 @@ fn row_ui(
                             .sense(egui::Sense::click_and_drag())
                             .selected(is_active),
                     );
-                    if name.clicked() {
+                    if name.double_clicked() {
+                        child_clicked = true;
+                        let mut evs = host.events.borrow_mut();
+                        evs.push(LayerPanelEvent::Select(id));
+                        evs.push(LayerPanelEvent::OpenSettings(id));
+                    } else if name.clicked() {
                         child_clicked = true;
                         host.events.borrow_mut().push(LayerPanelEvent::Select(id));
                     }

@@ -967,8 +967,8 @@ pub fn encode_gif(frames: &[GifFrameInput]) -> Result<Vec<u8>, GifError> {
                     frame.rgba.len()
                 )));
             }
-            let mut rgba = frame.rgba.clone();
-            let mut gif_frame = gif::Frame::from_rgba_speed(w, h, &mut rgba, 10);
+            let mut gif_frame = build_gif_frame(w, h, &frame.rgba);
+            gif_frame.dispose = gif::DisposalMethod::Background;
             gif_frame.delay =
                 (frame.delay_ms.saturating_add(5) / 10).clamp(1, u16::MAX as u32) as u16;
             encoder
@@ -977,6 +977,69 @@ pub fn encode_gif(frames: &[GifFrameInput]) -> Result<Vec<u8>, GifError> {
         }
     }
     Ok(out)
+}
+
+/// Builds a `gif::Frame` from straight-alpha RGBA8 pixels.
+///
+/// Uses a lossless exact local palette whenever the frame has at most 255
+/// distinct opaque colors (or 256 if fully opaque), preserving exact pixel-art
+/// colors and crisp 1-bit transparency. Falls back to NeuQuant (`speed = 1`)
+/// for high-color frames.
+fn build_gif_frame(w: u16, h: u16, rgba: &[u8]) -> gif::Frame<'static> {
+    let pixel_count = usize::from(w) * usize::from(h);
+    let mut has_transparent = false;
+    let mut color_to_idx: std::collections::HashMap<[u8; 3], u8> =
+        std::collections::HashMap::new();
+    let mut palette: Vec<u8> = Vec::new();
+    let mut exact = true;
+
+    for px in rgba.chunks_exact(4) {
+        if px[3] == 0 {
+            has_transparent = true;
+            continue;
+        }
+        let rgb = [px[0], px[1], px[2]];
+        if !color_to_idx.contains_key(&rgb) {
+            let max_opaque = if has_transparent { 255 } else { 256 };
+            if color_to_idx.len() >= max_opaque {
+                exact = false;
+                break;
+            }
+            let idx = color_to_idx.len() as u8;
+            color_to_idx.insert(rgb, idx);
+            palette.extend_from_slice(&rgb);
+        }
+    }
+    // If transparency was discovered after filling all 256 slots, fall back.
+    if has_transparent && color_to_idx.len() > 255 {
+        exact = false;
+    }
+
+    if exact {
+        let transparent_idx = if has_transparent {
+            let idx = color_to_idx.len() as u8;
+            palette.extend_from_slice(&[0, 0, 0]);
+            Some(idx)
+        } else {
+            None
+        };
+        if palette.is_empty() {
+            palette.extend_from_slice(&[0, 0, 0]);
+        }
+        let mut indexed = Vec::with_capacity(pixel_count);
+        for px in rgba.chunks_exact(4) {
+            if px[3] == 0 {
+                indexed.push(transparent_idx.unwrap_or(0));
+            } else {
+                let rgb = [px[0], px[1], px[2]];
+                indexed.push(*color_to_idx.get(&rgb).unwrap_or(&0));
+            }
+        }
+        gif::Frame::from_palette_pixels(w, h, indexed, palette, transparent_idx)
+    } else {
+        let mut buf = rgba.to_vec();
+        gif::Frame::from_rgba_speed(w, h, &mut buf, 1)
+    }
 }
 
 /// One decoded GIF animation frame (Import GIF, P1): full-canvas RGBA8 pixels
@@ -2180,6 +2243,60 @@ mod tests {
             assert_eq!(frame.rgba.len(), 2 * 2 * 4, "frame {index} must be full canvas");
             assert_eq!(frame.delay_ms, frames[index].delay_ms);
         }
+    }
+
+    #[test]
+    fn encode_gif_clears_previous_frame_transparent_pixels() {
+        // Frame 0: (0,0) is opaque red, rest transparent.
+        // Frame 1: (1,1) is opaque blue, (0,0) is transparent.
+        // Without DisposalMethod::Background, frame 0's red pixel bleeds into frame 1.
+        let mut f0 = vec![0u8; 2 * 2 * 4];
+        f0[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let mut f1 = vec![0u8; 2 * 2 * 4];
+        f1[12..16].copy_from_slice(&[0, 0, 255, 255]);
+
+        let bytes = encode_gif(&[
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: f0,
+                delay_ms: 120,
+            },
+            GifFrameInput {
+                width: 2,
+                height: 2,
+                rgba: f1,
+                delay_ms: 240,
+            },
+        ])
+        .unwrap();
+
+        // Raw GIF frames must declare DisposalMethod::Background and preserve delays/order.
+        let mut raw_dec = gif::Decoder::new(Cursor::new(&bytes)).unwrap();
+        let mut raw_disposals = Vec::new();
+        let mut raw_delays = Vec::new();
+        while let Some(frame) = raw_dec.read_next_frame().unwrap() {
+            raw_disposals.push(frame.dispose);
+            raw_delays.push(frame.delay);
+        }
+        assert_eq!(
+            raw_disposals,
+            vec![
+                gif::DisposalMethod::Background,
+                gif::DisposalMethod::Background,
+            ]
+        );
+        assert_eq!(raw_delays, vec![12, 24]);
+
+        // Composited decode must NOT carry frame 0's red pixel into frame 1.
+        let decoded = decode_gif(&bytes).unwrap();
+        assert_eq!(decoded.frames.len(), 2);
+        assert_eq!(&decoded.frames[0].rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            decoded.frames[1].rgba[3], 0,
+            "frame 1 pixel (0,0) must be transparent, not ghosted from frame 0"
+        );
+        assert_eq!(&decoded.frames[1].rgba[12..16], &[0, 0, 255, 255]);
     }
 
     #[test]

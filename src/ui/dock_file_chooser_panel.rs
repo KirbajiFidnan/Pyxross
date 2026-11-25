@@ -811,9 +811,42 @@ impl FileChooserComponent {
         };
         let mut actions = ChooserActions::default();
 
-        // Keyboard: Enter confirms, Esc cancels (kept from the old panel).
-        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        // Keyboard: Enter confirms/navigates, Esc cancels, Arrow keys step selection.
+        let (enter, arrow_up, arrow_down, arrow_left, arrow_right, backspace) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Backspace),
+            )
+        });
         let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut scroll_to_selected = false;
+        let text_editing = ui.ctx().egui_wants_keyboard_input();
+        if arrow_down {
+            if let Some(next) = step_selection(&entries, selected.as_deref(), 1) {
+                actions.select = Some(next);
+                scroll_to_selected = true;
+            }
+        } else if arrow_up {
+            if let Some(prev) = step_selection(&entries, selected.as_deref(), -1) {
+                actions.select = Some(prev);
+                scroll_to_selected = true;
+            }
+        } else if !text_editing && arrow_right {
+            if let Some(sel_path) = selected.as_deref() {
+                if entries
+                    .iter()
+                    .any(|e| e.is_dir && e.path.as_path() == sel_path)
+                {
+                    actions.navigate = Some(sel_path.to_path_buf());
+                }
+            }
+        } else if !text_editing && (arrow_left || backspace) {
+            actions.up = true;
+        }
 
         // Toolbar (pinned to the top).
         egui::Panel::top(ui.id().with("chooser-toolbar"))
@@ -894,23 +927,40 @@ impl FileChooserComponent {
         }
 
         // The listing well grows/shrinks with the panel and scrolls.
+        let display_selected = actions.select.clone().or_else(|| selected.clone());
         list_ui(
             ui,
             chrome,
             &entries,
-            selected.as_deref(),
+            display_selected.as_deref(),
+            scroll_to_selected,
             sort_column,
             sort_direction,
             &mut actions,
         );
 
         // A navigation this frame consumes Enter (the path field / a folder
-        // double-click must not also confirm).
+        // double-click must not also confirm). When a folder row is selected
+        // in file-pick modes, Enter navigates into it instead of erroring.
         if escape {
             actions.cancel = true;
         }
         if enter && !actions.is_navigation() && !actions.confirm && actions.select.is_none() {
-            actions.confirm = true;
+            let selected_dir = selected.as_deref().and_then(|p| {
+                entries
+                    .iter()
+                    .find(|e| e.is_dir && e.path.as_path() == p)
+                    .map(|e| e.path.clone())
+            });
+            if mode != FileChooserMode::ChooseFolder {
+                if let Some(dir) = selected_dir {
+                    actions.navigate = Some(dir);
+                } else {
+                    actions.confirm = true;
+                }
+            } else {
+                actions.confirm = true;
+            }
         }
 
         // Write the draft back.
@@ -1251,13 +1301,43 @@ fn sort_header_label(title: &str, column: SortColumn, active: SortColumn, dir: S
     }
 }
 
+/// Steps the list selection by `delta` (`+1` for Down, `-1` for Up), clamping
+/// to the list bounds. When nothing is selected, Down selects the first entry
+/// and Up selects the last entry.
+pub(crate) fn step_selection(
+    entries: &[Entry],
+    selected: Option<&Path>,
+    delta: isize,
+) -> Option<PathBuf> {
+    if entries.is_empty() {
+        return None;
+    }
+    let cur = selected.and_then(|p| entries.iter().position(|e| e.path.as_path() == p));
+    let next = match cur {
+        Some(idx) => {
+            let n = (idx as isize + delta).clamp(0, entries.len().saturating_sub(1) as isize);
+            n as usize
+        }
+        None => {
+            if delta >= 0 {
+                0
+            } else {
+                entries.len() - 1
+            }
+        }
+    };
+    Some(entries[next].path.clone())
+}
+
 /// The darker, zebra-striped listing well with sortable Name / Size / Modified
 /// column headers. Takes the available height and scrolls.
+#[allow(clippy::too_many_arguments)]
 fn list_ui(
     ui: &mut egui::Ui,
     chrome: &PanelChrome,
     entries: &[Entry],
     selected: Option<&Path>,
+    scroll_to_selected: bool,
     sort_column: SortColumn,
     sort_direction: SortDirection,
     actions: &mut ChooserActions,
@@ -1352,7 +1432,16 @@ fn list_ui(
                     return;
                 }
                 for (index, entry) in entries.iter().enumerate() {
-                    row_ui(ui, chrome, entry, index, selected, show_extra_cols, actions);
+                    row_ui(
+                        ui,
+                        chrome,
+                        entry,
+                        index,
+                        selected,
+                        scroll_to_selected,
+                        show_extra_cols,
+                        actions,
+                    );
                 }
             });
     });
@@ -1360,12 +1449,14 @@ fn list_ui(
 
 /// One listing row: a full-width Layers-style band (selection / hover / zebra
 /// fill) with left-aligned Name and right-aligned Size + Modified columns.
+#[allow(clippy::too_many_arguments)]
 fn row_ui(
     ui: &mut egui::Ui,
     chrome: &PanelChrome,
     entry: &Entry,
     index: usize,
     selected: Option<&Path>,
+    scroll_to_selected: bool,
     show_extra_cols: bool,
     actions: &mut ChooserActions,
 ) {
@@ -1464,6 +1555,9 @@ fn row_ui(
         ui.id().with(("chooser-row", index)),
         egui::Sense::click(),
     );
+    if scroll_to_selected && is_selected {
+        row_response.scroll_to_me(None);
+    }
     if row_response.clicked() {
         actions.select = Some(entry.path.clone());
     }
@@ -2445,6 +2539,55 @@ mod tests {
             .filter(|(rendered, _)| rendered == text)
             .map(|(_, pos)| pos)
             .collect()
+    }
+
+    #[test]
+    fn step_selection_navigates_entries_with_arrow_keys() {
+        let entries = vec![
+            Entry {
+                name: "alpha".into(),
+                path: PathBuf::from("/tmp/alpha"),
+                is_dir: true,
+                size_bytes: 0,
+                modified: None,
+            },
+            Entry {
+                name: "beta.png".into(),
+                path: PathBuf::from("/tmp/beta.png"),
+                is_dir: false,
+                size_bytes: 12,
+                modified: None,
+            },
+            Entry {
+                name: "gamma.png".into(),
+                path: PathBuf::from("/tmp/gamma.png"),
+                is_dir: false,
+                size_bytes: 34,
+                modified: None,
+            },
+        ];
+        // Nothing selected: Down picks first, Up picks last.
+        assert_eq!(step_selection(&entries, None, 1), Some(PathBuf::from("/tmp/alpha")));
+        assert_eq!(step_selection(&entries, None, -1), Some(PathBuf::from("/tmp/gamma.png")));
+        // Stepping forward and clamping at end.
+        assert_eq!(
+            step_selection(&entries, Some(Path::new("/tmp/alpha")), 1),
+            Some(PathBuf::from("/tmp/beta.png"))
+        );
+        assert_eq!(
+            step_selection(&entries, Some(Path::new("/tmp/gamma.png")), 1),
+            Some(PathBuf::from("/tmp/gamma.png"))
+        );
+        // Stepping backward and clamping at start.
+        assert_eq!(
+            step_selection(&entries, Some(Path::new("/tmp/beta.png")), -1),
+            Some(PathBuf::from("/tmp/alpha"))
+        );
+        assert_eq!(
+            step_selection(&entries, Some(Path::new("/tmp/alpha")), -1),
+            Some(PathBuf::from("/tmp/alpha"))
+        );
+        assert_eq!(step_selection(&[], None, 1), None);
     }
 
     #[test]

@@ -3938,9 +3938,13 @@ fn toolbox_lists_exactly_the_real_tools() {
         pyxross::ui::icons::ERASER,
         pyxross::ui::icons::FILL,
         pyxross::ui::icons::EYEDROPPER,
-        pyxross::ui::icons::SELECTION,
+        pyxross::ui::icons::SELECT_RECT,
+        pyxross::ui::icons::SELECT_WAND,
+        pyxross::ui::icons::SELECT_LASSO,
+        pyxross::ui::icons::SELECT_BRUSH,
         pyxross::ui::icons::TILE,
         pyxross::ui::icons::ANIMATION,
+        pyxross::ui::icons::TEXT,
     ];
     for icon in expected_icons {
         assert_eq!(
@@ -3949,14 +3953,16 @@ fn toolbox_lists_exactly_the_real_tools() {
             "tool icon {icon:?} must appear exactly once: {texts:?}"
         );
     }
-    assert!(
-        texts.iter().any(|text| text == "Toolbox"),
-        "panel title must render: {texts:?}"
-    );
+    for header in ["Toolbox", "Draw", "Selection", "Misc"] {
+        assert!(
+            texts.iter().any(|text| text == header),
+            "header {header:?} must render: {texts:?}"
+        );
+    }
     assert_eq!(
         texts.len(),
-        expected_icons.len() + 2,
-        "Toolbox title + 7 icon tools + 1 text tool label: {texts:?}"
+        expected_icons.len() + 4,
+        "Toolbox title + 3 category headers + 11 categorized tool icons: {texts:?}"
     );
 }
 

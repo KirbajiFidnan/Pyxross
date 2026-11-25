@@ -417,6 +417,10 @@ pub struct CanvasWidget {
     ants_polylines: Option<(Vec<BoundarySegment>, Vec<Vec<(f32, f32)>>)>,
     /// Cached seamless 16×16 pale sand-grey "X" + dither canvas backdrop.
     sand_bg_texture: Option<egui::TextureHandle>,
+    /// Cached nearest-neighbor texture for the Tile-placer preview overlay
+    /// `(content_hash, canvas_bbox, texture)` so large tiles render as a single
+    /// crisp quad without per-pixel egui anti-alias seams.
+    tile_preview_texture: Option<(u64, Rect2i, egui::TextureHandle)>,
     /// Sub-pixel pan remainder accumulated across slow drag frames so small
     /// deltas (< 0.5 px) are never dropped.
     pan_remainder: egui::Vec2,
@@ -425,6 +429,15 @@ pub struct CanvasWidget {
     /// Persistent active-animation frame regions painted in parallel even while
     /// a selection or gesture overlay is active.
     frame_regions_overlay: Vec<Rect2i>,
+    /// When true, onion skin is painted behind the frame image instead of on top.
+    onion_behind: bool,
+    /// Optional alternate sheet texture used by onion skin when Layer Mode is
+    /// enabled (samples only the active layer instead of the full composite).
+    onion_source_image_id: Option<egui::TextureId>,
+    /// Optional pre-composited region texture used when `onion_behind` is
+    /// active, where each layer's onion ghosts sit directly underneath that
+    /// layer's own pixels (so lower opaque layers never hide upper onion skin).
+    onion_behind_composite: Option<egui::TextureId>,
 }
 
 /// GG: order-independent union of two [`egui::Modifiers`] snapshots.
@@ -460,10 +473,25 @@ impl CanvasWidget {
             click_press_modifiers: None,
             ants_polylines: None,
             sand_bg_texture: None,
+            tile_preview_texture: None,
             pan_remainder: egui::Vec2::ZERO,
             text_caret: None,
             frame_regions_overlay: Vec::new(),
+            onion_behind: false,
+            onion_source_image_id: None,
+            onion_behind_composite: None,
         }
+    }
+
+    pub fn set_onion_options(
+        &mut self,
+        behind: bool,
+        source_image_id: Option<egui::TextureId>,
+        behind_composite: Option<egui::TextureId>,
+    ) {
+        self.onion_behind = behind;
+        self.onion_source_image_id = source_image_id;
+        self.onion_behind_composite = behind_composite;
     }
 
     pub fn set_text_caret(&mut self, caret: Option<((f32, f32), (f32, f32))>) {
@@ -812,12 +840,20 @@ impl CanvasWidget {
             egui::pos2(draw_rect.right() / tile_px, draw_rect.bottom() / tile_px),
         );
         painter.image(sand_id, draw_rect, sand_uv, crate::ui::theme::SKIN_TINT);
-        painter.image(
-            image_id,
-            draw_rect,
-            uv,
-            egui::Color32::WHITE, // NB: neutral texture tint (multiply blend, not chrome)
-        );
+        if let Some(comp_id) = self.onion_behind_composite {
+            let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(comp_id, draw_rect, full_uv, crate::ui::theme::SKIN_TINT);
+        } else {
+            if self.onion_behind {
+                self.paint_onion_overlay(&painter, theme, render_camera, image_id, canvas_size);
+            }
+            painter.image(
+                image_id,
+                draw_rect,
+                uv,
+                egui::Color32::WHITE, // NB: neutral texture tint (multiply blend, not chrome)
+            );
+        }
         painter.rect_stroke(
             draw_rect,
             0,
@@ -1553,15 +1589,16 @@ impl CanvasWidget {
         // the tile's baked pixels: the overlay used to be painted mid-pass,
         // where anything drawn afterwards (footprints, line/gizmo chrome) could
         // bury it under the tile content it is meant to describe.
-        self.paint_tile_placer_overlay(&painter, theme, render_camera, tile_size, scale);
+        self.paint_tile_placer_overlay(ui.ctx(), &painter, theme, render_camera, tile_size);
         // Animation-placer boundary highlights share the same final pass, so the
         // red/green/grey region outlines and the live in-flight rectangle read
         // above the canvas content too.
         self.paint_animation_placer_overlay(&painter, theme, render_camera);
-        // Frame-edit onion overlay viewports, painted in the same final pass so
-        // the translucent neighbour regions sit ON TOP of the base frame-edit
-        // content.
-        self.paint_onion_overlay(&painter, theme, render_camera, image_id, canvas_size);
+        // Frame-edit onion overlay viewports, painted on top when `onion_behind`
+        // is false (when true, per-layer behind compositing already painted them).
+        if !self.onion_behind && self.onion_behind_composite.is_none() {
+            self.paint_onion_overlay(&painter, theme, render_camera, image_id, canvas_size);
+        }
 
         interactions.primary_down_on_canvas = primary_response.is_pointer_button_down_on();
         interactions.updated_camera = camera;
@@ -1580,12 +1617,12 @@ impl CanvasWidget {
     /// in-flight gesture, so a drag previews the tile at each cell it paints
     /// rather than only under the pointer.
     fn paint_tile_placer_overlay(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         painter: &egui::Painter,
         theme: &ThemeColors,
         camera: Camera,
         tile_size: TileSize,
-        scale: f32,
     ) {
         let CanvasOverlay::TilePlacer {
             hover_cell,
@@ -1623,20 +1660,66 @@ impl CanvasWidget {
             let screen = self.canvas_rect_to_screen(camera, cell_rect(cx, cy));
             paint_live_outline(painter, screen, green);
         }
-        // Item 4: the REAL tile content over each previewed cell — every
-        // oriented OPAQUE pixel is a filled quad in its own colour, so the
-        // preview shows exactly what the stamp writes (transparency preserved:
-        // transparent pixels are simply not painted). Same convention as the
-        // Pen brush footprint preview.
+        // Item 4: render the oriented tile preview pixels into a single
+        // NEAREST-filtered texture quad over their bounding box. Drawing each
+        // pixel as a separate `rect_filled` triggers egui's per-quad feathering
+        // and subpixel gaps (shattered grid seams on large tiles); a single
+        // textured quad is pixel-crisp at every zoom level and O(1) to paint.
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut has_opaque = false;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for &(cx, cy, color) in preview_pixels {
-            let min = self.canvas_point_to_screen(camera, (cx, cy));
-            // At least 1 pt per pixel, like the brush preview cells.
-            let rect = egui::Rect::from_min_max(
-                min,
-                min + egui::vec2(scale, scale).max(egui::vec2(1.0, 1.0)),
+            if color.a == 0 {
+                continue;
+            }
+            has_opaque = true;
+            min_x = min_x.min(cx);
+            min_y = min_y.min(cy);
+            max_x = max_x.max(cx);
+            max_y = max_y.max(cy);
+            std::hash::Hash::hash(&(cx, cy, color.r, color.g, color.b, color.a), &mut hasher);
+        }
+        if has_opaque {
+            let bbox = Rect2i::new(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
+            let hash = std::hash::Hasher::finish(&hasher);
+            let needs_upload = !matches!(
+                &self.tile_preview_texture,
+                Some((cached_hash, cached_bbox, _)) if *cached_hash == hash && *cached_bbox == bbox
             );
-            let color32 = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
-            painter.rect_filled(rect, 0.0, color32);
+            if needs_upload {
+                let w = bbox.w as usize;
+                let h = bbox.h as usize;
+                let mut rgba = vec![0u8; w * h * 4];
+                for &(cx, cy, color) in preview_pixels {
+                    if color.a == 0 {
+                        continue;
+                    }
+                    let lx = (cx - bbox.x) as usize;
+                    let ly = (cy - bbox.y) as usize;
+                    let idx = (ly * w + lx) * 4;
+                    if idx + 4 <= rgba.len() {
+                        rgba[idx] = color.r;
+                        rgba[idx + 1] = color.g;
+                        rgba[idx + 2] = color.b;
+                        rgba[idx + 3] = color.a;
+                    }
+                }
+                let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                let tex = ctx.load_texture(
+                    "tile_placer_preview",
+                    image,
+                    egui::TextureOptions::NEAREST,
+                );
+                self.tile_preview_texture = Some((hash, bbox, tex));
+            }
+            if let Some((_, _, tex)) = &self.tile_preview_texture {
+                let screen = self.canvas_rect_to_screen(camera, bbox);
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(tex.id(), screen, uv, crate::ui::theme::SKIN_TINT);
+            }
         }
         // Item 6: the green tile_id label at each assigned cell's top-left.
         for ((cx, cy), id) in indices {
@@ -1723,6 +1806,7 @@ impl CanvasWidget {
         }
         let screen = self.canvas_rect_to_screen(camera, current);
         // Order matters: prev first, next last so `next` reads on top.
+        let source_id = self.onion_source_image_id.unwrap_or(image_id);
         for (region, tint) in [(prev, prev_tint), (next, next_tint)] {
             let Some(region) = region else {
                 continue;
@@ -1740,7 +1824,7 @@ impl CanvasWidget {
                     region.bottom() as f32 / sheet_size.1 as f32,
                 ),
             );
-            paint_textured_quad(painter, image_id, screen, uv, tint);
+            paint_textured_quad(painter, source_id, screen, uv, tint);
         }
     }
 
@@ -4656,33 +4740,26 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
             "the hovered cell must be outlined in the theme green at its bounds"
         );
 
-        // Item 4: the REAL tile content — filled quads in the tile's own
-        // colours (red + blue), NOT a green hollow silhouette.
-        let red32 = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255);
-        let blue32 = egui::Color32::from_rgba_unmultiplied(0, 0, 255, 255);
-        let red_quads = shapes
-            .iter()
-            .filter_map(|shape| match shape {
-                egui::Shape::Rect(rect) if rect.fill == red32 => Some(rect.rect),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let blue_quads = shapes
-            .iter()
-            .filter_map(|shape| match shape {
-                egui::Shape::Rect(rect) if rect.fill == blue32 => Some(rect.rect),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            red_quads.len(),
-            2,
-            "the two red opaque pixels must be painted in their own colour"
-        );
-        assert_eq!(
-            blue_quads.len(),
-            2,
-            "the two blue opaque pixels must be painted in their own colour"
+        // Item 4: the REAL tile content is uploaded into a single NEAREST
+        // preview texture spanning the opaque pixels' bounding box (16,0)-(18,2)
+        // and painted as one textured mesh quad (no per-pixel feathered rects).
+        let (_, preview_bbox, preview_tex) = widget
+            .tile_preview_texture
+            .as_ref()
+            .expect("opaque preview pixels must upload a preview texture");
+        assert_eq!(*preview_bbox, Rect2i::new(16, 0, 2, 2));
+        let tex_id = preview_tex.id();
+        let preview_mesh = shapes.iter().any(|shape| match shape {
+            egui::Shape::Mesh(mesh) => {
+                mesh.texture_id == tex_id
+                    && mesh.calc_bounds()
+                        == egui::Rect::from_min_max(egui::pos2(16.0, 0.0), egui::pos2(18.0, 2.0))
+            }
+            _ => false,
+        });
+        assert!(
+            preview_mesh,
+            "the tile preview must paint as a single textured quad at the opaque pixels' bounds"
         );
         let green_fills = shapes
             .iter()
@@ -4740,24 +4817,27 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
             green_stroked.is_empty(),
             "no hovered cell means no green outline stroke"
         );
-        // The opaque pixel paints red; the fully-transparent pixel (alpha 0)
-        // must not appear as a red quad at (17,0).
-        let red32 = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255);
-        let red_quads: Vec<egui::Rect> = shapes
-            .iter()
-            .filter_map(|shape| match shape {
-                egui::Shape::Rect(rect) if rect.fill == red32 => Some(rect.rect),
-                _ => None,
-            })
-            .collect();
+        // The opaque pixel (16,0) defines a 1x1 preview texture; the
+        // fully-transparent pixel (17,0) is excluded from the preview bounds.
+        let (_, preview_bbox, preview_tex) = widget
+            .tile_preview_texture
+            .as_ref()
+            .expect("the opaque pixel must produce a preview texture");
         assert_eq!(
-            red_quads.len(),
-            1,
-            "only the opaque pixel is painted: {red_quads:?}"
+            *preview_bbox,
+            Rect2i::new(16, 0, 1, 1),
+            "transparent pixel (17,0) must not expand the preview texture bounds"
         );
+        let tex_id = preview_tex.id();
         assert!(
-            red_quads.iter().all(|rect| rect.min.x < 17.0),
-            "no quad may appear at the transparent pixel (17,0): {red_quads:?}"
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::Shape::Mesh(mesh)
+                    if mesh.texture_id == tex_id
+                        && mesh.calc_bounds()
+                            == egui::Rect::from_min_max(egui::pos2(16.0, 0.0), egui::pos2(17.0, 1.0))
+            )),
+            "only the opaque pixel at (16,0) must be painted"
         );
         assert!(
             shapes.iter().any(|shape| matches!(
@@ -4807,23 +4887,25 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
                 "cell ({cell_x},0) must be outlined in the theme green: {outlines:?}"
             );
         }
-        let red32 = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255);
-        let blue32 = egui::Color32::from_rgba_unmultiplied(0, 0, 255, 255);
-        let fills: Vec<(egui::Color32, egui::Rect)> = shapes
-            .iter()
-            .filter_map(|shape| match shape {
-                egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
-                    Some((rect.fill, rect.rect))
-                }
-                _ => None,
-            })
-            .filter(|(fill, _)| *fill == red32 || *fill == blue32)
-            .collect();
+        let (_, preview_bbox, preview_tex) = widget
+            .tile_preview_texture
+            .as_ref()
+            .expect("gesture preview pixels must upload a preview texture");
+        assert_eq!(
+            *preview_bbox,
+            Rect2i::new(0, 0, 33, 1),
+            "preview texture bbox must span all three cells' pixels (0..=32, 0)"
+        );
+        let tex_id = preview_tex.id();
         assert!(
-            fills.contains(&(red32, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))))
-                && fills.contains(&(blue32, egui::Rect::from_min_max(egui::pos2(16.0, 0.0), egui::pos2(17.0, 1.0))))
-                && fills.contains(&(red32, egui::Rect::from_min_max(egui::pos2(32.0, 0.0), egui::pos2(33.0, 1.0)))),
-            "each previewed cell must paint its own tile pixel in place: {fills:?}"
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::Shape::Mesh(mesh)
+                    if mesh.texture_id == tex_id
+                        && mesh.calc_bounds()
+                            == egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(33.0, 1.0))
+            )),
+            "all previewed cells must paint through the textured preview quad"
         );
     }
 
@@ -4872,9 +4954,15 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         let green_stroke = shapes
             .iter()
             .position(|shape| matches!(shape, egui::Shape::Rect(rect) if rect.stroke.color == green));
-        let red_fill = shapes.iter().position(
-            |shape| matches!(shape, egui::Shape::Rect(rect) if rect.fill == egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255)),
-        );
+        let preview_tex_id = widget
+            .tile_preview_texture
+            .as_ref()
+            .expect("tile preview texture must be uploaded")
+            .2
+            .id();
+        let red_fill = shapes.iter().position(|shape| {
+            matches!(shape, egui::Shape::Mesh(mesh) if mesh.texture_id == preview_tex_id)
+        });
         let colors: Vec<egui::Color32> = shapes
             .iter()
             .filter_map(|s| {

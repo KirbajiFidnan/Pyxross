@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::core::color::Color;
 use crate::core::model::{BlendMode, LayerId};
 use crate::core::transform::TransformAlgorithm;
-use crate::input::{FieldierChild, FillSettings, Tool, WandSettings};
+use crate::input::{BrushSelectSettings, FieldierChild, FillSettings, Tool, WandSettings};
 use crate::ui::dock_color_palette_panel::PalettePanelEvent;
 use crate::ui::layers::LayerPanelEvent;
 use crate::ui::project::DrawSettings;
@@ -67,6 +67,7 @@ pub struct ToolboxShortcuts {
     pub rectangle: String,
     pub wand: String,
     pub lasso: String,
+    pub brush_selector: String,
     pub fill: String,
     pub tile: String,
     pub animation_placer: String,
@@ -89,6 +90,7 @@ impl ToolboxShortcuts {
             rectangle: keymap.display_label(Action::SelectRectangle),
             wand: keymap.display_label(Action::SelectWand),
             lasso: keymap.display_label(Action::SelectLasso),
+            brush_selector: keymap.display_label(Action::SelectBrushSelector),
             fill: keymap.display_label(Action::SelectFill),
             tile: keymap.display_label(Action::SelectTileTool),
             animation_placer: keymap.display_label(Action::SelectAnimationPlacer),
@@ -120,6 +122,8 @@ pub struct ToolboxView {
     pub child: FieldierChild,
     /// The Fieldier wand's stored settings.
     pub wand: WandSettings,
+    /// The Fieldier Brush Selector's stored brush settings.
+    pub brush_select: BrushSelectSettings,
     /// Whether the wand's flood fill is contiguous THIS frame: the stored
     /// [`WandSettings::contiguous`] XOR live Alt state.
     pub wand_contiguous_effective: bool,
@@ -161,6 +165,7 @@ impl Default for ToolboxView {
             draw: DrawSettings::default(),
             child: FieldierChild::default(),
             wand,
+            brush_select: BrushSelectSettings::default(),
             wand_contiguous_effective: wand.contiguous,
             fill,
             fill_contiguous_effective: fill.contiguous,

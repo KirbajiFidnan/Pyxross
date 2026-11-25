@@ -81,7 +81,7 @@ pub mod region;
 pub mod sequence;
 
 pub use animation_set::AnimationSet;
-pub use composite::composite_over;
+pub use composite::{composite_over, OnionBehindSpec};
 pub use frame::Frame;
 pub use region::Region;
 pub use sequence::AnimationSequence;
@@ -791,6 +791,28 @@ impl LayerStack {
             return None;
         }
         Some(composite::composite_stack_region(self, palette, clipped))
+    }
+
+    /// Composites all visible layers over `rect` with per-layer behind-frame
+    /// onion skinning: each eligible layer's previous/next ghosts are painted
+    /// directly underneath that layer's own current-frame pixels.
+    pub fn composite_layers_region_with_onion_behind(
+        &self,
+        rect: Rect2i,
+        palette: &TilePalette,
+        spec: &OnionBehindSpec,
+    ) -> Option<PixelBuffer> {
+        if rect.is_empty() {
+            return None;
+        }
+        let canvas = Rect2i::new(0, 0, self.width as i32, self.height as i32);
+        let clipped = rect.clamp_to(canvas);
+        if clipped.is_empty() {
+            return None;
+        }
+        Some(composite::composite_stack_region_with_onion_behind(
+            self, palette, clipped, spec,
+        ))
     }
 
     /// Composites a region with transient root-tile pixel replacements.

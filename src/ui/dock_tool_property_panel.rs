@@ -372,6 +372,10 @@ impl ToolPropertyComponent {
                     FieldierChild::Lasso,
                     format!("Lasso ({})", view.shortcuts.lasso),
                 ),
+                (
+                    FieldierChild::BrushSelector,
+                    format!("Brush Selector ({})", view.shortcuts.brush_selector),
+                ),
             ];
             let current = children
                 .iter()
@@ -392,6 +396,69 @@ impl ToolPropertyComponent {
                     }
                 });
         });
+        if view.child == FieldierChild::BrushSelector {
+            let mut size = view
+                .brush_select
+                .size
+                .clamp(BrushSpec::MIN_SIZE, BrushSpec::MAX_SIZE);
+            property_row(ui, "Size (Shift+Scroll)", |ui| {
+                let input = ui.add_sized(
+                    vec2(42.0, ui.spacing().interact_size.y),
+                    egui::DragValue::new(&mut size)
+                        .range(BrushSpec::MIN_SIZE..=BrushSpec::MAX_SIZE),
+                );
+                let mut size_f = size as f32;
+                let slider_w = (ui.available_width() - 50.0).max(40.0);
+                let slider = ui
+                    .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                        pro_slider(
+                            ui,
+                            "brush-select-size",
+                            &mut size_f,
+                            (BrushSpec::MIN_SIZE as f32)..=(BrushSpec::MAX_SIZE as f32),
+                            false,
+                        )
+                    })
+                    .inner;
+                if slider.changed() {
+                    size = size_f.round() as u8;
+                }
+                let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+                if (input.changed() || slider.changed()) && size != view.brush_select.size {
+                    events
+                        .borrow_mut()
+                        .push(ToolbarEvent::BrushSelectSizeChanged(size));
+                }
+                if reset.clicked() {
+                    events
+                        .borrow_mut()
+                        .push(ToolbarEvent::BrushSelectSizeChanged(BrushSpec::MIN_SIZE));
+                }
+            });
+            property_row(ui, "Shape (Ctrl+Scroll)", |ui| {
+                let current = match view.brush_select.shape {
+                    BrushShape::Square => "Square",
+                    BrushShape::Round => "Circle",
+                };
+                egui::ComboBox::from_id_salt("tool_prop_brush_select_shape")
+                    .width(ui.available_width().clamp(96.0, 180.0))
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (shape, label) in [
+                            (BrushShape::Square, "Square"),
+                            (BrushShape::Round, "Circle"),
+                        ] {
+                            let selected = view.brush_select.shape == shape;
+                            if chrome.combo_item(ui, selected, label).clicked() && !selected {
+                                events
+                                    .borrow_mut()
+                                    .push(ToolbarEvent::BrushSelectShapeChanged(shape));
+                            }
+                        }
+                    });
+            });
+            return;
+        }
         if view.child != FieldierChild::Wand {
             return;
         }

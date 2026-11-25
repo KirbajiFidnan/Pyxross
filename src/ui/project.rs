@@ -95,7 +95,7 @@ impl Ownership {
         Self { category: "clipboard", owner: OwnerClass::ProjectLocal, fields: "clipboard, os_clipboard_available", close_policy: "discard with session" },
         Self { category: "active layer/frame", owner: OwnerClass::ProjectLocal, fields: "layers, animation", close_policy: "discard with session" },
         Self { category: "camera", owner: OwnerClass::ProjectLocal, fields: "camera", close_policy: "discard with session" },
-        Self { category: "animation/playback", owner: OwnerClass::ProjectLocal, fields: "animations, animation, onion_prev, onion_next", close_policy: "discard with session" },
+        Self { category: "animation/playback", owner: OwnerClass::ProjectLocal, fields: "animations, animation, onion_prev, onion_next, onion_behind, onion_layer_mode", close_policy: "discard with session" },
         Self { category: "palette/colors", owner: OwnerClass::ProjectLocal, fields: "palettes, active_palette, color, secondary_color, tile_palette", close_policy: "discard with session" },
         Self { category: "tool/brush/grid", owner: OwnerClass::ProjectLocal, fields: "tool_state, pen_draw_settings, eraser_draw_settings, grid_visible, text_font, text_size, text_align", close_policy: "discard with session" },
         Self { category: "canvas texture", owner: OwnerClass::ProjectLocal, fields: "canvas_generation", close_policy: "discard with session" },
@@ -158,6 +158,10 @@ pub struct ProjectSession {
     pub onion_prev: bool,
     /// Onion-skin toggle for the next frame.
     pub onion_next: bool,
+    /// Onion-skin toggle to draw ghosts behind the current frame image.
+    pub onion_behind: bool,
+    /// Onion-skin toggle to sample only the active layer instead of all layers.
+    pub onion_layer_mode: bool,
     pub palettes: Vec<Palette>,
     pub active_palette: usize,
     pub color: Color,
@@ -227,6 +231,14 @@ pub enum SelectGesture {
     /// selection a Shift/Alt gesture merges into, and the combining mode
     /// chosen at press (D78).
     Lasso {
+        points: Vec<(i32, i32)>,
+        base: Option<Selection>,
+        mode: SelectMode,
+    },
+    /// A freehand Brush Selector stroke: the swept brush centers so far, the
+    /// pre-gesture selection a Shift/right-button gesture merges into, and the
+    /// combining mode chosen at press.
+    BrushSelect {
         points: Vec<(i32, i32)>,
         base: Option<Selection>,
         mode: SelectMode,
@@ -877,6 +889,8 @@ impl ProjectSession {
             animation,
             onion_prev: false,
             onion_next: false,
+            onion_behind: false,
+            onion_layer_mode: false,
             palettes: vec![crate::core::palette::builtin_palette(
                 crate::core::palette::BuiltinPaletteKind::Ross,
             )],

@@ -581,6 +581,24 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         lifecycle: "updated by frame editor navigation and clamped per project",
     },
     AppOwnership {
+        field: "onion_layer_texture",
+        owner: AppOwner::HostLocal,
+        rationale: "cached GPU active-layer sheet texture for onion-skin Layer Mode",
+        lifecycle: "rebuilt on demand when active layer or pixels change while Layer Mode is enabled",
+    },
+    AppOwnership {
+        field: "onion_behind_texture",
+        owner: AppOwner::HostLocal,
+        rationale: "cached GPU per-layer behind-onion composite texture for Frame Edit",
+        lifecycle: "rebuilt on demand when Onion Behind is active and frame pixels change",
+    },
+    AppOwnership {
+        field: "suppress_next_region_double_click",
+        owner: AppOwner::HostLocal,
+        rationale: "ephemeral click-gesture latch suppressing region select right after commit/deselect",
+        lifecycle: "set on transform commit or deselect and cleared on the next click/double-click",
+    },
+    AppOwnership {
         field: "frame_preview_feed",
         owner: AppOwner::HostLocal,
         rationale: "GPU preview texture feed for animation playback",
