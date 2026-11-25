@@ -13,23 +13,13 @@ use crate::ui::dock_tool_property_panel::pro_slider;
 use crate::ui::layers::LayerPanelEvent;
 use crate::ui::panel_dock::{ButtonStyle, PanelChrome, PanelContent};
 
-/// Display label for a blend mode (mirrors `layers::blend_label`).
+/// Display label for a blend mode.
 fn blend_label(mode: BlendMode) -> &'static str {
-    match mode {
-        BlendMode::Normal => "Normal",
-        BlendMode::Multiply => "Multiply",
-        BlendMode::Screen => "Screen",
-        BlendMode::Add => "Add",
-    }
+    mode.label()
 }
 
 /// All blend modes in display order.
-const BLEND_MODES: [BlendMode; 4] = [
-    BlendMode::Normal,
-    BlendMode::Multiply,
-    BlendMode::Screen,
-    BlendMode::Add,
-];
+const BLEND_MODES: &[BlendMode] = &BlendMode::ALL;
 
 /// Panel content for the per-layer settings floating dock panel.
 ///
@@ -114,7 +104,7 @@ impl PanelContent for LayerSettingsContent {
             .width(ui.available_width().max(100.0))
             .selected_text(blend_label(blend))
             .show_ui(ui, |ui| {
-                for mode in BLEND_MODES {
+                for &mode in BLEND_MODES {
                     let selected = blend == mode;
                     if chrome.combo_item(ui, selected, blend_label(mode)).clicked() && !selected {
                         self.host

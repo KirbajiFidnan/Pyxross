@@ -3885,7 +3885,7 @@ fn dynamic_nest_zooms_at_the_same_rate_as_the_canvas() {
 // ---------------------------------------------------------------------------
 
 use pyxross::core::brush::{BrushShape, BrushSpec};
-use pyxross::input::{FieldierChild, Tool, WandSettings};
+use pyxross::input::{FieldierChild, Tool};
 use pyxross::ui::dock_hosts::ToolboxHost;
 use pyxross::ui::dock_tool_property_panel::tool_property_panel_spec;
 use pyxross::ui::dock_toolbox_panel::toolbox_panel_spec;
@@ -5319,7 +5319,7 @@ fn wand_rows_hidden_for_non_wand_children() {
 }
 
 #[test]
-fn wand_contiguous_checkbox_is_display_only() {
+fn wand_contiguous_checkbox_emits_event() {
     let ctx = egui::Context::default();
     let theme = Theme::default_dark();
     let chrome = ChromeHarness::new();
@@ -5346,14 +5346,10 @@ fn wand_contiguous_checkbox_is_display_only() {
     click_tool_property(&ctx, &mut manager, &chrome.view(&theme), contiguous);
 
     let events: Vec<ToolbarEvent> = host.events.borrow_mut().drain(..).collect();
-    assert!(
-        events.is_empty(),
-        "a click on the display-only Contiguous checkbox must emit nothing, got {events:?}"
-    );
     assert_eq!(
-        host.view.borrow().wand,
-        WandSettings::default(),
-        "the display-only checkbox must not change the stored wand settings"
+        events,
+        vec![ToolbarEvent::WandContiguousChanged(false)],
+        "clicking the Contiguous checkbox must emit WandContiguousChanged with toggled stored state"
     );
 }
 
@@ -5477,7 +5473,7 @@ fn fill_properties_render_and_emit_events() {
     let screen = vec2(800.0, 600.0);
 
     let output = run_tool_property_frame(&ctx, &mut manager, &chrome.view(&theme), screen, vec![]);
-    for label in ["Tolerance", "Contiguous", "Restrict to region"] {
+    for label in ["Tolerance", "Contiguous (Alt)", "Restrict to region"] {
         assert!(
             text_pos(&output, label).is_some(),
             "the Fill panel must show {label:?}: {:?}",
@@ -5490,7 +5486,7 @@ fn fill_properties_render_and_emit_events() {
     );
 
     // The Contiguous checkbox toggles off and emits.
-    let contiguous = text_pos(&output, "Contiguous").expect("the Contiguous checkbox paints");
+    let contiguous = text_pos(&output, "Contiguous (Alt)").expect("the Contiguous checkbox paints");
     click_tool_property(&ctx, &mut manager, &chrome.view(&theme), contiguous);
     let events: Vec<ToolbarEvent> = host.events.borrow_mut().drain(..).collect();
     assert_eq!(

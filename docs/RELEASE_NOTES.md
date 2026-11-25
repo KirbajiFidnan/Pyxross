@@ -1,29 +1,31 @@
-# Pyxross Workshop v0.9.1 Release Notes
+# Pyxross Workshop v0.9.2 Release Notes
 
 ## Downloads
 
-Prebuilt portable binaries for **v0.9.1**:
+Prebuilt portable binaries for **v0.9.2**:
 
-- **Linux AppImage (x86_64, GLIBC 2.35+):** `pyxross-0.9.1-linux-x86_64.AppImage`
-- **Linux Portable Archive (x86_64, GLIBC 2.35+):** `pyxross-0.9.1-linux-x86_64.tar.gz`
-- **Windows Portable ZIP (x86_64, Windows 10/11):** `pyxross-0.9.1-windows-x86_64-portable.zip`
+- **Linux AppImage (x86_64, GLIBC 2.35+):** `pyxross-0.9.2-linux-x86_64.AppImage`
+- **Linux Portable Archive (x86_64, GLIBC 2.35+):** `pyxross-0.9.2-linux-x86_64.tar.gz`
+- **Windows Portable ZIP (x86_64, Windows 10/11):** `pyxross-0.9.2-windows-x86_64-portable.zip`
 
-## What's New in 0.9.1
+## What's New in 0.9.2
 
-- **File Manager:** Sortable `Name`, `Size`, and `Modified` columns (ascending/descending), live autocomplete search in `File name` (including extension matching like `.png` with `Tab` completion), and a `File type` filter dropdown.
-- **Image-to-Pixel:** Smooth pointer-centered preview zoom & pan with `Fit` reset, plus `Save Preset` and `Load Preset` (`.json`) controls in the `Size` tab.
-- **Import Banner Panel:** New two-column banner importer launched from `Select Banner` with `Banner Name` input, `Cut (8:1)` / `Full Image` modes, zoomable/pannable preview, draggable 8:1 crop frame with shaded exterior, and direct PNG export into `banners/`.
-- **Top-Bar Banner Shortcut:** Clickable hotspot on the top-bar banner region with a subtle `"Click to change banner"` hover hint.
-- **Style Panel:** Ergonomic `Save` (enabled when customized) and `Load` theme dialog workflow plus a `Spacing` slider.
-- **Key Bindings Panel:** Redesigned with live search, category filter tabs (`Tools`, `Edit`, `Transform`, `File`, `Import / Export`, `View`), click-to-record monospace keycap badges, inline conflict indicators, manual key/modifier popover, and a pinned `Reset` / `Apply` footer.
+- **27 Layer Blend Modes:** Full W3C Compositing & Blending Level 1 support covering all 19 Aseprite blend modes (`0..=18`), Pyxel Edit blend modes, and standard artistic modes (`Darken`, `Multiply`, `Color Burn`, `Linear Burn`, `Darker Color`, `Lighten`, `Screen`, `Color Dodge`, `Add`, `Lighter Color`, `Overlay`, `Soft Light`, `Hard Light`, `Vivid Light`, `Linear Light`, `Pin Light`, `Hard Mix`, `Difference`, `Exclusion`, `Subtract`, `Divide`, `Invert`, `Hue`, `Saturation`, `Color`, `Luminosity`), with `.ase`/`.aseprite` and `.pyxel` import/export support.
+- **Resize Canvas Undo/Redo:** Canvas count and region resizes are now fully undoable and redoable, restoring layer buffers, tilemaps, tile palette, tile size, and animation regions together.
+- **Image-to-Pixel `Reload Previous` & Aspect-Locked Presets:** Automatically remembers the last used Image-to-Pixel settings even if not manually saved, with a `Reload Previous` button in the `Size` tab. When aspect lock is enabled, both `Reload Previous` and saved presets apply the preset width and compute height proportionally to the current source image.
+- **`Back` vs `Cancel` in Import Flows:** Post-file-chooser dialogs (`Import Image`, `Import GIF`, `Import Aseprite`, `Import Pyxel`, `Image-to-Pixel`, `Import Banner`) now separate `Back` (return to file selection) from `Cancel` (close dialog).
+- **Workspace Crosshair Cursor:** Hides the OS cursor over the canvas workspace (outside panels, popups, and gizmos) and renders a thin, subtle theme-tinted crosshair.
+- **Tile Tool `Tab` Index Toggle:** Pressing `Tab` in the Tile tool toggles canvas tile ID labels on and off.
+- **Fill & Wand `Contiguous (Alt)` XOR Control:** Both Fill and Fieldier Wand have a clickable `Contiguous (Alt)` checkbox; holding `Alt` temporarily inverts the current checked state and releasing restores it.
 
 ## Fixes
 
-- **Windows Input & Render Latency:** Configured swapchain `desired_maximum_frame_latency = 1`, added `window.pre_present_notify()`, and flushed canvas texture uploads in the same frame after input handling to eliminate multi-frame cursor lag.
-- **Overlapping Panel Z-Order:** Clicking the front floating panel (or foreground popups) no longer raises occluded background panels or triggers background header drags.
-- **Fast Canvas Edge Strokes:** Rapid inward and outward brush swipes now interpolate cleanly across canvas borders without missing edge pixels while staying paused during off-canvas motion.
-- **Panel Layout & Scrollbars:** Fixed narrow-panel slider/button overlap in `Style`, pinned top action buttons in resizable `Select Banner`, eliminated resize scrollbar flicker and text overflow in `File Manager`, and kept `Key Bindings` footer buttons clear of scrollbars.
-- **Pencil Default Shortcut:** Guarded test keymap persistence so unit tests cannot overwrite user `keybindings.json` (keeping Pencil on `D`).
+- **Tile Tool Drag Interpolation:** Fast left-click drags now interpolate across grid cells without gaps while preserving mid-hold `R`/`Q`/`X`/`Z` orientation changes and eliminating 1-frame preview lag.
+- **Large Selection Performance:** `O(W+H)` rectangular outline generation, `Shape::closed_line` backing with viewport-clipped screen-space dashes, zero per-frame overlay cloning, and in-place outline translation during area moves.
+- **UI Interaction Deselect Guard:** Interacting with panels, dock chrome, floating borders, top-bar menus, or popups no longer deselects active canvas selections.
+- **Image-to-Pixel Single-Piece Import:** Importing as a new document now initializes a single full-canvas region instead of stale `16×16` 4-frame animations.
+- **Animation Borders Alongside Selection:** Replaced yellow marching ants with clean static grey area + red first-frame + green last-frame borders that stay visible in parallel with active selections.
+- **Resize Canvas Region–Pixel Binding:** Whole-region pivot offsets keep pixels, tilemap cells, tile palette entries, and animation frame regions locked together.
 
 ## Package Contents
 

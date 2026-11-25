@@ -481,6 +481,45 @@ impl Selection {
     /// non-selected neighbour (or the canvas edge).  Order is row-major
     /// deterministic.  This is the geometry marching-ants rendering consumes.
     pub fn outline_segments(&self) -> Vec<((i32, i32), (i32, i32))> {
+        if self.rect.is_empty() {
+            return Vec::new();
+        }
+        // O(W + H) fast path for rectangular selections: only the outer
+        // perimeter borders unselected neighbours, producing the exact same
+        // row-major deterministic segment list as the full scan.
+        if self.is_rectangular() {
+            let rx = self.rect.x;
+            let ry = self.rect.y;
+            let right = self.rect.right();
+            let bottom = self.rect.bottom();
+            let rw = self.rect.w as usize;
+            let rh = self.rect.h as usize;
+            let mut segments = Vec::with_capacity(2 * (rw + rh));
+            for y in ry..bottom {
+                let top_row = y == ry;
+                let bot_row = y == bottom - 1;
+                if top_row || bot_row {
+                    for x in rx..right {
+                        if top_row {
+                            segments.push(((x, y), (x + 1, y)));
+                        }
+                        if bot_row {
+                            segments.push(((x, y + 1), (x + 1, y + 1)));
+                        }
+                        if x == rx {
+                            segments.push(((x, y), (x, y + 1)));
+                        }
+                        if x == right - 1 {
+                            segments.push(((x + 1, y), (x + 1, y + 1)));
+                        }
+                    }
+                } else {
+                    segments.push(((rx, y), (rx, y + 1)));
+                    segments.push(((right, y), (right, y + 1)));
+                }
+            }
+            return segments;
+        }
         let mut segments = Vec::new();
         for y in self.rect.y..self.rect.bottom() {
             for x in self.rect.x..self.rect.right() {

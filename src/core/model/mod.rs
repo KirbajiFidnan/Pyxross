@@ -103,12 +103,104 @@ impl LayerId {
 }
 
 /// Blend mode applied to a layer's color against the accumulated backdrop.
+///
+/// Covers all 19 Aseprite blend modes (0..=18), all Pyxel Edit blend modes,
+/// and standard Photoshop/Krita artistic blend modes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BlendMode {
     Normal,
+    Darken,
     Multiply,
+    ColorBurn,
+    LinearBurn,
+    DarkerColor,
+    Lighten,
     Screen,
+    ColorDodge,
     Add,
+    LighterColor,
+    Overlay,
+    SoftLight,
+    HardLight,
+    VividLight,
+    LinearLight,
+    PinLight,
+    HardMix,
+    Difference,
+    Exclusion,
+    Subtract,
+    Divide,
+    Invert,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    /// All blend modes in grouped display order for layer settings UI.
+    pub const ALL: [BlendMode; 27] = [
+        BlendMode::Normal,
+        BlendMode::Darken,
+        BlendMode::Multiply,
+        BlendMode::ColorBurn,
+        BlendMode::LinearBurn,
+        BlendMode::DarkerColor,
+        BlendMode::Lighten,
+        BlendMode::Screen,
+        BlendMode::ColorDodge,
+        BlendMode::Add,
+        BlendMode::LighterColor,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::VividLight,
+        BlendMode::LinearLight,
+        BlendMode::PinLight,
+        BlendMode::HardMix,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Subtract,
+        BlendMode::Divide,
+        BlendMode::Invert,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+    ];
+
+    /// Human-readable display label for UI dropdowns.
+    pub const fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Darken => "Darken",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::ColorBurn => "Color Burn",
+            BlendMode::LinearBurn => "Linear Burn",
+            BlendMode::DarkerColor => "Darker Color",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::Screen => "Screen",
+            BlendMode::ColorDodge => "Color Dodge",
+            BlendMode::Add => "Add",
+            BlendMode::LighterColor => "Lighter Color",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::SoftLight => "Soft Light",
+            BlendMode::HardLight => "Hard Light",
+            BlendMode::VividLight => "Vivid Light",
+            BlendMode::LinearLight => "Linear Light",
+            BlendMode::PinLight => "Pin Light",
+            BlendMode::HardMix => "Hard Mix",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+            BlendMode::Subtract => "Subtract",
+            BlendMode::Divide => "Divide",
+            BlendMode::Invert => "Invert",
+            BlendMode::Hue => "Hue",
+            BlendMode::Saturation => "Saturation",
+            BlendMode::Color => "Color",
+            BlendMode::Luminosity => "Luminosity",
+        }
+    }
 }
 
 /// A single drawable layer: a pixel buffer plus its stack attributes.
@@ -196,6 +288,7 @@ pub struct TilemapRenderCache {
 /// `layers[0]` is the bottom layer. The active layer is tracked by
 /// [`LayerId`] (object identity), never by index. `changed` is a single
 /// coarse dirty flag set by every mutating method (D58).
+#[derive(Clone)]
 pub struct LayerStack {
     layers: Vec<Layer>,
     active: LayerId,
@@ -543,6 +636,54 @@ impl LayerStack {
                 let cols = (new_w as u32).div_ceil(tile_w);
                 let rows = (new_h as u32).div_ceil(tile_h);
                 tm.resize(cols, rows);
+            }
+            layer.tilemap_cache = RefCell::new(None);
+        }
+        self.width = new_w;
+        self.height = new_h;
+        self.changed = true;
+    }
+
+    /// Resizes every non-group layer buffer to `new_w × new_h` at an explicit
+    /// `pixel_offset` and shifts each layer's tilemap cells by `tile_offset`.
+    ///
+    /// Used by `ResizeCounts` so region-grid count changes always move pixels
+    /// and tilemap cells by whole region multiples, keeping regions locked to
+    /// their content.
+    pub fn resize_canvas_with_offset(
+        &mut self,
+        new_w: usize,
+        new_h: usize,
+        pixel_offset: (i32, i32),
+        tile_offset: (i32, i32),
+    ) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        for layer in &mut self.layers {
+            if layer.is_group {
+                continue;
+            }
+            let old_w = layer.buffer.width() as u32;
+            let old_h = layer.buffer.height() as u32;
+            let resized = crate::core::canvas_resize::resize_pixels_at_offset(
+                layer.buffer.as_bytes(),
+                old_w,
+                old_h,
+                new_w as u32,
+                new_h as u32,
+                pixel_offset,
+            );
+            let mut buffer = PixelBuffer::new(new_w, new_h);
+            if resized.len() == buffer.as_bytes().len() {
+                buffer.as_bytes_mut().copy_from_slice(&resized);
+            }
+            layer.buffer = buffer;
+            if let Some(tm) = layer.tilemap.as_mut() {
+                let tile_w = tm.tile_size.w.max(1);
+                let tile_h = tm.tile_size.h.max(1);
+                let cols = (new_w as u32).div_ceil(tile_w);
+                let rows = (new_h as u32).div_ceil(tile_h);
+                tm.resize_with_offset(cols, rows, tile_offset);
             }
             layer.tilemap_cache = RefCell::new(None);
         }

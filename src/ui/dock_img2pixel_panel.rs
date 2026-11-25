@@ -56,6 +56,7 @@ pub enum Img2PixelEvent {
     },
     SavePreset,
     LoadPreset,
+    Back,
     Cancel,
 }
 
@@ -67,6 +68,7 @@ pub struct Img2PixelHost {
     pub project_palette: Vec<[u8; 4]>,
     pub has_active_project: bool,
     pub params: Img2PixelParams,
+    pub previous_preset: Option<Img2PixelParams>,
     pub show_original: bool,
     pub preview_zoom: f32,
     pub preview_pan: egui::Vec2,
@@ -89,6 +91,7 @@ impl Default for Img2PixelHost {
             project_palette: Vec::new(),
             has_active_project: false,
             params: Img2PixelParams::default(),
+            previous_preset: None,
             show_original: false,
             preview_zoom: 1.0,
             preview_pan: egui::Vec2::ZERO,
@@ -132,7 +135,12 @@ impl Img2PixelHost {
         self.events.clear();
     }
 
-    pub fn apply_loaded_preset(&mut self, params: Img2PixelParams) {
+    pub fn apply_loaded_preset(&mut self, mut params: Img2PixelParams) {
+        if params.lock_aspect && self.src_w > 0 && self.src_h > 0 {
+            let aspect = self.src_h as f32 / self.src_w as f32;
+            params.target_height =
+                ((params.target_width as f32 * aspect).round() as u32).clamp(1, 512);
+        }
         self.params = params;
         self.last_params = None;
         self.cached_output = None;
@@ -313,6 +321,28 @@ impl Img2PixelPanelContent {
                                                 host.events.push(Img2PixelEvent::LoadPreset);
                                             }
                                         });
+                                        ui.add_space(4.0);
+                                        let has_prev = host.previous_preset.is_some();
+                                        if chrome
+                                            .button(
+                                                ui,
+                                                "Reload Previous",
+                                                ButtonStyle {
+                                                    enabled: has_prev,
+                                                    ..ButtonStyle::plain()
+                                                },
+                                            )
+                                            .on_hover_text(
+                                                "Restore the last used Image to Pixel settings even if not saved as a preset",
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Some(prev) = host.previous_preset.clone() {
+                                                host.apply_loaded_preset(prev);
+                                                host.status_message =
+                                                    Some("Reloaded previous settings.".to_string());
+                                            }
+                                        }
                                         if let Some(msg) = &host.status_message {
                                             ui.add_space(2.0);
                                             ui.weak(msg);
@@ -587,6 +617,13 @@ impl Img2PixelPanelContent {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
                     host.events.push(Img2PixelEvent::Cancel);
+                }
+                if chrome
+                    .button(ui, "Back", ButtonStyle::plain())
+                    .on_hover_text("Return to file selection")
+                    .clicked()
+                {
+                    host.events.push(Img2PixelEvent::Back);
                 }
                 if host.has_active_project
                     && chrome

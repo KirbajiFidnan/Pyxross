@@ -98,7 +98,7 @@ pub fn resize_pixels(
         return Vec::new();
     };
     // New buffer starts fully transparent; grow areas stay that way.
-    let mut out = vec![0u8; new_len];
+    let out = vec![0u8; new_len];
     if w == 0 || h == 0 || new_w == 0 || new_h == 0 {
         return out;
     }
@@ -117,10 +117,44 @@ pub fn resize_pixels(
         return scale_nn(src, w as usize, h as usize, new_w as usize, new_h as usize);
     }
 
-    // 1:1 pivot placement: every old pixel lands at its offset position, with
-    // clipping on both sides (negative offset crops the leading edge; a too-far
-    // positive offset clips the trailing edge).
-    let (ox, oy) = pivot.offset((w, h), (new_w, new_h));
+    let offset = pivot.offset((w, h), (new_w, new_h));
+    resize_pixels_at_offset(src, w, h, new_w, new_h, offset)
+}
+
+/// Places `src` (`w × h` straight-alpha RGBA8) 1:1 into a new `new_w × new_h`
+/// RGBA8 buffer at an explicit `(ox, oy)` pixel offset.
+///
+/// Used by region-grid count resizes so the anchor offset stays aligned to
+/// whole region cells rather than shifting pixels by half a region.
+pub fn resize_pixels_at_offset(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    new_w: u32,
+    new_h: u32,
+    offset: (i32, i32),
+) -> Vec<u8> {
+    let new_len = (new_w as usize)
+        .checked_mul(new_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    let Some(new_len) = new_len else {
+        return Vec::new();
+    };
+    let mut out = vec![0u8; new_len];
+    if w == 0 || h == 0 || new_w == 0 || new_h == 0 {
+        return out;
+    }
+    let Some(src_len) = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return out;
+    };
+    if src.len() != src_len {
+        return out;
+    }
+
+    let (ox, oy) = offset;
     let new_w_i = i64::from(new_w);
     let new_h_i = i64::from(new_h);
     for sy in 0..h as i64 {

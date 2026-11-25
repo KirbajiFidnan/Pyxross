@@ -11,9 +11,9 @@ use std::any::Any;
 
 use crate::core::buffer::PixelBuffer;
 use crate::core::math::Rect2i;
-use crate::core::model::{LayerId, LayerStack};
+use crate::core::model::{AnimationSet, LayerId, LayerStack};
 use crate::core::tile_edit;
-use crate::core::tilemap::{TileCell, TileId, TilePalette};
+use crate::core::tilemap::{TileCell, TileId, TilePalette, TileSize};
 
 // ---------------------------------------------------------------------------
 // CommandContext
@@ -570,6 +570,109 @@ impl UndoStack {
         self.undo.clear();
         self.redo.clear();
     }
+
+    /// Peek at the command on top of the undo stack without popping it.
+    pub fn peek_undo(&self) -> Option<&dyn Command> {
+        self.undo.last().map(|c| c.as_ref())
+    }
+
+    /// Peek at the command on top of the redo stack without popping it.
+    pub fn peek_redo(&self) -> Option<&dyn Command> {
+        self.redo.last().map(|c| c.as_ref())
+    }
+}
+
+/// Undoable canvas-resize command (`ResizeCounts` or `ResizeRegions`).
+///
+/// Captures full before/after snapshots of the layer stack, tile palette,
+/// tile size, and animation frame regions so Undo and Redo restore every
+/// pixel, tilemap cell, palette tile, and region rect losslessly.
+pub struct ResizeCanvasCommand {
+    name: &'static str,
+    before_layers: LayerStack,
+    after_layers: LayerStack,
+    before_palette: TilePalette,
+    after_palette: TilePalette,
+    before_tile_size: TileSize,
+    after_tile_size: TileSize,
+    before_animations: AnimationSet,
+    after_animations: AnimationSet,
+    undone: bool,
+}
+
+impl ResizeCanvasCommand {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: &'static str,
+        before_layers: LayerStack,
+        after_layers: LayerStack,
+        before_palette: TilePalette,
+        after_palette: TilePalette,
+        before_tile_size: TileSize,
+        after_tile_size: TileSize,
+        before_animations: AnimationSet,
+        after_animations: AnimationSet,
+    ) -> Self {
+        Self {
+            name,
+            before_layers,
+            after_layers,
+            before_palette,
+            after_palette,
+            before_tile_size,
+            after_tile_size,
+            before_animations,
+            after_animations,
+            undone: false,
+        }
+    }
+
+    pub fn before_meta(&self) -> (TileSize, AnimationSet) {
+        (self.before_tile_size, self.before_animations.clone())
+    }
+
+    pub fn after_meta(&self) -> (TileSize, AnimationSet) {
+        (self.after_tile_size, self.after_animations.clone())
+    }
+}
+
+impl Command for ResizeCanvasCommand {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn undo(&mut self, context: &mut CommandContext) -> bool {
+        if self.undone {
+            return false;
+        }
+        *context.layers = self.before_layers.clone();
+        *context.palette = self.before_palette.clone();
+        context.palette.change_epoch = context.palette.change_epoch.wrapping_add(1);
+        self.undone = true;
+        true
+    }
+
+    fn redo(&mut self, context: &mut CommandContext) -> bool {
+        if !self.undone {
+            return false;
+        }
+        *context.layers = self.after_layers.clone();
+        *context.palette = self.after_palette.clone();
+        context.palette.change_epoch = context.palette.change_epoch.wrapping_add(1);
+        self.undone = false;
+        true
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+impl UndoStack {
 
     /// Name of the command at the top of the undo stack, for UI display
     /// (e.g. "Undo Stroke").

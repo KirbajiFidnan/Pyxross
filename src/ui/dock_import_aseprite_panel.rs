@@ -219,6 +219,7 @@ impl ImportAsepriteView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportAsepriteEvent {
     Import(AsepriteLayoutMode),
+    Back,
     Cancel,
 }
 
@@ -566,6 +567,14 @@ impl ImportAsepriteComponent {
                     if let Ok(mode) = view_snap.effective_layout_mode() {
                         emitted = Some(ImportAsepriteEvent::Import(mode));
                     }
+                }
+                ui.add_space(6.0);
+                if chrome
+                    .button(ui, "Back", ButtonStyle::plain())
+                    .on_hover_text("Return to file selection")
+                    .clicked()
+                {
+                    emitted = Some(ImportAsepriteEvent::Back);
                 }
                 ui.add_space(6.0);
                 if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {

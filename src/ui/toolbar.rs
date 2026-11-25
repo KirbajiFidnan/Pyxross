@@ -40,6 +40,8 @@ pub enum ToolbarEvent {
     FieldierChildChanged(FieldierChild),
     /// The user moved the wand-tolerance control in the Tool Property panel.
     WandToleranceChanged(u8),
+    /// The user toggled the wand's contiguous checkbox.
+    WandContiguousChanged(bool),
     /// The user toggled the wand's restrict-to-region checkbox.
     WandRestrictToRegionChanged(bool),
     /// The user moved the Fill tool's tolerance control in the Tool Property panel.

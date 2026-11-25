@@ -844,10 +844,33 @@ pub fn export_pyxel_bytes(
 }
 
 fn parse_blend_mode(mode: &str) -> BlendMode {
-    match mode.to_ascii_lowercase().as_str() {
+    match mode.to_ascii_lowercase().replace(['_', '-'], " ").trim() {
+        "darken" => BlendMode::Darken,
         "multiply" => BlendMode::Multiply,
+        "color burn" | "colorburn" => BlendMode::ColorBurn,
+        "linear burn" | "linearburn" => BlendMode::LinearBurn,
+        "darker color" | "darkercolor" => BlendMode::DarkerColor,
+        "lighten" => BlendMode::Lighten,
         "screen" => BlendMode::Screen,
-        "add" | "linear dodge" | "lineardodge" => BlendMode::Add,
+        "color dodge" | "colordodge" => BlendMode::ColorDodge,
+        "add" | "addition" | "linear dodge" | "lineardodge" => BlendMode::Add,
+        "lighter color" | "lightercolor" => BlendMode::LighterColor,
+        "overlay" => BlendMode::Overlay,
+        "soft light" | "softlight" => BlendMode::SoftLight,
+        "hard light" | "hardlight" => BlendMode::HardLight,
+        "vivid light" | "vividlight" => BlendMode::VividLight,
+        "linear light" | "linearlight" => BlendMode::LinearLight,
+        "pin light" | "pinlight" => BlendMode::PinLight,
+        "hard mix" | "hardmix" => BlendMode::HardMix,
+        "difference" => BlendMode::Difference,
+        "exclusion" => BlendMode::Exclusion,
+        "subtract" => BlendMode::Subtract,
+        "divide" => BlendMode::Divide,
+        "invert" => BlendMode::Invert,
+        "hue" => BlendMode::Hue,
+        "saturation" => BlendMode::Saturation,
+        "color" => BlendMode::Color,
+        "luminosity" => BlendMode::Luminosity,
         _ => BlendMode::Normal,
     }
 }
@@ -855,9 +878,32 @@ fn parse_blend_mode(mode: &str) -> BlendMode {
 fn blend_mode_name(mode: BlendMode) -> &'static str {
     match mode {
         BlendMode::Normal => "normal",
+        BlendMode::Darken => "darken",
         BlendMode::Multiply => "multiply",
+        BlendMode::ColorBurn => "color burn",
+        BlendMode::LinearBurn => "linear burn",
+        BlendMode::DarkerColor => "darker color",
+        BlendMode::Lighten => "lighten",
         BlendMode::Screen => "screen",
+        BlendMode::ColorDodge => "color dodge",
         BlendMode::Add => "add",
+        BlendMode::LighterColor => "lighter color",
+        BlendMode::Overlay => "overlay",
+        BlendMode::SoftLight => "soft light",
+        BlendMode::HardLight => "hard light",
+        BlendMode::VividLight => "vivid light",
+        BlendMode::LinearLight => "linear light",
+        BlendMode::PinLight => "pin light",
+        BlendMode::HardMix => "hard mix",
+        BlendMode::Difference => "difference",
+        BlendMode::Exclusion => "exclusion",
+        BlendMode::Subtract => "subtract",
+        BlendMode::Divide => "divide",
+        BlendMode::Invert => "invert",
+        BlendMode::Hue => "hue",
+        BlendMode::Saturation => "saturation",
+        BlendMode::Color => "color",
+        BlendMode::Luminosity => "luminosity",
     }
 }
 

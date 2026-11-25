@@ -2,6 +2,25 @@
 
 All notable changes to **Pyxross Workshop** are documented in this file.
 
+## [0.9.2] - 2026-11-25
+
+### Added
+- **27 Layer Blend Modes:** expanded layer compositing with full W3C Compositing & Blending Level 1 math covering all 19 Aseprite blend modes (`0..=18`), Pyxel Edit blend modes, and standard digital art modes (`Darken`, `Multiply`, `Color Burn`, `Linear Burn`, `Darker Color`, `Lighten`, `Screen`, `Color Dodge`, `Add`, `Lighter Color`, `Overlay`, `Soft Light`, `Hard Light`, `Vivid Light`, `Linear Light`, `Pin Light`, `Hard Mix`, `Difference`, `Exclusion`, `Subtract`, `Divide`, `Invert`, `Hue`, `Saturation`, `Color`, `Luminosity`), including `.ase`/`.aseprite` and `.pyxel` import/export mappings.
+- **Resize Canvas Undo/Redo:** canvas count and region resize operations now push a full reversible `ResizeCanvasCommand` onto the undo/redo stack, restoring layers, tilemaps, tile palette, tile size, and animation regions losslessly.
+- **Image-to-Pixel Previous Settings & Aspect-Locked Presets:** automatically persists the last used Image-to-Pixel settings (`img2pixel_last_preset.json`) with a `Reload Previous` button in the `Size` tab; when `Lock` (aspect ratio) is enabled, both `Reload Previous` and saved presets preserve `target_width` and recalculate `target_height` to match the current image's aspect ratio.
+- **Import Flow `Back` vs `Cancel`:** post-file-selection dialogs (`Import Image`, `Import GIF`, `Import Aseprite`, `Import Pyxel`, `Image-to-Pixel`, `Import Banner`) now provide a separate `Back` button to return to file selection and `Cancel` to close the dialog.
+- **Workspace Custom Crosshair Cursor:** hides the OS pointer over the canvas workspace (when not over panels, popups, or transform gizmos) and draws a thin, subtle theme-tinted crosshair.
+- **Tile Tool `Tab` Index Toggle:** pressing `Tab` while using the Tile tool toggles visibility of canvas tile ID overlays on and off.
+- **Fill & Wand `Contiguous (Alt)` XOR Control:** both Fill and Fieldier Wand now provide a clickable `Contiguous (Alt)` checkbox whose active state is temporarily inverted while `Alt` is held and restored on release.
+
+### Fixed
+- **Tile Tool Left-Click Drag:** interpolated dragged cells along a Bresenham grid line so fast drags no longer leave gaps, preserved mid-hold `R`/`Q`/`X`/`Z` orientation changes, and eliminated 1-frame preview lag.
+- **Large Selection Performance:** added an `O(W+H)` perimeter fast path for rectangular selections, switched marching-ants backing to `Shape::closed_line` with viewport-clipped screen-space dashes, removed per-frame overlay cloning, and replaced per-drag `capture_mask` copies with in-place segment translation.
+- **Selection Preservation on UI Interaction:** clicking panels, dock chrome/splitters, floating borders, top-bar dropdowns, or popups outside the workspace no longer triggers selection deselect.
+- **Image-to-Pixel Single-Piece Import:** importing as a new document now rebuilds the default animation set for the full image size instead of retaining stale `16×16` 4-frame regions.
+- **Selected Animation Border & Parallel Selection View:** replaced yellow marching ants with a clean static grey outer area border plus red first-frame and green last-frame borders, and kept animation borders visible in parallel while a selection is active.
+- **Resize Canvas Region–Pixel Binding:** `ResizeCounts` now shifts pixels, tilemap cells, and animation frame rects together by whole-region pivot multiples, and `ResizeRegions` resizes `TilePalette` entries in lockstep using ceiling region counts.
+
 ## [0.9.1] - 2026-11-22
 
 ### Added

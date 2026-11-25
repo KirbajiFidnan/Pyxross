@@ -90,23 +90,13 @@ pub fn drop_placement(
     }
 }
 
-/// Display label for a blend mode (D58: normal/multiply/screen/add).
+/// Display label for a blend mode.
 fn blend_label(mode: BlendMode) -> &'static str {
-    match mode {
-        BlendMode::Normal => "Normal",
-        BlendMode::Multiply => "Multiply",
-        BlendMode::Screen => "Screen",
-        BlendMode::Add => "Add",
-    }
+    mode.label()
 }
 
 /// All blend modes in display order.
-const BLEND_MODES: [BlendMode; 4] = [
-    BlendMode::Normal,
-    BlendMode::Multiply,
-    BlendMode::Screen,
-    BlendMode::Add,
-];
+const BLEND_MODES: &[BlendMode] = &BlendMode::ALL;
 
 /// Vertical gap between the "Add layer" button and the layer list.
 const SECTION_SPACING: f32 = 4.0;
@@ -193,7 +183,7 @@ impl LayerPanel {
                 .selected_text(blend_label(layer.blend))
                 .width(80.0)
                 .show_ui(ui, |ui| {
-                    for mode in BLEND_MODES {
+                    for &mode in BLEND_MODES {
                         if ui
                             .selectable_value(&mut blend, mode, blend_label(mode))
                             .changed()

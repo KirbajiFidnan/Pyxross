@@ -152,6 +152,27 @@ pub fn user_keymap_path() -> Option<PathBuf> {
     dirs::config_dir().map(|base| base.join("pyxross").join("keybindings.json"))
 }
 
+pub fn user_img2pixel_last_preset_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|base| base.join("pyxross").join("img2pixel_last_preset.json"))
+}
+
+pub fn save_img2pixel_last_preset(
+    params: &crate::core::img2pixel::Img2PixelParams,
+    path: &Path,
+) -> Result<(), PersistenceError> {
+    let parent = path.parent().map_or_else(|| Path::new("."), |value| value);
+    fs::create_dir_all(parent).map_err(PersistenceError::Io)?;
+    let json = params.to_json_pretty().map_err(PersistenceError::Json)?;
+    fs::write(path, json).map_err(PersistenceError::Io)
+}
+
+pub fn load_img2pixel_last_preset(
+    path: &Path,
+) -> Option<crate::core::img2pixel::Img2PixelParams> {
+    let json = fs::read_to_string(path).ok()?;
+    crate::core::img2pixel::Img2PixelParams::from_json(&json).ok()
+}
+
 pub fn save_keymap(keymap: &Keymap, path: &Path) -> Result<(), PersistenceError> {
     let parent = path.parent().map_or_else(|| Path::new("."), |value| value);
     fs::create_dir_all(parent).map_err(PersistenceError::Io)?;
@@ -2657,5 +2678,36 @@ mod tests {
             "existing file must be restored when replacement fails"
         );
         assert!(!bak.exists());
+    }
+
+    #[test]
+    fn img2pixel_last_preset_roundtrip_missing_and_legacy_json() {
+        let dir = TempDir::new();
+        let path = dir.path().join("img2pixel_last_preset.json");
+
+        // 1. Missing file returns None cleanly (defaults preserved).
+        assert!(load_img2pixel_last_preset(&path).is_none());
+
+        // 2. Existing saved preset round-trips faithfully.
+        let mut params = crate::core::img2pixel::Img2PixelParams::default();
+        params.target_width = 96;
+        params.target_height = 64;
+        params.kmeans_colors = 12;
+        params.brightness = 0.25;
+        save_img2pixel_last_preset(&params, &path).unwrap();
+        let loaded = load_img2pixel_last_preset(&path).expect("saved preset must load");
+        assert_eq!(loaded.target_width, 96);
+        assert_eq!(loaded.target_height, 64);
+        assert_eq!(loaded.kmeans_colors, 12);
+        assert!((loaded.brightness - 0.25).abs() < 1e-5);
+
+        // 3. Old/partial JSON format fills missing fields with defaults.
+        fs::write(&path, r#"{"target_width": 48}"#).unwrap();
+        let legacy = load_img2pixel_last_preset(&path).expect("partial JSON must deserialize");
+        assert_eq!(legacy.target_width, 48);
+        assert_eq!(
+            legacy.target_height,
+            crate::core::img2pixel::Img2PixelParams::default().target_height
+        );
     }
 }

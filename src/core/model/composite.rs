@@ -42,6 +42,150 @@ fn apply_opacity(src: Color, opacity: f32) -> Color {
     Color::rgba(src.r, src.g, src.b, a)
 }
 
+#[inline]
+fn to_u8_channel(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[inline]
+fn blend_color_dodge_ch(s: f32, d: f32) -> f32 {
+    if d <= 0.0 {
+        0.0
+    } else if s >= 1.0 {
+        1.0
+    } else {
+        (d / (1.0 - s)).min(1.0)
+    }
+}
+
+#[inline]
+fn blend_color_burn_ch(s: f32, d: f32) -> f32 {
+    if d >= 1.0 {
+        1.0
+    } else if s <= 0.0 {
+        0.0
+    } else {
+        1.0 - ((1.0 - d) / s).min(1.0)
+    }
+}
+
+#[inline]
+fn blend_hard_light_ch(s: f32, d: f32) -> f32 {
+    if s <= 0.5 {
+        2.0 * s * d
+    } else {
+        1.0 - 2.0 * (1.0 - s) * (1.0 - d)
+    }
+}
+
+#[inline]
+fn blend_soft_light_ch(s: f32, d: f32) -> f32 {
+    if s <= 0.5 {
+        d - (1.0 - 2.0 * s) * d * (1.0 - d)
+    } else {
+        let g = if d <= 0.25 {
+            ((16.0 * d - 12.0) * d + 4.0) * d
+        } else {
+            d.sqrt()
+        };
+        d + (2.0 * s - 1.0) * (g - d)
+    }
+}
+
+#[inline]
+fn blend_vivid_light_ch(s: f32, d: f32) -> f32 {
+    if s <= 0.5 {
+        blend_color_burn_ch(2.0 * s, d)
+    } else {
+        blend_color_dodge_ch(2.0 * (s - 0.5), d)
+    }
+}
+
+#[inline]
+fn blend_pin_light_ch(s: f32, d: f32) -> f32 {
+    if s <= 0.5 {
+        d.min(2.0 * s)
+    } else {
+        d.max(2.0 * (s - 0.5))
+    }
+}
+
+#[inline]
+fn blend_divide_ch(s: f32, d: f32) -> f32 {
+    if d <= 0.0 {
+        0.0
+    } else if s <= 0.0 {
+        1.0
+    } else {
+        (d / s).min(1.0)
+    }
+}
+
+// W3C Compositing & Blending Level 1 non-separable HSL helpers.
+#[inline]
+fn lum(c: [f32; 3]) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+#[inline]
+fn sat(c: [f32; 3]) -> f32 {
+    c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+}
+
+fn clip_color(mut c: [f32; 3]) -> [f32; 3] {
+    let l = lum(c);
+    let n = c[0].min(c[1]).min(c[2]);
+    let x = c[0].max(c[1]).max(c[2]);
+    if n < 0.0 && (l - n).abs() > 1e-6 {
+        let f = l / (l - n);
+        c = [l + (c[0] - l) * f, l + (c[1] - l) * f, l + (c[2] - l) * f];
+    }
+    if x > 1.0 && (x - l).abs() > 1e-6 {
+        let f = (1.0 - l) / (x - l);
+        c = [l + (c[0] - l) * f, l + (c[1] - l) * f, l + (c[2] - l) * f];
+    }
+    c
+}
+
+fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
+    let d = l - lum(c);
+    clip_color([c[0] + d, c[1] + d, c[2] + d])
+}
+
+fn set_sat(mut c: [f32; 3], s: f32) -> [f32; 3] {
+    let mut idx = [0usize, 1, 2];
+    if c[idx[0]] > c[idx[1]] {
+        idx.swap(0, 1);
+    }
+    if c[idx[1]] > c[idx[2]] {
+        idx.swap(1, 2);
+    }
+    if c[idx[0]] > c[idx[1]] {
+        idx.swap(0, 1);
+    }
+    let (i_min, i_mid, i_max) = (idx[0], idx[1], idx[2]);
+    let span = c[i_max] - c[i_min];
+    if span > 1e-6 {
+        c[i_mid] = ((c[i_mid] - c[i_min]) * s) / span;
+        c[i_max] = s;
+    } else {
+        c[i_mid] = 0.0;
+        c[i_max] = 0.0;
+    }
+    c[i_min] = 0.0;
+    c
+}
+
+#[inline]
+fn blend_separable(src: Color, dst: Color, f: impl Fn(f32, f32) -> f32) -> Color {
+    Color::rgba(
+        to_u8_channel(f(src.r as f32 / 255.0, dst.r as f32 / 255.0)),
+        to_u8_channel(f(src.g as f32 / 255.0, dst.g as f32 / 255.0)),
+        to_u8_channel(f(src.b as f32 / 255.0, dst.b as f32 / 255.0)),
+        src.a,
+    )
+}
+
 /// Applies `blend` to `src`'s color against the accumulated `dst` backdrop,
 /// then composites via the straight-alpha [`over`]. When the backdrop is
 /// fully transparent the blend is skipped and the plain `over` result is
@@ -50,26 +194,85 @@ fn blend_over(src: Color, dst: Color, blend: BlendMode) -> Color {
     if dst.a == 0 {
         return over(src, dst);
     }
+    let s_rgb = [src.r as f32 / 255.0, src.g as f32 / 255.0, src.b as f32 / 255.0];
+    let d_rgb = [dst.r as f32 / 255.0, dst.g as f32 / 255.0, dst.b as f32 / 255.0];
     let blended = match blend {
         BlendMode::Normal => src,
+        BlendMode::Darken => Color::rgba(src.r.min(dst.r), src.g.min(dst.g), src.b.min(dst.b), src.a),
         BlendMode::Multiply => Color::rgba(
             (src.r as f32 * dst.r as f32 / 255.0).round() as u8,
             (src.g as f32 * dst.g as f32 / 255.0).round() as u8,
             (src.b as f32 * dst.b as f32 / 255.0).round() as u8,
             src.a,
         ),
+        BlendMode::ColorBurn => blend_separable(src, dst, blend_color_burn_ch),
+        BlendMode::LinearBurn => blend_separable(src, dst, |s, d| (s + d - 1.0).max(0.0)),
+        BlendMode::DarkerColor => {
+            if lum(s_rgb) < lum(d_rgb) {
+                src
+            } else {
+                Color::rgba(dst.r, dst.g, dst.b, src.a)
+            }
+        }
+        BlendMode::Lighten => Color::rgba(src.r.max(dst.r), src.g.max(dst.g), src.b.max(dst.b), src.a),
         BlendMode::Screen => Color::rgba(
             (255.0 - (255.0 - src.r as f32) * (255.0 - dst.r as f32) / 255.0).round() as u8,
             (255.0 - (255.0 - src.g as f32) * (255.0 - dst.g as f32) / 255.0).round() as u8,
             (255.0 - (255.0 - src.b as f32) * (255.0 - dst.b as f32) / 255.0).round() as u8,
             src.a,
         ),
+        BlendMode::ColorDodge => blend_separable(src, dst, blend_color_dodge_ch),
         BlendMode::Add => Color::rgba(
             (src.r as u16 + dst.r as u16).min(255) as u8,
             (src.g as u16 + dst.g as u16).min(255) as u8,
             (src.b as u16 + dst.b as u16).min(255) as u8,
             src.a,
         ),
+        BlendMode::LighterColor => {
+            if lum(s_rgb) > lum(d_rgb) {
+                src
+            } else {
+                Color::rgba(dst.r, dst.g, dst.b, src.a)
+            }
+        }
+        BlendMode::Overlay => blend_separable(src, dst, |s, d| blend_hard_light_ch(d, s)),
+        BlendMode::SoftLight => blend_separable(src, dst, blend_soft_light_ch),
+        BlendMode::HardLight => blend_separable(src, dst, blend_hard_light_ch),
+        BlendMode::VividLight => blend_separable(src, dst, blend_vivid_light_ch),
+        BlendMode::LinearLight => blend_separable(src, dst, |s, d| (d + 2.0 * s - 1.0).clamp(0.0, 1.0)),
+        BlendMode::PinLight => blend_separable(src, dst, blend_pin_light_ch),
+        BlendMode::HardMix => blend_separable(src, dst, |s, d| if s + d >= 1.0 { 1.0 } else { 0.0 }),
+        BlendMode::Difference => Color::rgba(
+            src.r.abs_diff(dst.r),
+            src.g.abs_diff(dst.g),
+            src.b.abs_diff(dst.b),
+            src.a,
+        ),
+        BlendMode::Exclusion => blend_separable(src, dst, |s, d| s + d - 2.0 * s * d),
+        BlendMode::Subtract => Color::rgba(
+            dst.r.saturating_sub(src.r),
+            dst.g.saturating_sub(src.g),
+            dst.b.saturating_sub(src.b),
+            src.a,
+        ),
+        BlendMode::Divide => blend_separable(src, dst, blend_divide_ch),
+        BlendMode::Invert => Color::rgba(255 - dst.r, 255 - dst.g, 255 - dst.b, src.a),
+        BlendMode::Hue => {
+            let c = set_lum(set_sat(s_rgb, sat(d_rgb)), lum(d_rgb));
+            Color::rgba(to_u8_channel(c[0]), to_u8_channel(c[1]), to_u8_channel(c[2]), src.a)
+        }
+        BlendMode::Saturation => {
+            let c = set_lum(set_sat(d_rgb, sat(s_rgb)), lum(d_rgb));
+            Color::rgba(to_u8_channel(c[0]), to_u8_channel(c[1]), to_u8_channel(c[2]), src.a)
+        }
+        BlendMode::Color => {
+            let c = set_lum(s_rgb, lum(d_rgb));
+            Color::rgba(to_u8_channel(c[0]), to_u8_channel(c[1]), to_u8_channel(c[2]), src.a)
+        }
+        BlendMode::Luminosity => {
+            let c = set_lum(d_rgb, lum(s_rgb));
+            Color::rgba(to_u8_channel(c[0]), to_u8_channel(c[1]), to_u8_channel(c[2]), src.a)
+        }
     };
     over(blended, dst)
 }

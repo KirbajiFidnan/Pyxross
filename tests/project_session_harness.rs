@@ -701,6 +701,12 @@ const APP_OWNERSHIP: &[AppOwnership] = &[
         lifecycle: "updated every frame by the host input loop",
     },
     AppOwnership {
+        field: "show_tile_indices",
+        owner: AppOwner::HostLocal,
+        rationale: "Tile tool Tab toggle for canvas tile_id overlay labels",
+        lifecycle: "host-level view preference, defaults true and toggled via Tab in Tile tool",
+    },
+    AppOwnership {
         field: "recovery_host",
         owner: AppOwner::ShellGlobal,
         rationale: "floating crash-recovery prompt host is shell-global",

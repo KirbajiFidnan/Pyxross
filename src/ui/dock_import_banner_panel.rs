@@ -41,6 +41,7 @@ pub enum ImportBannerEvent {
         height: u32,
         rgba: Vec<u8>,
     },
+    Back,
     Cancel,
 }
 
@@ -491,6 +492,13 @@ impl ImportBannerPanelContent {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
                     host.events.push(ImportBannerEvent::Cancel);
+                }
+                if chrome
+                    .button(ui, "Back", ButtonStyle::plain())
+                    .on_hover_text("Return to file selection")
+                    .clicked()
+                {
+                    host.events.push(ImportBannerEvent::Back);
                 }
                 if chrome.button(ui, "Import", ButtonStyle::plain()).clicked() {
                     match sanitize_banner_filename(&host.banner_name) {

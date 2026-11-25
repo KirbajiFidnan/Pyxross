@@ -395,11 +395,15 @@ impl ToolPropertyComponent {
         if view.child != FieldierChild::Wand {
             return;
         }
-        // Display-only: the effective contiguity already folds in Alt, and the
-        // checkbox must never emit — the temp Alt override is a gesture-engine
-        // concern, not a stored setting.
+        // Displays the live effective contiguity (stored XOR Alt). Clicking
+        // toggles the stored `wand.contiguous` setting so the user can flip
+        // the default while Alt temporarily inverts whatever state is active.
         let mut effective = view.wand_contiguous_effective;
-        ui.add_enabled(false, egui::Checkbox::new(&mut effective, "Contiguous (Alt)"));
+        if ui.checkbox(&mut effective, "Contiguous (Alt)").changed() {
+            events
+                .borrow_mut()
+                .push(ToolbarEvent::WandContiguousChanged(!view.wand.contiguous));
+        }
         property_row(ui, "Tolerance", |ui| {
             let mut tolerance = view.wand.tolerance;
             let input = ui.add_sized(
@@ -470,11 +474,14 @@ impl ToolPropertyComponent {
                     .push(ToolbarEvent::FillToleranceChanged(0));
             }
         });
-        let mut contiguous = view.fill.contiguous;
-        if ui.checkbox(&mut contiguous, "Contiguous").changed() {
+        // Displays the live effective contiguity (stored XOR Alt). Clicking
+        // toggles the stored `fill.contiguous` setting while Alt temporarily
+        // inverts the active state.
+        let mut effective = view.fill_contiguous_effective;
+        if ui.checkbox(&mut effective, "Contiguous (Alt)").changed() {
             events
                 .borrow_mut()
-                .push(ToolbarEvent::FillContiguousChanged(contiguous));
+                .push(ToolbarEvent::FillContiguousChanged(!view.fill.contiguous));
         }
         let mut restrict = view.fill.restrict_to_region;
         if ui.checkbox(&mut restrict, "Restrict to region").changed() {

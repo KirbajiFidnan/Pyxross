@@ -47,6 +47,7 @@ pub struct ImportPyxelView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportPyxelEvent {
     Import,
+    Back,
     Cancel,
 }
 
@@ -180,6 +181,14 @@ impl ImportPyxelComponent {
                     .clicked()
                 {
                     emitted = Some(ImportPyxelEvent::Import);
+                }
+                ui.add_space(6.0);
+                if chrome
+                    .button(ui, "Back", ButtonStyle::plain())
+                    .on_hover_text("Return to file selection")
+                    .clicked()
+                {
+                    emitted = Some(ImportPyxelEvent::Back);
                 }
                 ui.add_space(6.0);
                 if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {

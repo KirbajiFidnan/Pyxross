@@ -106,6 +106,8 @@ impl Default for ImportGifView {
 pub enum ImportGifEvent {
     /// The user confirmed with a valid row length.
     Ok { line_length: u32 },
+    /// Return to file selection.
+    Back,
     /// The user dismissed the panel.
     Cancel,
 }
@@ -341,25 +343,37 @@ impl Component for ImportGifComponent {
 
         // Symmetric centred action pair (mirrors import_image).
         let mut ok_clicked = false;
+        let mut back_clicked = false;
         let mut cancel_clicked = false;
-        ui.columns(2, |columns| {
-            columns[0].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(valid, |ui| {
-                    if chrome.button(ui, "OK", ButtonStyle::plain()).clicked() {
-                        ok_clicked = true;
-                    }
-                });
-            });
-            columns[1].with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
-                    cancel_clicked = true;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(valid, |ui| {
+                if chrome.button(ui, "OK", ButtonStyle::plain()).clicked() {
+                    ok_clicked = true;
                 }
             });
+            ui.add_space(6.0);
+            if chrome
+                .button(ui, "Back", ButtonStyle::plain())
+                .on_hover_text("Return to file selection")
+                .clicked()
+            {
+                back_clicked = true;
+            }
+            ui.add_space(6.0);
+            if chrome.button(ui, "Cancel", ButtonStyle::plain()).clicked() {
+                cancel_clicked = true;
+            }
         });
 
         let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed =
             ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+
+        if back_clicked {
+            host.view.borrow_mut().error = None;
+            host.events.borrow_mut().push(ImportGifEvent::Back);
+            return;
+        }
 
         if cancel_clicked || escape_pressed {
             host.view.borrow_mut().error = None;

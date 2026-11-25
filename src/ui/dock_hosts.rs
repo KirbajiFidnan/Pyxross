@@ -121,11 +121,13 @@ pub struct ToolboxView {
     /// The Fieldier wand's stored settings.
     pub wand: WandSettings,
     /// Whether the wand's flood fill is contiguous THIS frame: the stored
-    /// [`WandSettings::contiguous`] with Alt momentarily dropping contiguity
-    /// (`false`) so the panel can show it read-only.
+    /// [`WandSettings::contiguous`] XOR live Alt state.
     pub wand_contiguous_effective: bool,
     /// The Fill (bucket) tool's stored flood-fill settings.
     pub fill: FillSettings,
+    /// Whether the Fill tool is contiguous THIS frame: the stored
+    /// [`FillSettings::contiguous`] XOR live Alt state.
+    pub fill_contiguous_effective: bool,
     /// Whether a selection-transform session is live. When true the Tool
     /// Property panel shows the "Transform" algorithm selector instead of the
     /// active tool's properties.
@@ -153,13 +155,15 @@ pub struct ToolboxView {
 impl Default for ToolboxView {
     fn default() -> Self {
         let wand = WandSettings::default();
+        let fill = FillSettings::default();
         Self {
             tool: Tool::Pencil,
             draw: DrawSettings::default(),
             child: FieldierChild::default(),
             wand,
             wand_contiguous_effective: wand.contiguous,
-            fill: FillSettings::default(),
+            fill,
+            fill_contiguous_effective: fill.contiguous,
             transform_active: false,
             transform_algorithm: TransformAlgorithm::default(),
             tile_placer: TilePlacerView::default(),

@@ -401,6 +401,9 @@ struct App {
     /// `modifiers.alt` and compared frame-to-frame. Holding Alt must not
     /// retoggle.
     prev_alt: bool,
+    /// Whether Tile-tool assigned cell `tile_id` labels are visible on the
+    /// canvas (toggled via `Tab` while the Tile tool is active).
+    show_tile_indices: bool,
     /// GHOST tile captured by a right-click eyedropper on an EMPTY cell: the
     /// composited footprint `(w, h, rgba8)` visibly on screen at that cell.
     /// While `Some`, a placement blits these pixels into the active layer as an
@@ -709,6 +712,7 @@ impl App {
             tile_placer_transform: TilePlacerTransform::default(),
             tile_placer_preview: TilePlacerPreview::default(),
             prev_alt: false,
+            show_tile_indices: true,
             ghost_tile: None,
             tile_rect_anchor: None,
             tile_rect_current: None,
@@ -1022,6 +1026,10 @@ struct TilePlacerGesture {
     /// SAME cell — neither overwrites the recorded `before` nor appends a
     /// duplicate buffer footprint.
     touched: BTreeSet<(u32, u32)>,
+    /// Last grid cell stamped in the current continuous drag segment, used to
+    /// interpolate intermediate cells via Bresenham so fast drags never leave
+    /// gaps.
+    last_cell: Option<(u32, u32)>,
 }
 
 impl TilePlacerGesture {
@@ -2133,6 +2141,13 @@ impl App {
                 dock_import_banner_panel::ImportBannerEvent::Cancel => {
                     let _ = self.panel_dock.remove_spec(panel_id);
                 }
+                dock_import_banner_panel::ImportBannerEvent::Back => {
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportBanner,
+                        self.default_save_location(),
+                    );
+                }
                 dock_import_banner_panel::ImportBannerEvent::Import {
                     name,
                     width,
@@ -2716,6 +2731,14 @@ impl App {
                     self.close_import_gif_panel();
                     self.pending_gif_import = None;
                 }
+                dock_import_gif_panel::ImportGifEvent::Back => {
+                    self.close_import_gif_panel();
+                    self.pending_gif_import = None;
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportGif,
+                        self.default_save_location(),
+                    );
+                }
                 dock_import_gif_panel::ImportGifEvent::Ok { line_length } => {
                     self.close_import_gif_panel();
                     match self.apply_import_gif(line_length) {
@@ -2781,6 +2804,14 @@ impl App {
                 dock_import_image_panel::ImportImageEvent::Cancel => {
                     self.close_import_image_panel();
                     self.pending_image_import = None;
+                }
+                dock_import_image_panel::ImportImageEvent::Back => {
+                    self.close_import_image_panel();
+                    self.pending_image_import = None;
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportPng,
+                        self.default_save_location(),
+                    );
                 }
                 dock_import_image_panel::ImportImageEvent::Ok {
                     px_w,
@@ -3079,9 +3110,19 @@ impl App {
             .drain(..)
             .collect();
         for event in events {
-            match event {
+            let (before_layers, before_palette, before_tile_size, before_animations) = {
+                let s = self.projects.current();
+                (
+                    s.layers.clone(),
+                    s.tile_palette.clone(),
+                    s.tile_size,
+                    s.animations.clone(),
+                )
+            };
+            let cmd_name = match event {
                 dock_resize_canvas_panel::ResizeCanvasEvent::ResizeCounts { w, h, pivot } => {
                     self.apply_resize_counts(w.max(1), h.max(1), pivot);
+                    "Resize Canvas"
                 }
                 dock_resize_canvas_panel::ResizeCanvasEvent::ResizeRegions {
                     w,
@@ -3090,8 +3131,30 @@ impl App {
                     resample,
                 } => {
                     self.apply_resize_regions(w.max(1), h.max(1), pivot, resample);
+                    "Resize Regions"
                 }
-            }
+            };
+            let (after_layers, after_palette, after_tile_size, after_animations) = {
+                let s = self.projects.current();
+                (
+                    s.layers.clone(),
+                    s.tile_palette.clone(),
+                    s.tile_size,
+                    s.animations.clone(),
+                )
+            };
+            let cmd = crate::core::undo::ResizeCanvasCommand::new(
+                cmd_name,
+                before_layers,
+                after_layers,
+                before_palette,
+                after_palette,
+                before_tile_size,
+                after_tile_size,
+                before_animations,
+                after_animations,
+            );
+            self.projects.current_mut().undo.push(Box::new(cmd));
             self.invalidate_host_project_cache();
             self.sync_anim_delays();
             self.projects.current_mut().mark_dirty();
@@ -3109,21 +3172,33 @@ impl App {
         pivot: crate::core::canvas_resize::Pivot,
     ) {
         let ts = self.projects.current().tile_size;
+        let old_w = self.projects.current().layers.width() as u32;
+        let old_h = self.projects.current().layers.height() as u32;
+        let old_cols = old_w.div_ceil(ts.w.max(1)).max(1);
+        let old_rows = old_h.div_ceil(ts.h.max(1)).max(1);
+        let (cell_ox, cell_oy) = pivot.offset((old_cols, old_rows), (w, h));
+        let pixel_ox = cell_ox.saturating_mul(ts.w.max(1) as i32);
+        let pixel_oy = cell_oy.saturating_mul(ts.h.max(1) as i32);
         let (new_w, new_h) = crate::core::canvas_resize::canvas_size(ts.w, ts.h, w, h);
         let (new_w, new_h) = (new_w.max(1), new_h.max(1));
         self.projects
             .current_mut()
             .layers
-            .resize_canvas(new_w as usize, new_h as usize, pivot, false);
-        self.clamp_frames_to_canvas(new_w as i32, new_h as i32);
+            .resize_canvas_with_offset(
+                new_w as usize,
+                new_h as usize,
+                (pixel_ox, pixel_oy),
+                (cell_ox, cell_oy),
+            );
+        self.translate_and_clamp_frames_to_canvas(pixel_ox, pixel_oy, new_w as i32, new_h as i32);
     }
 
     /// `ResizeRegions`: each region becomes `w × h` (PER-AXIS; the new
     /// `tile_size` is `TileSize::new(w, h)` — non-square regions are honoured).
     /// The current region counts are preserved, so the new canvas is
     /// `(w*count_w, h*count_h)`. Pixels are resampled per `resample` (`false` =
-    /// 1:1 pivot copy, `true` = NN scale); frame rects are scaled by the region
-    /// ratio and clamped.
+    /// 1:1 pivot copy, `true` = NN scale); tile palette entries are resized in
+    /// lockstep; frame rects are mapped to the new region grid and clamped.
     fn apply_resize_regions(
         &mut self,
         w: u32,
@@ -3134,27 +3209,32 @@ impl App {
         let old_tile = self.projects.current().tile_size;
         let old_w = self.projects.current().layers.width() as u32;
         let old_h = self.projects.current().layers.height() as u32;
-        let count_w = (old_w / old_tile.w.max(1)).max(1);
-        let count_h = (old_h / old_tile.h.max(1)).max(1);
+        let count_w = old_w.div_ceil(old_tile.w.max(1)).max(1);
+        let count_h = old_h.div_ceil(old_tile.h.max(1)).max(1);
         let new_tile = TileSize::new(w, h);
         let (new_w, new_h) =
             crate::core::canvas_resize::canvas_size(new_tile.w, new_tile.h, count_w, count_h);
         let (new_w, new_h) = (new_w.max(1), new_h.max(1));
-        self.projects.current_mut().layers.resize_regions(
-            old_tile,
-            new_tile,
-            count_w,
-            count_h,
-            pivot,
-            resample,
-        );
-        self.projects.current_mut().tile_size = new_tile;
+        {
+            let session = self.projects.current_mut();
+            session.layers.resize_regions(
+                old_tile,
+                new_tile,
+                count_w,
+                count_h,
+                pivot,
+                resample,
+            );
+            session.tile_palette.resize_tiles(new_tile, pivot, resample);
+            session.tile_size = new_tile;
+        }
         self.scale_frames_to_canvas(new_tile.w, new_tile.h, old_tile, new_w as i32, new_h as i32);
     }
 
-    /// Clamp every frame's region rect into `0..new_w × 0..new_h` (overflow is
-    /// cropped), across ALL animations.
-    fn clamp_frames_to_canvas(&mut self, new_w: i32, new_h: i32) {
+    /// Translate every frame's region rect by `(dx, dy)` and clamp into
+    /// `0..new_w × 0..new_h`, across ALL animations. Keeps every animation
+    /// frame bound to its pixels when the canvas grows/shrinks around a pivot.
+    fn translate_and_clamp_frames_to_canvas(&mut self, dx: i32, dy: i32, new_w: i32, new_h: i32) {
         let canvas = Rect2i::new(0, 0, new_w.max(1), new_h.max(1));
         let session = self.projects.current_mut();
         for i in 0..session.animations.len() {
@@ -3163,7 +3243,10 @@ impl App {
             };
             for idx in 0..seq.len() {
                 if let Some(frame) = seq.frame_mut(idx) {
-                    frame.region.rect = frame.region.rect.clamp_to(canvas);
+                    let r = frame.region.rect;
+                    frame.region.rect =
+                        Rect2i::new(r.x.saturating_add(dx), r.y.saturating_add(dy), r.w, r.h)
+                            .clamp_to(canvas);
                 }
             }
         }
@@ -3892,6 +3975,9 @@ impl App {
                 ToolbarEvent::WandToleranceChanged(tolerance) => {
                     self.projects.current_mut().tool_state.wand_mut().tolerance = tolerance;
                 }
+                ToolbarEvent::WandContiguousChanged(contiguous) => {
+                    self.projects.current_mut().tool_state.wand_mut().contiguous = contiguous;
+                }
                 ToolbarEvent::WandRestrictToRegionChanged(restrict) => {
                     self.projects
                         .current_mut()
@@ -4030,9 +4116,11 @@ impl App {
         let tool = session.tool_state.tool();
         let draw: DrawSettings = *session.draw_settings(tool);
         let child = session.tool_state.child();
+        let alt_held = self.ctx.input(|i| i.modifiers.alt);
         let wand = session.tool_state.wand();
-        let wand_contiguous_effective = wand.contiguous && !self.ctx.input(|i| i.modifiers.alt);
+        let wand_contiguous_effective = wand.contiguous ^ alt_held;
         let fill = session.tool_state.fill();
+        let fill_contiguous_effective = fill.contiguous ^ alt_held;
         let transform_active = session.transform.is_some();
         let text_transform_active = session
             .transform
@@ -4064,6 +4152,7 @@ impl App {
             wand,
             wand_contiguous_effective,
             fill,
+            fill_contiguous_effective,
             transform_active,
             transform_algorithm,
             tile_placer,
@@ -5073,19 +5162,21 @@ impl App {
         let ts = session.tile_size;
         let layer_id = session.layers.active_layer_id();
         // Item 6: every assigned cell of the ACTIVE layer's tilemap carries its
-        // tile_id label.
-        if let Some(tm) = session
-            .layers
-            .layer(layer_id)
-            .and_then(|l| l.tilemap.as_ref())
-        {
-            let cols = tm.cols.max(1) as usize;
-            for (index, cell) in tm.cells().iter().enumerate() {
-                if let Some(cell) = cell {
-                    preview.indices.push((
-                        ((index % cols) as u32, (index / cols) as u32),
-                        cell.tile_id.0,
-                    ));
+        // tile_id label (when toggled visible via Tab).
+        if self.show_tile_indices {
+            if let Some(tm) = session
+                .layers
+                .layer(layer_id)
+                .and_then(|l| l.tilemap.as_ref())
+            {
+                let cols = tm.cols.max(1) as usize;
+                for (index, cell) in tm.cells().iter().enumerate() {
+                    if let Some(cell) = cell {
+                        preview.indices.push((
+                            ((index % cols) as u32, (index / cols) as u32),
+                            cell.tile_id.0,
+                        ));
+                    }
                 }
             }
         }
@@ -5481,28 +5572,34 @@ impl App {
         if let Some(sel) = &self.projects.current().selection {
             return Self::selection_overlay(sel);
         }
-        // Persistent frame-region borders for the ACTIVE animation: a
-        // tool-independent marching-ants highlight of every frame region. Skip
-        // the default single full-canvas frame on a fresh document so the
-        // workspace does not open with a yellow border around the whole screen.
-        {
-            let session = self.projects.current();
-            let sequence = session.sequence();
-            if sequence.len() > 0 {
-                let full_canvas = Rect2i::new(
-                    0,
-                    0,
-                    session.layers.width() as i32,
-                    session.layers.height() as i32,
-                );
-                let regions: Vec<Rect2i> =
-                    sequence.iter().map(|frame| frame.region().rect()).collect();
-                if !(regions.len() == 1 && regions[0] == full_canvas) {
-                    return CanvasOverlay::FrameRegions(regions);
-                }
-            }
+        let regions = self.active_frame_regions();
+        if !regions.is_empty() {
+            return CanvasOverlay::FrameRegions(regions);
         }
         CanvasOverlay::None
+    }
+
+    /// Active animation's non-default frame regions, painted in parallel with
+    /// selection and gesture overlays so animation borders stay visible while
+    /// working with selections.
+    fn active_frame_regions(&self) -> Vec<Rect2i> {
+        let session = self.projects.current();
+        let sequence = session.sequence();
+        if sequence.len() == 0 {
+            return Vec::new();
+        }
+        let full_canvas = Rect2i::new(
+            0,
+            0,
+            session.layers.width() as i32,
+            session.layers.height() as i32,
+        );
+        let regions: Vec<Rect2i> = sequence.iter().map(|frame| frame.region().rect()).collect();
+        if regions.len() == 1 && regions[0] == full_canvas {
+            Vec::new()
+        } else {
+            regions
+        }
     }
 
     /// Select-tool press: Ctrl+LMB inside the committed selection lifts it
@@ -5614,23 +5711,25 @@ impl App {
         let session = self.projects.current_mut();
         let ts = session.tile_size;
         let next = match std::mem::replace(&mut session.gesture, SelectGesture::Idle) {
-            SelectGesture::AreaMove { origin, dest, .. } => match &session.selection {
+            SelectGesture::AreaMove {
+                origin,
+                dest,
+                mut preview,
+            } => match &session.selection {
                 Some(sel) => {
                     let next_dest = sel.destination(pt.0 - origin.0, pt.1 - origin.1);
-                    let preview = (!sel.is_rectangular()).then(|| {
-                        let dx = next_dest.x - sel.rect().x;
-                        let dy = next_dest.y - sel.rect().y;
-                        sel.translated_shape(dx, dy)
-                            .and_then(|(bbox, mask)| {
-                                Selection::capture_mask(
-                                    &session.layers.active_layer().buffer,
-                                    bbox,
-                                    mask,
-                                )
-                            })
-                            .map(|moved| moved.outline_segments())
-                            .unwrap_or_default()
-                    });
+                    if let Some(segs) = preview.as_mut() {
+                        let step_dx = next_dest.x - dest.x;
+                        let step_dy = next_dest.y - dest.y;
+                        if step_dx != 0 || step_dy != 0 {
+                            for (a, b) in segs.iter_mut() {
+                                a.0 += step_dx;
+                                a.1 += step_dy;
+                                b.0 += step_dx;
+                                b.1 += step_dy;
+                            }
+                        }
+                    }
                     SelectGesture::AreaMove {
                         origin,
                         dest: next_dest,
@@ -5885,15 +5984,14 @@ impl App {
             SelectMode::Replace
         };
         let wand = self.projects.current().tool_state.wand();
-        let effective_contiguous = wand.contiguous && !alt_held;
+        let effective_contiguous = wand.contiguous ^ alt_held;
         if let Some(seed) = interactions.double_clicked {
             let captured = {
                 let buf = &self.projects.current().layers.active_layer().buffer;
                 let shape = if alt_held {
-                    // FF: Alt+double-click is the non-contiguous Wand fill
-                    // (matching the single-click Alt override), NOT the
-                    // alpha-connected component. Otherwise a fast second click
-                    // would silently break Alt+Shift.
+                    // FF: Alt+double-click uses the effective contiguity
+                    // (matching the single-click Alt invert), NOT the
+                    // alpha-connected component.
                     let ts = self.projects.current().tile_size;
                     let tw = ts.w.max(1) as i32;
                     let th = ts.h.max(1) as i32;
@@ -5910,7 +6008,7 @@ impl App {
                         buf,
                         seed,
                         wand.tolerance,
-                        false,
+                        effective_contiguous,
                         clip.as_ref(),
                     )
                 } else {
@@ -6165,7 +6263,10 @@ impl App {
     }
 
     fn workspace_empty_click(&self) -> Option<(i32, i32)> {
-        if self.ctx.egui_is_using_pointer() || self.pointer_over_panel() {
+        if self.ctx.egui_is_using_pointer()
+            || self.pointer_over_panel()
+            || self.panel_dock.is_interacting()
+        {
             return None;
         }
         if self.input_capture.target() != Some(SurfaceId::Canvas) {
@@ -6176,14 +6277,40 @@ impl App {
         if space_held {
             return None;
         }
-        let pos = self.ctx.input(|i| {
-            (i.pointer.button_clicked(egui::PointerButton::Primary)
-                || i.pointer.button_double_clicked(egui::PointerButton::Primary))
-            .then(|| i.pointer.latest_pos())
-            .flatten()
+        let (pos, press_origin) = self.ctx.input(|i| {
+            let clicked = i.pointer.button_clicked(egui::PointerButton::Primary)
+                || i.pointer.button_double_clicked(egui::PointerButton::Primary);
+            if !clicked {
+                return None;
+            }
+            let pos = i.pointer.latest_pos()?;
+            Some((pos, i.pointer.press_origin()))
         })?;
-        if pos.y < top_bar::TOP_BAR_HEIGHT {
+        let frame_rect = self.ctx.content_rect();
+        let body_rect = top_bar::split_frame(frame_rect).body_rect;
+        let is_ui_point = |p: egui::Pos2| -> bool {
+            if p.y < top_bar::TOP_BAR_HEIGHT || !body_rect.contains(p) {
+                return true;
+            }
+            if self.panel_dock_demo && self.panel_dock.contains_panel_or_chrome(p, body_rect) {
+                return true;
+            }
+            if self
+                .ctx
+                .layer_id_at(p)
+                .is_some_and(|layer| layer.order != egui::Order::Background)
+            {
+                return true;
+            }
+            false
+        };
+        if is_ui_point(pos) {
             return None;
+        }
+        if let Some(origin) = press_origin {
+            if is_ui_point(origin) {
+                return None;
+            }
         }
         let camera = self.projects.current().camera;
         let canvas_size = (
@@ -7932,6 +8059,11 @@ impl App {
                 self.tile_placer_commit();
             }
         }
+        if interactions.stroke_segment_started {
+            // Re-entering the canvas after dragging outside starts a fresh
+            // contiguous run so we never bridge across the off-canvas gap.
+            self.tile_placer.last_cell = None;
+        }
         if let Some(pt) = interactions.stroke_point {
             if self.tile_rect_anchor.is_some() {
                 // Shift rectangle: only track the current cell; apply on release.
@@ -7940,7 +8072,29 @@ impl App {
                 self.tile_rect_current = Some(TileMap::snap_cell(pt, ts));
             } else {
                 let mode = self.tile_effect();
-                self.tile_placer_cell(pt, mode);
+                let ts = self.projects.current().tile_size;
+                let cell = TileMap::snap_cell(pt, ts);
+                if let Some(prev) = self.tile_placer.last_cell {
+                    if prev != cell {
+                        let tw = ts.w.max(1) as i32;
+                        let th = ts.h.max(1) as i32;
+                        for (gx, gy) in crate::core::brush::bresenham_line(
+                            (prev.0 as i32, prev.1 as i32),
+                            (cell.0 as i32, cell.1 as i32),
+                        ) {
+                            if gx >= 0 && gy >= 0 && (gx as u32, gy as u32) != prev {
+                                self.tile_placer_cell((gx * tw, gy * th), mode);
+                            }
+                        }
+                    } else {
+                        // Same cell while held: still allow live mid-hold
+                        // transform changes (e.g. R/Q/X/Z) to re-stamp.
+                        self.tile_placer_cell(pt, mode);
+                    }
+                } else {
+                    self.tile_placer_cell(pt, mode);
+                }
+                self.tile_placer.last_cell = Some(cell);
             }
         }
         if interactions.stroke_ended {
@@ -8445,6 +8599,13 @@ impl App {
         if guarded {
             return;
         }
+        if !self.ctx.text_edit_focused()
+            && self
+                .ctx
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            self.show_tile_indices = !self.show_tile_indices;
+        }
         let t = &mut self.tile_placer_transform;
         if r {
             t.rotation = (t.rotation + 1) % 4;
@@ -8742,9 +8903,9 @@ impl App {
         let layer_id = project.layers.active_layer_id();
         let color = project.color;
         let fill = project.tool_state.fill();
-        // Alt momentarily drops contiguity (global replace-all), mirroring the
-        // wand's Alt override.
-        let replace_all = !(fill.contiguous && !alt_held);
+        // Alt momentarily inverts the current contiguous setting (XOR),
+        // mirroring the wand's Alt invert.
+        let replace_all = !(fill.contiguous ^ alt_held);
         // The selection clip always bounds the fill; restrict-to-region adds the
         // seed's region/tile-cell clip, and the two are intersected so both
         // constraints hold when present.
@@ -9176,6 +9337,13 @@ impl App {
 
     fn undo_document(&mut self) {
         self.clear_selection();
+        let resize_meta = self
+            .projects
+            .current()
+            .undo
+            .peek_undo()
+            .and_then(|c| c.as_any().downcast_ref::<crate::core::undo::ResizeCanvasCommand>())
+            .map(crate::core::undo::ResizeCanvasCommand::before_meta);
         let undone = {
             let project = self.projects.current_mut();
             let mut ctx = CommandContext {
@@ -9185,6 +9353,17 @@ impl App {
             project.undo.undo(&mut ctx)
         };
         if undone {
+            if let Some((tile_size, animations)) = resize_meta {
+                {
+                    let project = self.projects.current_mut();
+                    project.tile_size = tile_size;
+                    project.animations = animations;
+                }
+                self.invalidate_host_project_cache();
+                self.sync_anim_delays();
+                self.texture_dirty = true;
+                self.canvas_cache_token = None;
+            }
             self.projects.current_mut().mark_dirty();
             self.show_status_toast("Undo");
         }
@@ -9192,6 +9371,13 @@ impl App {
 
     fn redo_document(&mut self) {
         self.clear_selection();
+        let resize_meta = self
+            .projects
+            .current()
+            .undo
+            .peek_redo()
+            .and_then(|c| c.as_any().downcast_ref::<crate::core::undo::ResizeCanvasCommand>())
+            .map(crate::core::undo::ResizeCanvasCommand::after_meta);
         let redone = {
             let project = self.projects.current_mut();
             let mut ctx = CommandContext {
@@ -9201,6 +9387,17 @@ impl App {
             project.undo.redo(&mut ctx)
         };
         if redone {
+            if let Some((tile_size, animations)) = resize_meta {
+                {
+                    let project = self.projects.current_mut();
+                    project.tile_size = tile_size;
+                    project.animations = animations;
+                }
+                self.invalidate_host_project_cache();
+                self.sync_anim_delays();
+                self.texture_dirty = true;
+                self.canvas_cache_token = None;
+            }
             self.projects.current_mut().mark_dirty();
             self.show_status_toast("Redo");
         }
@@ -11449,6 +11646,14 @@ impl App {
                     self.pending_pyxel_import = None;
                     let _ = self.panel_dock.remove_spec(panel_id);
                 }
+                dock_import_pyxel_panel::ImportPyxelEvent::Back => {
+                    self.pending_pyxel_import = None;
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportPyxel,
+                        self.default_save_location(),
+                    );
+                }
                 dock_import_pyxel_panel::ImportPyxelEvent::Import => {
                     if let Some((_path, imported)) = self.pending_pyxel_import.take() {
                         let project =
@@ -11576,14 +11781,21 @@ impl App {
         } else {
             Vec::new()
         };
-        self.img2pixel_host.borrow_mut().seed(
-            name,
-            w,
-            h,
-            img.into_raw(),
-            project_palette,
-            has_active,
-        );
+        {
+            let mut host = self.img2pixel_host.borrow_mut();
+            if host.previous_preset.is_none() && !cfg!(test) {
+                host.previous_preset = crate::io::user_img2pixel_last_preset_path()
+                    .and_then(|p| crate::io::load_img2pixel_last_preset(&p));
+            }
+            host.seed(
+                name,
+                w,
+                h,
+                img.into_raw(),
+                project_palette,
+                has_active,
+            );
+        }
         let panel_id = panel_dock::PanelId::new(dock_img2pixel_panel::IMPORT_IMG2PIXEL_PANEL_ID);
         if self.panel_dock.placement(panel_id).is_some() {
             self.panel_dock.raise_floating(panel_id);
@@ -11602,6 +11814,16 @@ impl App {
         }
     }
 
+    fn remember_img2pixel_last_preset(&self) {
+        let params = self.img2pixel_host.borrow().params.clone();
+        self.img2pixel_host.borrow_mut().previous_preset = Some(params.clone());
+        if !cfg!(test) {
+            if let Some(path) = crate::io::user_img2pixel_last_preset_path() {
+                let _ = crate::io::save_img2pixel_last_preset(&params, &path);
+            }
+        }
+    }
+
     fn drain_img2pixel_events(&mut self) {
         let events = self.img2pixel_host.borrow_mut().take_events();
         if events.is_empty() {
@@ -11611,9 +11833,19 @@ impl App {
         for event in events {
             match event {
                 dock_img2pixel_panel::Img2PixelEvent::Cancel => {
+                    self.remember_img2pixel_last_preset();
                     let _ = self.panel_dock.remove_spec(panel_id);
                 }
+                dock_img2pixel_panel::Img2PixelEvent::Back => {
+                    self.remember_img2pixel_last_preset();
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportImage2Pixel,
+                        self.default_save_location(),
+                    );
+                }
                 dock_img2pixel_panel::Img2PixelEvent::SavePreset => {
+                    self.remember_img2pixel_last_preset();
                     self.open_save_as_panel(
                         dock_save_as_panel::SaveAsKind::Img2PixelPreset,
                         None,
@@ -11627,11 +11859,17 @@ impl App {
                     );
                 }
                 dock_img2pixel_panel::Img2PixelEvent::ImportAsNewDocument { name, output } => {
+                    self.remember_img2pixel_last_preset();
                     let w = output.width.max(1) as usize;
                     let h = output.height.max(1) as usize;
                     let project = self.new_project(name.clone(), w, h);
                     if let Some(session) = self.projects.session_mut(project) {
-                        session.tile_size = TileSize::new(output.width.max(1), output.height.max(1));
+                        let tile = TileSize::new(output.width.max(1), output.height.max(1));
+                        session.tile_size = tile;
+                        let (animations, animation) =
+                            project::default_animation_set_for_canvas(w, h, tile);
+                        session.animations = animations;
+                        session.animation = animation;
                         let rect = Rect2i::new(0, 0, w as i32, h as i32);
                         session
                             .layers
@@ -11656,6 +11894,7 @@ impl App {
                             }
                         }
                     }
+                    self.sync_anim_delays();
                     self.texture_dirty = true;
                     self.canvas_cache_token = None;
                     self.update_title();
@@ -11663,6 +11902,7 @@ impl App {
                     let _ = self.panel_dock.remove_spec(panel_id);
                 }
                 dock_img2pixel_panel::Img2PixelEvent::ImportToActiveLayer { output } => {
+                    self.remember_img2pixel_last_preset();
                     if self.projects.active_id().is_some() {
                         if let Some(region) = ClipboardRegion::try_new(
                             output.width as usize,
@@ -11773,6 +12013,14 @@ impl App {
                 dock_import_aseprite_panel::ImportAsepriteEvent::Cancel => {
                     self.pending_aseprite_import = None;
                     let _ = self.panel_dock.remove_spec(panel_id);
+                }
+                dock_import_aseprite_panel::ImportAsepriteEvent::Back => {
+                    self.pending_aseprite_import = None;
+                    let _ = self.panel_dock.remove_spec(panel_id);
+                    self.open_file_chooser(
+                        dock_file_chooser_panel::FileChooserMode::ImportAseprite,
+                        self.default_save_location(),
+                    );
                 }
                 dock_import_aseprite_panel::ImportAsepriteEvent::Import(mode) => {
                     if let Some((path, parsed)) = self.pending_aseprite_import.take() {
@@ -12300,6 +12548,8 @@ impl App {
                 _ => None,
             };
             self.canvas_widget.set_text_caret(text_caret);
+            self.canvas_widget
+                .set_frame_regions(self.active_frame_regions());
             self.canvas_widget.set_overlay(self.current_overlay());
             let interactions = self.canvas_widget.ui(
                 ui,
@@ -12340,6 +12590,28 @@ impl App {
             };
             if let Some(cursor) = transform_cursor {
                 self.ctx.output_mut(|o| o.cursor_icon = cursor);
+            } else {
+                let space_held = !self.ctx.text_edit_focused()
+                    && self.ctx.input(|i| i.key_down(egui::Key::Space));
+                let pointer_pos = self.ctx.input(|i| i.pointer.hover_pos());
+                let in_workspace_canvas = self.input_capture.is_target(SurfaceId::Canvas)
+                    && !self.panel_dock.is_interacting()
+                    && pointer_pos.is_some_and(|p| {
+                        p.y >= top_bar::TOP_BAR_HEIGHT
+                            && body_rect.contains(p)
+                            && !self.panel_dock.contains_panel_or_chrome(p, body_rect)
+                            && self
+                                .ctx
+                                .layer_id_at(p)
+                                .is_none_or(|l| l.order == egui::Order::Background)
+                    });
+                if in_workspace_canvas && !space_held {
+                    self.ctx
+                        .output_mut(|o| o.cursor_icon = egui::CursorIcon::None);
+                    if let Some(p) = pointer_pos {
+                        paint_workspace_crosshair(&self.ctx, p, &self.theme.current().colors);
+                    }
+                }
             }
             self.projects.current_mut().camera = interactions.updated_camera;
             let interactions = self.update_tool_gesture(ui.ctx(), interactions);
@@ -12355,6 +12627,13 @@ impl App {
             );
             if !frame_edit_is_target {
                 self.handle_interactions_in(ui.ctx(), interactions);
+            }
+            if self.projects.current().tool_state.tool() == Tool::Tile
+                && (self.tile_placer.is_active() || self.tile_rect_anchor.is_some())
+            {
+                let cam = self.projects.current().camera;
+                self.tile_placer_preview = self.tile_placer_preview_at(ui.ctx(), cam, canvas_size);
+                self.ctx.request_repaint();
             }
         }
         let preview_image = has_active_project
@@ -12699,10 +12978,9 @@ impl App {
             return true;
         }
         if matches!(
-            self.canvas_widget.overlay(),
+            self.canvas_widget.overlay_ref(),
             CanvasOverlay::Ants(_)
                 | CanvasOverlay::AntsMask(_)
-                | CanvasOverlay::FrameRegions(_)
                 | CanvasOverlay::RegionCells { .. }
         ) {
             return true;
@@ -12721,6 +12999,41 @@ fn rect_from_points(a: (i32, i32), b: (i32, i32)) -> Rect2i {
     let w = (a.0 - b.0).abs() + 1;
     let h = (a.1 - b.1).abs() + 1;
     Rect2i::new(x, y, w, h)
+}
+
+/// Paints a thin, subtle yet visible crosshair at the pointer position when
+/// the OS cursor is hidden over the workspace canvas.
+fn paint_workspace_crosshair(
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+    theme: &crate::ui::theme::ThemeColors,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("workspace_crosshair"),
+    ));
+    let cx = pos.x.floor() + 0.5;
+    let cy = pos.y.floor() + 0.5;
+    let inner = 2.0_f32;
+    let outer = 7.0_f32;
+
+    let dark = theme.marching_ants_contrast_dark32().gamma_multiply(0.45);
+    let light = theme.marching_ants32().gamma_multiply(0.65);
+
+    let arms = [
+        [egui::pos2(cx - outer, cy), egui::pos2(cx - inner, cy)],
+        [egui::pos2(cx + inner, cy), egui::pos2(cx + outer, cy)],
+        [egui::pos2(cx, cy - outer), egui::pos2(cx, cy - inner)],
+        [egui::pos2(cx, cy + inner), egui::pos2(cx, cy + outer)],
+    ];
+    let halo_stroke = egui::Stroke::new(2.0, dark);
+    let line_stroke = egui::Stroke::new(1.0, light);
+    for seg in arms {
+        painter.line_segment(seg, halo_stroke);
+    }
+    for seg in arms {
+        painter.line_segment(seg, line_stroke);
+    }
 }
 
 /// Collect the per-layer pixel deltas `(layer, region, before, after)` of a
@@ -34835,5 +35148,339 @@ mod tests {
             .as_bytes()
             .chunks_exact(4)
             .any(|px| px == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn tile_drag_interpolates_cells_without_gaps() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        let ts = TileSize::square(16);
+        app.projects.current_mut().tile_size = ts;
+        let tile = crate::core::tilemap::Tile {
+            id: crate::core::tilemap::TileId(1),
+            w: 16,
+            h: 16,
+            pixels: vec![255; 16 * 16 * 4],
+        };
+        let id = app.projects.current_mut().tile_palette.add(tile);
+        app.projects.current_mut().tile_palette.select(id);
+        app.projects
+            .current_mut()
+            .tool_state
+            .select_tool(Tool::Tile);
+
+        // Start at cell (0, 0) and jump straight to cell (4, 0) in one drag step.
+        app.handle_tile_placer_interactions(CanvasInteractions {
+            stroke_started: true,
+            stroke_point: Some((4, 4)),
+            ..Default::default()
+        });
+        app.handle_tile_placer_interactions(CanvasInteractions {
+            stroke_point: Some((68, 4)),
+            ..Default::default()
+        });
+        app.handle_tile_placer_interactions(CanvasInteractions {
+            stroke_ended: true,
+            ..Default::default()
+        });
+
+        let tm = app
+            .projects
+            .current()
+            .layers
+            .active_layer()
+            .tilemap
+            .as_ref()
+            .expect("tilemap created");
+        for cx in 0..=4 {
+            assert!(
+                tm.cell((cx, 0)).is_some(),
+                "interpolated tile drag must fill cell ({cx}, 0) without gaps"
+            );
+        }
+    }
+
+    #[test]
+    fn img2pixel_import_as_new_document_is_single_piece_not_16x16_4frame() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        let output = crate::core::img2pixel::Img2PixelOutput {
+            width: 64,
+            height: 48,
+            rgba: vec![255; 64 * 48 * 4],
+            extracted_palette: None,
+        };
+        app.img2pixel_host
+            .borrow_mut()
+            .events
+            .push(dock_img2pixel_panel::Img2PixelEvent::ImportAsNewDocument {
+                name: "SinglePiece".to_string(),
+                output,
+            });
+        app.drain_img2pixel_events();
+
+        let session = app.projects.current();
+        assert_eq!(session.tile_size, TileSize::new(64, 48));
+        assert_eq!(
+            session.sequence().len(),
+            1,
+            "single-piece Img2Pixel import must have 1 full-canvas frame, not 4 16x16 frames"
+        );
+        assert_eq!(
+            session.sequence().frame(0).unwrap().region().rect(),
+            Rect2i::new(0, 0, 64, 48)
+        );
+    }
+
+    #[test]
+    fn resize_counts_keeps_regions_and_pixels_bound_at_whole_region_offset() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        // Start with 2x2 regions of 16x16 (32x32 canvas), mark pixel (2, 2) in cell (0, 0).
+        app.projects.current_mut().tile_size = TileSize::square(16);
+        app.apply_resize_counts(2, 2, crate::core::canvas_resize::Pivot::TopLeft);
+        app.projects
+            .current_mut()
+            .layers
+            .active_layer_mut()
+            .buffer
+            .set_pixel(2, 2, Color::rgba(255, 0, 0, 255));
+        let orig_frame = app.projects.current().sequence().frame(0).unwrap().region().rect();
+        assert_eq!(orig_frame, Rect2i::new(0, 0, 16, 16));
+
+        // Grow 2x2 -> 4x4 with Center pivot: cell offset is (+1, +1) -> pixel offset (+16, +16).
+        app.apply_resize_counts(4, 4, crate::core::canvas_resize::Pivot::Center);
+        let session = app.projects.current();
+        assert_eq!(
+            session.sequence().frame(0).unwrap().region().rect(),
+            Rect2i::new(16, 16, 16, 16),
+            "frame region must shift with its pixels by whole-region offset"
+        );
+        assert_eq!(
+            session.layers.active_layer().buffer.get_pixel(18, 18),
+            Some(Color::rgba(255, 0, 0, 255)),
+            "pixel inside region must remain at the same local offset (2, 2) inside the shifted region"
+        );
+    }
+
+    #[test]
+    fn fill_and_wand_contiguous_xor_inverts_with_alt() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+
+        // Both default to contiguous = true.
+        assert!(app.projects.current().tool_state.fill().contiguous);
+        assert!(app.projects.current().tool_state.wand().contiguous);
+
+        // User unchecks both via panel events -> stored becomes false.
+        app.apply_toolbar_events(vec![
+            ToolbarEvent::FillContiguousChanged(false),
+            ToolbarEvent::WandContiguousChanged(false),
+        ]);
+        assert!(!app.projects.current().tool_state.fill().contiguous);
+        assert!(!app.projects.current().tool_state.wand().contiguous);
+
+        // With Alt held while stored == false, effective contiguous must invert to true!
+        app.ctx.input_mut(|input| {
+            input.modifiers = egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            };
+        });
+        app.write_dock_snapshots();
+        let view = app.toolbox_host.view.borrow().clone();
+        assert!(view.fill_contiguous_effective);
+        assert!(view.wand_contiguous_effective);
+
+        // Releasing Alt restores effective contiguous back to stored (false).
+        app.ctx.input_mut(|input| {
+            input.modifiers = egui::Modifiers::NONE;
+        });
+        app.write_dock_snapshots();
+        let view = app.toolbox_host.view.borrow().clone();
+        assert!(!view.fill_contiguous_effective);
+        assert!(!view.wand_contiguous_effective);
+    }
+
+    #[test]
+    fn import_panels_back_event_reopens_file_chooser() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        app.import_image_host
+            .events
+            .borrow_mut()
+            .push(dock_import_image_panel::ImportImageEvent::Back);
+        app.drain_import_image_events();
+        let chooser_id = panel_dock::PanelId::new(dock_file_chooser_panel::FILE_CHOOSER_PANEL_ID);
+        assert!(
+            app.panel_dock.placement(chooser_id).is_some(),
+            "Back on Import Image must reopen the File Chooser"
+        );
+    }
+
+    #[test]
+    fn animation_borders_stay_visible_in_parallel_with_selection() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        // Default 128x128 canvas has 4 16x16 frames in active animation.
+        assert!(!app.active_frame_regions().is_empty());
+
+        // Select an area on the canvas -> current_overlay becomes AntsMask,
+        // AND active_frame_regions() stays non-empty so CanvasWidget paints both!
+        let sel = Selection::capture(
+            &app.projects.current().layers.active_layer().buffer,
+            Rect2i::new(8, 8, 24, 24),
+        )
+        .unwrap();
+        app.projects.current_mut().selection = Some(sel);
+        assert!(matches!(app.current_overlay(), CanvasOverlay::AntsMask(_)));
+        assert_eq!(app.active_frame_regions().len(), 4);
+    }
+
+    #[test]
+    fn resize_canvas_is_undoable_and_redoable() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        let orig_w = app.projects.current().layers.width();
+        let orig_h = app.projects.current().layers.height();
+        let orig_ts = app.projects.current().tile_size;
+
+        app.resize_canvas_host
+            .events
+            .borrow_mut()
+            .push(dock_resize_canvas_panel::ResizeCanvasEvent::ResizeRegions {
+                w: 32,
+                h: 32,
+                pivot: crate::core::canvas_resize::Pivot::Center,
+                resample: false,
+            });
+        app.drain_resize_canvas_events();
+        let resized_w = app.projects.current().layers.width();
+        let resized_h = app.projects.current().layers.height();
+        assert_eq!(app.projects.current().tile_size, TileSize::square(32));
+        assert_ne!((resized_w, resized_h), (orig_w, orig_h));
+
+        app.undo_document();
+        assert_eq!(app.projects.current().layers.width(), orig_w);
+        assert_eq!(app.projects.current().layers.height(), orig_h);
+        assert_eq!(app.projects.current().tile_size, orig_ts);
+
+        app.redo_document();
+        assert_eq!(app.projects.current().layers.width(), resized_w);
+        assert_eq!(app.projects.current().layers.height(), resized_h);
+        assert_eq!(app.projects.current().tile_size, TileSize::square(32));
+    }
+
+    #[test]
+    fn img2pixel_apply_loaded_preset_respects_aspect_lock_from_width() {
+        let mut host = dock_img2pixel_panel::Img2PixelHost::default();
+        // Current source image is 200x100 (2:1 aspect ratio).
+        host.seed("Wide".into(), 200, 100, vec![255; 200 * 100 * 4], vec![], false);
+
+        // Preset had target 64x64 with lock_aspect = true -> height must scale to 32.
+        let mut locked = crate::core::img2pixel::Img2PixelParams::default();
+        locked.target_width = 64;
+        locked.target_height = 64;
+        locked.lock_aspect = true;
+        host.apply_loaded_preset(locked);
+        assert_eq!(host.params.target_width, 64);
+        assert_eq!(host.params.target_height, 32);
+
+        // Preset with lock_aspect = false keeps both width and height verbatim.
+        let mut unlocked = crate::core::img2pixel::Img2PixelParams::default();
+        unlocked.target_width = 64;
+        unlocked.target_height = 64;
+        unlocked.lock_aspect = false;
+        host.apply_loaded_preset(unlocked);
+        assert_eq!(host.params.target_width, 64);
+        assert_eq!(host.params.target_height, 64);
+    }
+
+    #[test]
+    fn tile_tool_tab_toggles_tile_indices_visibility() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_canvas(&ctx);
+        app.ctx = ctx.clone();
+        let ts = TileSize::square(16);
+        app.projects.current_mut().tile_size = ts;
+        let tile = crate::core::tilemap::Tile {
+            id: crate::core::tilemap::TileId(1),
+            w: 16,
+            h: 16,
+            pixels: vec![255; 16 * 16 * 4],
+        };
+        let id = app.projects.current_mut().tile_palette.add(tile);
+        app.projects.current_mut().tile_palette.select(id);
+        app.projects.current_mut().tool_state.select_tool(Tool::Tile);
+        app.handle_tile_placer_interactions(CanvasInteractions {
+            clicked: Some((4, 4)),
+            ..Default::default()
+        });
+
+        let cam = app.projects.current().camera;
+        let sz = (128, 128);
+        assert!(
+            !app.tile_placer_preview_at(&ctx, cam, sz).indices.is_empty(),
+            "tile indices are visible by default"
+        );
+
+        // Press Tab -> hides tile indices.
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+        app.tick_tile_placer_transform();
+        assert!(!app.show_tile_indices);
+        assert!(app.tile_placer_preview_at(&ctx, cam, sz).indices.is_empty());
+
+        // Press Tab again -> restores tile indices.
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+        app.tick_tile_placer_transform();
+        assert!(app.show_tile_indices);
+        assert!(!app.tile_placer_preview_at(&ctx, cam, sz).indices.is_empty());
+    }
+
+    #[test]
+    fn all_blend_modes_composite_without_panic() {
+        let mut dst = PixelBuffer::new(2, 2);
+        let mut src = PixelBuffer::new(2, 2);
+        dst.set_pixel(0, 0, Color::rgba(180, 90, 40, 255));
+        src.set_pixel(0, 0, Color::rgba(60, 200, 150, 200));
+        for &mode in &crate::core::model::BlendMode::ALL {
+            let mut out = dst.clone();
+            crate::core::model::composite_over(&mut out, &src, 0.8, mode);
+            let px = out.get_pixel(0, 0).unwrap();
+            assert_eq!(px.a, 255, "opaque backdrop stays opaque for {mode:?}");
+        }
     }
 }

@@ -175,6 +175,26 @@ impl DockManager {
         None
     }
 
+    /// Returns `true` when `point` lies on any floating panel (including its
+    /// 4 px outer resize border) or anywhere inside a non-empty docked panel
+    /// strip (including splitters, gaps and resize handles).
+    pub fn contains_panel_or_chrome(&self, point: Pos2, viewport: Rect) -> bool {
+        for id in self.floating_order().iter().rev() {
+            if self
+                .floating_rect(*id)
+                .is_some_and(|rect| rect.expand(4.0).contains(point))
+            {
+                return true;
+            }
+        }
+        for side in [DockSide::Left, DockSide::Right, DockSide::Bottom] {
+            if self.dock_extent(side) > 0.0 && self.dock_rect(side, viewport).contains(point) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Raises the most recently used floating panel. egui lifts marked layers
     /// above unmarked ones while preserving their relative order, so ONLY the
     /// single topmost panel (`floating_order().last()`) is moved to top each

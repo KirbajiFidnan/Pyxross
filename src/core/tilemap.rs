@@ -235,6 +235,42 @@ impl TilePalette {
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }
+
+    /// Resizes every stored tile's pixel buffer to `new_tile` using the same
+    /// pivot and resample settings as a region-size canvas resize, keeping
+    /// tilemap rasterization synced with the new region dimensions.
+    pub fn resize_tiles(
+        &mut self,
+        new_tile: TileSize,
+        pivot: crate::core::canvas_resize::Pivot,
+        resample: bool,
+    ) {
+        let new_w = new_tile.w.max(1);
+        let new_h = new_tile.h.max(1);
+        let mut changed = false;
+        for tile in &mut self.tiles {
+            let old_w = u32::from(tile.w);
+            let old_h = u32::from(tile.h);
+            if old_w == new_w && old_h == new_h {
+                continue;
+            }
+            tile.pixels = crate::core::canvas_resize::resize_pixels(
+                &tile.pixels,
+                old_w,
+                old_h,
+                new_w,
+                new_h,
+                pivot,
+                resample,
+            );
+            tile.w = new_w.min(u32::from(u16::MAX)) as u16;
+            tile.h = new_h.min(u32::from(u16::MAX)) as u16;
+            changed = true;
+        }
+        if changed {
+            self.change_epoch = self.change_epoch.wrapping_add(1);
+        }
+    }
 }
 
 /// One occupied grid cell: a palette reference plus a per-cell transform.
@@ -330,16 +366,33 @@ impl TileMap {
     /// different `tile_size`, or before a canvas resize) never silently drops
     /// stamps outside its old bounds — a click there must still place a tile.
     pub fn resize(&mut self, cols: u32, rows: u32) {
+        self.resize_with_offset(cols, rows, (0, 0));
+    }
+
+    /// Grows (or shrinks) the map to `cols × rows` cells, shifting existing
+    /// cells by `offset = (ox, oy)` in cell space so tilemap placements stay
+    /// locked to their pixels and regions during a pivoted canvas resize.
+    pub fn resize_with_offset(&mut self, cols: u32, rows: u32, offset: (i32, i32)) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        if self.cols == cols && self.rows == rows {
+        if self.cols == cols && self.rows == rows && offset == (0, 0) {
             return;
         }
         let mut cells = vec![None; (cols as usize).checked_mul(rows as usize).unwrap_or(0)];
-        for y in 0..self.rows.min(rows) {
-            for x in 0..self.cols.min(cols) {
+        let cols_i = i64::from(cols);
+        let rows_i = i64::from(rows);
+        for y in 0..self.rows {
+            let dy = i64::from(y) + i64::from(offset.1);
+            if dy < 0 || dy >= rows_i {
+                continue;
+            }
+            for x in 0..self.cols {
+                let dx = i64::from(x) + i64::from(offset.0);
+                if dx < 0 || dx >= cols_i {
+                    continue;
+                }
                 let old = (y as usize) * (self.cols as usize) + (x as usize);
-                let new = (y as usize) * (cols as usize) + (x as usize);
+                let new = (dy as usize) * (cols as usize) + (dx as usize);
                 cells[new] = self.cells[old];
             }
         }

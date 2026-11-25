@@ -8,8 +8,8 @@ use crate::core::math::Rect2i;
 use crate::core::tilemap::TileSize;
 use crate::render::gizmo::GizmoHit;
 use crate::render::overlay::{
-    ant_segments, ant_stroke_color, ant_under_stroke_color, mask_polylines,
-    pixel_ant_edges_from_polylines, BoundarySegment, OnionGhost, PIXEL_ANT_SUBDIV,
+    ant_segments, ant_stroke_color, ant_under_stroke_color, mask_polylines, BoundarySegment,
+    OnionGhost,
 };
 use crate::ui::input_capture::{ctrl_wheel, shift_wheel, InputCapture, SurfaceId};
 use crate::ui::theme::ThemeColors;
@@ -27,24 +27,6 @@ const ZOOM_PER_NOTCH: f32 = 1.15;
 
 /// Tile-grid lines closer than this many points are suppressed.
 const MIN_TILE_LINE_SPACING: f32 = 4.0;
-
-/// Alpha applied to the theme's `frame_region_ant` token so the animated
-/// frame-region dashes read as a clearly VISIBLE yellow line.
-///
-/// Deliberately higher than the selection ants'
-/// [`crate::render::overlay::ANT_STROKE_ALPHA`] = 120: at the shared 47% alpha
-/// the yellow dashes blended with the bordeaux under-baseline into grey, so the
-/// frame borders were barely legible against the artwork. This token keeps its
-/// RGB channels from the theme (no hard-coded chrome colour) and only raises
-/// the alpha.
-const FRAME_REGION_ANT_STROKE_ALPHA: u8 = 220;
-
-/// Speed scale for the frame-region marching ants: the phase input fed to
-/// [`pixel_ant_edges_from_polylines`] is `time_ms * 0.5`, so the pattern
-/// marches HALF as fast as the selection ants. The global
-/// [`crate::render::overlay::ANT_SPEED_PX_PER_MS`] is left untouched — only
-/// the frame-region dashes are slowed down.
-const FRAME_REGION_ANT_SPEED_SCALE: f32 = 0.5;
 
 /// Per-frame interactions reported by [`CanvasWidget::ui`].
 ///
@@ -440,6 +422,9 @@ pub struct CanvasWidget {
     pan_remainder: egui::Vec2,
     /// Optional canvas-space caret line `(top, bottom)` during Text Transform.
     text_caret: Option<((f32, f32), (f32, f32))>,
+    /// Persistent active-animation frame regions painted in parallel even while
+    /// a selection or gesture overlay is active.
+    frame_regions_overlay: Vec<Rect2i>,
 }
 
 /// GG: order-independent union of two [`egui::Modifiers`] snapshots.
@@ -477,6 +462,7 @@ impl CanvasWidget {
             sand_bg_texture: None,
             pan_remainder: egui::Vec2::ZERO,
             text_caret: None,
+            frame_regions_overlay: Vec::new(),
         }
     }
 
@@ -626,6 +612,18 @@ impl CanvasWidget {
     /// The currently assigned canvas overlay.
     pub fn overlay(&self) -> CanvasOverlay {
         self.overlay.clone()
+    }
+
+    /// Borrowed reference to the currently assigned canvas overlay (avoids
+    /// cloning large `AntsMask` segment vectors during per-frame checks).
+    pub fn overlay_ref(&self) -> &CanvasOverlay {
+        &self.overlay
+    }
+
+    /// Sets the active animation's frame regions to paint in parallel with
+    /// selection / gesture overlays.
+    pub fn set_frame_regions(&mut self, regions: Vec<Rect2i>) {
+        self.frame_regions_overlay = regions;
     }
 
     /// The gizmo handle under the pointer, computed on the last frame.
@@ -1006,6 +1004,26 @@ impl CanvasWidget {
         // Mask-shaped marching ants: the boundary unit segments of a
         // non-rectangular selection, dashed by the same slow, low-contrast
         // phase.
+        // Persistent active-animation borders rendered in parallel with
+        // selections / gestures (skipped when AnimationPlacer or explicit
+        // FrameRegions overlay already draws them).
+        if !self.frame_regions_overlay.is_empty()
+            && !matches!(
+                self.overlay,
+                CanvasOverlay::FrameRegions(_) | CanvasOverlay::AnimationPlacer { .. }
+            )
+        {
+            paint_frame_regions(
+                &painter,
+                theme,
+                self.last_origin,
+                scale,
+                pan,
+                &self.frame_regions_overlay,
+                0,
+            );
+        }
+
         if let CanvasOverlay::AntsMask(_) = &self.overlay {
             let time_ms = (ui.input(|i| i.time) * 1000.0) as u64;
             paint_ants_mask(
@@ -2350,38 +2368,105 @@ fn paint_ants_mask(
     polylines: &[Vec<(f32, f32)>],
     time_ms: u64,
 ) {
-    let subdiv = PIXEL_ANT_SUBDIV as f32;
-    // `x`/`y` are SUB-UNIT coordinates: convert back to document pixels first.
     let to_screen = |x: f32, y: f32| {
         egui::pos2(
-            origin.x + pan.0 as f32 + (x / subdiv) * scale,
-            origin.y + pan.1 as f32 + (y / subdiv) * scale,
+            origin.x + pan.0 as f32 + x * scale,
+            origin.y + pan.1 as f32 + y * scale,
         )
     };
     let dark_under = theme.marching_ants_contrast_dark32();
     let bright_ant = crate::ui::theme::SKIN_TINT;
-    let edges = pixel_ant_edges_from_polylines(polylines, time_ms);
-    for edge in &edges {
-        painter.line_segment(
-            [
-                to_screen(edge.start.0 as f32, edge.start.1 as f32),
-                to_screen(edge.end.0 as f32, edge.end.1 as f32),
-            ],
-            egui::Stroke::new(2.0, dark_under),
-        );
-    }
-    for edge in edges {
-        // ON runs are bright white dashes over the dark backing stroke.
-        if !edge.on {
+    let dark_stroke = egui::Stroke::new(2.0, dark_under);
+    let bright_stroke = egui::Stroke::new(1.5, bright_ant);
+
+    // Draw the dark backing stroke as one closed polyline per loop instead of
+    // thousands of individual sub-pixel line segments.
+    for path in polylines {
+        if path.len() < 2 {
             continue;
         }
-        painter.line_segment(
-            [
-                to_screen(edge.start.0 as f32, edge.start.1 as f32),
-                to_screen(edge.end.0 as f32, edge.end.1 as f32),
-            ],
-            egui::Stroke::new(1.5, bright_ant),
-        );
+        let pts: Vec<egui::Pos2> = path.iter().map(|&(x, y)| to_screen(x, y)).collect();
+        painter.add(egui::Shape::closed_line(pts, dark_stroke));
+    }
+
+    // Screen-space marching-ant dashes: use 0.5 doc-px dashes when zoomed in
+    // (matching the sub-unit look) and clamp to at least 4 screen px when
+    // zoomed out so large selections emit O(visible_perimeter / 8px) segments
+    // instead of tens of thousands of sub-pixel segments.
+    let dash_len = (0.5 * scale).max(4.0);
+    let period = dash_len * 2.0;
+    let speed_px_per_ms = (crate::render::overlay::ANT_SPEED_PX_PER_MS * scale).max(0.015);
+    let phase = ((time_ms as f64 * f64::from(speed_px_per_ms)) % f64::from(period)) as f32;
+    let clip = painter.clip_rect().expand(4.0);
+
+    for path in polylines {
+        let n = path.len();
+        if n < 2 {
+            continue;
+        }
+        let mut dist = 0.0_f32;
+        for i in 0..n {
+            let a = to_screen(path[i].0, path[i].1);
+            let b = to_screen(path[(i + 1) % n].0, path[(i + 1) % n].1);
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let edge_len = dx.hypot(dy);
+            if edge_len <= 1e-4 {
+                continue;
+            }
+            // Fast AABB rejection against the visible viewport.
+            let min_x = a.x.min(b.x);
+            let max_x = a.x.max(b.x);
+            let min_y = a.y.min(b.y);
+            let max_y = a.y.max(b.y);
+            if max_x < clip.min.x
+                || min_x > clip.max.x
+                || max_y < clip.min.y
+                || min_y > clip.max.y
+            {
+                dist += edge_len;
+                continue;
+            }
+            let ux = dx / edge_len;
+            let uy = dy / edge_len;
+
+            // Clip the parameter range t in [0, edge_len] to the clip rect so
+            // huge zoomed-in edges only emit dashes that are actually on screen.
+            let mut t_min = 0.0_f32;
+            let mut t_max = edge_len;
+            if dx.abs() > 1e-6 {
+                let tx1 = (clip.min.x - a.x) / ux;
+                let tx2 = (clip.max.x - a.x) / ux;
+                t_min = t_min.max(tx1.min(tx2));
+                t_max = t_max.min(tx1.max(tx2));
+            }
+            if dy.abs() > 1e-6 {
+                let ty1 = (clip.min.y - a.y) / uy;
+                let ty2 = (clip.max.y - a.y) / uy;
+                t_min = t_min.max(ty1.min(ty2));
+                t_max = t_max.min(ty1.max(ty2));
+            }
+            if t_min < t_max {
+                // Find the first period cycle overlapping [dist + t_min, dist + t_max].
+                let start_s = dist + t_min;
+                let end_s = dist + t_max;
+                let first_k = ((start_s - phase) / period).floor() as i64;
+                let mut s = first_k as f32 * period + phase;
+                while s < end_s {
+                    let on_start = s.max(start_s);
+                    let on_end = (s + dash_len).min(end_s);
+                    if on_end > on_start {
+                        let t0 = on_start - dist;
+                        let t1 = on_end - dist;
+                        let p0 = egui::pos2(a.x + ux * t0, a.y + uy * t0);
+                        let p1 = egui::pos2(a.x + ux * t1, a.y + uy * t1);
+                        painter.line_segment([p0, p1], bright_stroke);
+                    }
+                    s += period;
+                }
+            }
+            dist += edge_len;
+        }
     }
 }
 
@@ -2394,6 +2479,7 @@ fn paint_ants_mask(
 /// neighbour. Adjacent frames therefore share NO inner edge: only the outer
 /// silhouette of the union is drawn. Overlapping rects emit an edge once
 /// (`sort` + `dedup`). Deterministic; empty input yields an empty vec.
+#[cfg(test)]
 fn frame_region_boundary_segments(regions: &[Rect2i]) -> Vec<BoundarySegment> {
     let covered =
         |x: i32, y: i32| regions.iter().any(|r| !r.is_empty() && r.contains(x, y));
@@ -2455,67 +2541,34 @@ fn paint_frame_regions(
     scale: f32,
     pan: (i32, i32),
     regions: &[Rect2i],
-    time_ms: u64,
+    _time_ms: u64,
 ) {
-    let segs = frame_region_boundary_segments(regions);
-    if segs.is_empty() {
+    let non_empty: Vec<Rect2i> = regions.iter().copied().filter(|r| !r.is_empty()).collect();
+    if non_empty.is_empty() {
         return;
     }
-    let loops = mask_polylines(&segs);
-    let subdiv = PIXEL_ANT_SUBDIV as f32;
-    // `x`/`y` are DOCUMENT pixels here: loops are in doc-px coordinates.
-    let to_screen = |x: f32, y: f32| {
-        egui::pos2(
-            origin.x + pan.0 as f32 + x * scale,
-            origin.y + pan.1 as f32 + y * scale,
-        )
-    };
-    // ... while `x`/`y` are SUB-UNIT coordinates for the dash edges.
-    let to_sub_screen = |x: f32, y: f32| {
-        egui::pos2(
-            origin.x + pan.0 as f32 + (x / subdiv) * scale,
-            origin.y + pan.1 as f32 + (y / subdiv) * scale,
-        )
-    };
-    // Theme-tinted only: the construction keeps the channels on one line
-    // (`color.r, color.g, color.b`) so no hard-coded chrome colour is added.
-    // Solid bordeaux baseline (unchanged: `ant_under_stroke_color` alpha 200).
-    let color = ant_under_stroke_color(theme.frame_region_ant_under_core());
-    let under_color = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
-    // Yellow dashes: the token's RGB at the higher FRAME_REGION alpha so the
-    // moving line stays clearly yellow over the bordeaux baseline.
-    let color = theme.frame_region_ant_core();
-    let a = (u32::from(color.a) * u32::from(FRAME_REGION_ANT_STROKE_ALPHA) / 255) as u8;
-    let ant_color = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, a);
-    // Half-speed march: halve the phase input (ANT_SPEED_PX_PER_MS untouched).
-    let t = (time_ms as f32 * FRAME_REGION_ANT_SPEED_SCALE) as u64;
-    // Solid bordeaux baseline along every outer loop, then yellow dashes.
-    for loop_ in &loops {
-        if loop_.len() < 2 {
-            continue;
-        }
-        for i in 0..loop_.len() {
-            let a = loop_[i];
-            let b = loop_[(i + 1) % loop_.len()];
-            painter.line_segment(
-                [to_screen(a.0, a.1), to_screen(b.0, b.1)],
-                egui::Stroke::new(1.0, under_color),
-            );
-        }
-    }
-    for edge in pixel_ant_edges_from_polylines(&loops, t) {
-        // ON runs are dashes; OFF runs are gaps, so the border reads as small
-        // alternating sub-pixel segments rather than a continuous line.
-        if !edge.on {
-            continue;
-        }
-        painter.line_segment(
-            [
-                to_sub_screen(edge.start.0 as f32, edge.start.1 as f32),
-                to_sub_screen(edge.end.0 as f32, edge.end.1 as f32),
-            ],
-            egui::Stroke::new(1.0, ant_color),
+    let to_screen_rect = |r: Rect2i| {
+        let min = egui::pos2(
+            origin.x + pan.0 as f32 + r.x as f32 * scale,
+            origin.y + pan.1 as f32 + r.y as f32 * scale,
         );
+        let max = egui::pos2(
+            origin.x + pan.0 as f32 + r.right() as f32 * scale,
+            origin.y + pan.1 as f32 + r.bottom() as f32 * scale,
+        );
+        egui::Rect::from_min_max(min, max)
+    };
+    let (red, green, grey) = animation_placer_colors(theme);
+    let first = non_empty[0];
+    let last = non_empty[non_empty.len() - 1];
+    let area = non_empty.iter().copied().fold(first, |acc, r| acc.union(r));
+
+    // Clean, static grey border around the whole animation area, then red on
+    // the first frame and green on the last frame for immediate showcase clarity.
+    paint_live_outline(painter, to_screen_rect(area), grey);
+    paint_live_outline(painter, to_screen_rect(first), red);
+    if non_empty.len() > 1 {
+        paint_live_outline(painter, to_screen_rect(last), green);
     }
 }
 
@@ -2933,17 +2986,29 @@ mod tests {
     }
 
     fn ant_line_points(shapes: &[egui::Shape], color: egui::Color32) -> Vec<[egui::Pos2; 2]> {
-        shapes
-            .iter()
-            .filter_map(|shape| match shape {
+        let mut out = Vec::new();
+        for shape in shapes {
+            match shape {
                 egui::Shape::LineSegment { points, stroke }
                     if stroke.color == color && (1.0..=2.0).contains(&stroke.width) =>
                 {
-                    Some(*points)
+                    out.push(*points);
                 }
-                _ => None,
-            })
-            .collect()
+                egui::Shape::Path(path)
+                    if path.stroke.color == egui::epaint::ColorMode::Solid(color)
+                        && (1.0..=2.0).contains(&path.stroke.width)
+                        && path.points.len() >= 2 =>
+                {
+                    let n = path.points.len();
+                    let edges = if path.closed { n } else { n - 1 };
+                    for i in 0..edges {
+                        out.push([path.points[i], path.points[(i + 1) % n]]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     fn wheel(delta_y: f32, modifiers: egui::Modifiers) -> egui::Event {
@@ -5519,28 +5584,17 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         let on_lines = ant_line_points(&shapes, on_color);
         let under_lines = ant_line_points(&shapes, dark_under);
         assert!(!on_lines.is_empty(), "expected bright ON dashes");
-        assert_eq!(
-            under_lines.len(),
-            12 * PIXEL_ANT_SUBDIV as usize,
-            "all 12 document edges × SUBDIV sub-edges have a dark backing stroke"
+        assert!(
+            !under_lines.is_empty(),
+            "the dark contrast backing polyline must be painted"
         );
 
-        let all: Vec<[egui::Pos2; 2]> = on_lines;
-        let sub_px = 1.0 / PIXEL_ANT_SUBDIV as f32;
-        for [a, b] in &all {
+        for [a, b] in &on_lines {
             let dx = (b.x - a.x).abs();
             let dy = (b.y - a.y).abs();
             assert!(dx < 1e-3 || dy < 1e-3, "edge {a:?}→{b:?} is not axis-aligned");
-            assert!(
-                (dx.max(dy) - sub_px).abs() < 1e-3,
-                "edge {a:?}→{b:?} is not exactly one SUB-UNIT long"
-            );
+            assert!(dx.max(dy) > 0.0, "dash must have positive length");
         }
-        assert_eq!(
-            all.len(),
-            6 * PIXEL_ANT_SUBDIV as usize,
-            "half of the 12 document edges × SUBDIV sub-edges are ON"
-        );
     }
 
     #[test]
@@ -5647,309 +5701,110 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
     }
 
     #[test]
-    fn frame_regions_paint_pixel_ants_in_theme_tokens() {
-        // Given: the FrameRegions overlay for one 4×4 region.
-        // Then: the region border is a bordeaux under-baseline with live-yellow
-        // pixel-perfect (sub-unit) dashes on top, all from the tokens; an empty
-        // region list paints nothing.
+    fn frame_regions_paint_clean_first_last_and_area_borders() {
         let ctx = egui::Context::default();
         let mut widget = CanvasWidget::new();
-        let region = Rect2i::new(2, 2, 4, 4);
-        widget.set_overlay(CanvasOverlay::FrameRegions(vec![region]));
+        let first = Rect2i::new(2, 2, 4, 4);
+        let middle = Rect2i::new(6, 2, 4, 4);
+        let last = Rect2i::new(10, 2, 4, 4);
+        widget.set_overlay(CanvasOverlay::FrameRegions(vec![first, middle, last]));
         let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
 
         let theme = Theme::default_dark().colors;
-        let under = ant_under_stroke_color(theme.frame_region_ant_under_core());
-        let under_color =
-            egui::Color32::from_rgba_unmultiplied(under.r, under.g, under.b, under.a);
-        // The dashes: the token's RGB at the higher FRAME_REGION alpha (the
-        // same construction the paint path uses), NOT `ant_stroke_color`.
-        let base = theme.frame_region_ant_core();
-        let a = (u32::from(base.a) * u32::from(FRAME_REGION_ANT_STROKE_ALPHA) / 255) as u8;
-        let ant_color = egui::Color32::from_rgba_unmultiplied(base.r, base.g, base.b, a);
-        assert_eq!(
-            ant_color.a(),
-            FRAME_REGION_ANT_STROKE_ALPHA,
-            "the frame-region dashes must use the higher FRAME_REGION alpha"
-        );
-        assert_ne!(
-            under_color, ant_color,
-            "the two frame-region tokens must be distinct tones"
-        );
+        let (red, green, grey) = animation_placer_colors(&theme);
+        let rect_outlines_with_color =
+            |shapes: &[egui::Shape], color: egui::Color32| -> Vec<egui::Rect> {
+                shapes
+                    .iter()
+                    .filter_map(|shape| match shape {
+                        egui::Shape::Rect(r)
+                            if r.stroke.color == color && r.fill == egui::Color32::TRANSPARENT =>
+                        {
+                            Some(r.rect)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
 
-        // The full region perimeter is laid down as the solid under-baseline:
-        // `mask_polylines` chains the boundary into doc-px unit segments, so a
-        // 4×4 region is covered by 16 contiguous bordeaux under-segments.
-        let origin = widget.canvas_rect_to_screen(Camera::new(), Rect2i::new(0, 0, 1, 1)).min;
-        let to_screen = |x: f32, y: f32| egui::pos2(origin.x + x, origin.y + y);
-        let under_lines = ant_line_points(&shapes, under_color);
-        assert_eq!(
-            under_lines.len(),
-            16,
-            "a 4×4 region has 16 boundary unit edges → 16 under segments"
-        );
-        for seg in frame_region_boundary_segments(&[region]) {
-            let a = to_screen(seg.0 .0 as f32, seg.0 .1 as f32);
-            let b = to_screen(seg.1 .0 as f32, seg.1 .1 as f32);
-            assert!(
-                under_lines.contains(&[a, b]) || under_lines.contains(&[b, a]),
-                "missing bordeaux under-segment for boundary unit edge {seg:?}"
-            );
-        }
+        let area_rects = rect_outlines_with_color(&shapes, grey);
+        let first_rects = rect_outlines_with_color(&shapes, red);
+        let last_rects = rect_outlines_with_color(&shapes, green);
+        assert_eq!(area_rects.len(), 1, "one clean grey border around whole animation area");
+        assert_eq!(first_rects.len(), 1, "one red border on first frame");
+        assert_eq!(last_rects.len(), 1, "one green border on last frame");
 
-        // Pixel-perfect dashes from the live-yellow token: axis-aligned and
-        // exactly one SUB-UNIT long each (locked to the document grid).
-        let dashes = ant_line_points(&shapes, ant_color);
-        assert!(!dashes.is_empty(), "expected live-yellow frame-region dashes");
-        let sub_px = 1.0 / PIXEL_ANT_SUBDIV as f32;
-        for [a, b] in &dashes {
-            let dx = (b.x - a.x).abs();
-            let dy = (b.y - a.y).abs();
-            assert!(dx < 1e-3 || dy < 1e-3, "dash {a:?}→{b:?} is not axis-aligned");
-            assert!(
-                (dx.max(dy) - sub_px).abs() < 1e-3,
-                "dash {a:?}→{b:?} is not exactly one SUB-UNIT long"
-            );
-        }
-
-        // The under-baseline is painted beneath the dashes.
-        let is_color = |shape: &egui::Shape, color: egui::Color32| {
-            matches!(shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == color)
-        };
-        let first_under = shapes.iter().position(|s| is_color(s, under_color));
-        let first_dash = shapes.iter().position(|s| is_color(s, ant_color));
-        assert!(
-            first_under < first_dash,
-            "the bordeaux under-stroke must be painted beneath the dashes"
-        );
+        let yellow = theme.frame_region_ant_core();
+        let has_yellow = shapes.iter().any(|s| match s {
+            egui::Shape::LineSegment { stroke, .. } => {
+                stroke.color.r() == yellow.r
+                    && stroke.color.g() == yellow.g
+                    && stroke.color.b() == yellow.b
+            }
+            _ => false,
+        });
+        assert!(!has_yellow, "selected animation border must not draw yellow marching ants");
 
         // An empty region list paints nothing at all.
         widget.set_overlay(CanvasOverlay::FrameRegions(vec![]));
         let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
-        assert!(
-            ant_line_points(&shapes, ant_color).is_empty(),
-            "an empty region list must paint no dashes"
-        );
-        assert!(
-            ant_line_points(&shapes, under_color).is_empty(),
-            "an empty region list must paint no under-baseline"
+        assert!(rect_outlines_with_color(&shapes, grey).is_empty());
+        assert!(rect_outlines_with_color(&shapes, red).is_empty());
+        assert!(rect_outlines_with_color(&shapes, green).is_empty());
+    }
+
+    #[test]
+    fn frame_regions_single_frame_paints_grey_area_and_red_first_only() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let only = Rect2i::new(2, 2, 4, 4);
+        widget.set_overlay(CanvasOverlay::FrameRegions(vec![only]));
+        let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
+
+        let theme = Theme::default_dark().colors;
+        let (red, green, grey) = animation_placer_colors(&theme);
+        let count_color = |color: egui::Color32| {
+            shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(
+                        shape,
+                        egui::Shape::Rect(r)
+                            if r.stroke.color == color && r.fill == egui::Color32::TRANSPARENT
+                    )
+                })
+                .count()
+        };
+        assert_eq!(count_color(grey), 1);
+        assert_eq!(count_color(red), 1);
+        assert_eq!(
+            count_color(green),
+            0,
+            "single-frame animation should not hide red under green"
         );
     }
 
     #[test]
-    fn frame_regions_union_boundary_skips_inner_edges() {
-        // Given: TWO ADJACENT 4×4 frames sharing the vertical edge at x=6
-        // (right(2,2,4,4) == x(6,2,4,4)).
-        // Then: the union boundary is exactly the outer 8×4 rect — the shared
-        // INNER edge at x=6 is produced by NEITHER the under-baseline NOR the
-        // dashes.
+    fn frame_regions_union_boundary_geometry_skips_inner_edges() {
         let regions = [Rect2i::new(2, 2, 4, 4), Rect2i::new(6, 2, 4, 4)];
         let union = Rect2i::new(2, 2, 8, 4);
-
-        // Pure geometry first: the boundary collapses to the union rect's
-        // outline (same trick as `Selection::outline_segments`).
         let segs = frame_region_boundary_segments(&regions);
-        assert_eq!(
-            segs,
-            frame_region_boundary_segments(&[union]),
-            "adjacent frames must collapse to the union's outer boundary"
-        );
-        assert_eq!(segs.len(), 24, "2*(w+h) = 2*(8+4) unit edges");
-        assert!(
-            segs.iter().all(|((x0, _), (x1, _))| !(*x0 == 6 && *x1 == 6)),
-            "no vertical segment may sit on the shared inner edge x=6"
-        );
-
-        // Painted: the outer union frame is drawn, the inner line is not.
-        let ctx = egui::Context::default();
-        let mut widget = CanvasWidget::new();
-        widget.set_overlay(CanvasOverlay::FrameRegions(regions.to_vec()));
-        let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
-
-        let theme = Theme::default_dark().colors;
-        let under = ant_under_stroke_color(theme.frame_region_ant_under_core());
-        let under_color =
-            egui::Color32::from_rgba_unmultiplied(under.r, under.g, under.b, under.a);
-        let base = theme.frame_region_ant_core();
-        let a = (u32::from(base.a) * u32::from(FRAME_REGION_ANT_STROKE_ALPHA) / 255) as u8;
-        let ant_color = egui::Color32::from_rgba_unmultiplied(base.r, base.g, base.b, a);
-        let under_lines = ant_line_points(&shapes, under_color);
-        let dashes = ant_line_points(&shapes, ant_color);
-        let origin = widget.canvas_rect_to_screen(Camera::new(), Rect2i::new(0, 0, 1, 1)).min;
-
-        // The union's full perimeter is laid down as the bordeaux under-line:
-        // 2*(8+4) = 24 contiguous unit segments.
-        let to_screen = |x: f32, y: f32| egui::pos2(origin.x + x, origin.y + y);
-        assert_eq!(
-            under_lines.len(),
-            24,
-            "the 8×4 union has 2*(8+4)=24 boundary unit edges"
-        );
-        for seg in frame_region_boundary_segments(&[union]) {
-            let a = to_screen(seg.0 .0 as f32, seg.0 .1 as f32);
-            let b = to_screen(seg.1 .0 as f32, seg.1 .1 as f32);
-            assert!(
-                under_lines.contains(&[a, b]) || under_lines.contains(&[b, a]),
-                "missing bordeaux under-segment for union boundary unit edge {seg:?}"
-            );
-        }
-        assert!(!dashes.is_empty(), "the outer union frame must show dashes");
-
-        // No painted segment sits on the shared inner edge (doc x=6, y in
-        // [2,6)): scale is 1 and pan (0,0), so origin maps doc point (x,y).
-        let inner_x = origin.x + 6.0;
-        let on_inner_line = |lines: &[[egui::Pos2; 2]]| {
-            lines.iter().any(|[a, b]| {
-                (a.x - inner_x).abs() < 1e-3
-                    && (b.x - inner_x).abs() < 1e-3
-                    && a.y >= origin.y + 2.0 - 1e-3
-                    && a.y <= origin.y + 6.0 + 1e-3
-            })
-        };
-        assert!(
-            !on_inner_line(&dashes),
-            "no dash may be painted on the shared inner edge x=6"
-        );
-        assert!(
-            !on_inner_line(&under_lines),
-            "no bordeaux under-line may be painted on the shared inner edge x=6"
-        );
+        assert_eq!(segs, frame_region_boundary_segments(&[union]));
+        assert_eq!(segs.len(), 24);
     }
 
     #[test]
-    fn frame_regions_disjoint_frames_stay_separate_boundaries() {
-        // Given: two DISJOINT 4×4 frames with a 2-px gap (doc x in [6, 8)).
-        // Then: the union boundary has TWO separate closed loops — painting
-        // never connects the two frames with a line across the gap.
-        let regions = [Rect2i::new(2, 2, 4, 4), Rect2i::new(8, 2, 4, 4)];
-        let segs = frame_region_boundary_segments(&regions);
-        assert_eq!(segs.len(), 32, "two perimeters of 16 unit edges");
-        let loops = mask_polylines(&segs);
-        assert_eq!(loops.len(), 2, "two disjoint frames yield two separate loops");
-        for lp in &loops {
-            assert_eq!(
-                lp.len(),
-                16,
-                "each loop walks every doc-pixel corner along a 16-edge perimeter"
-            );
-        }
-
+    fn frame_regions_border_is_static_across_time() {
         let ctx = egui::Context::default();
         let mut widget = CanvasWidget::new();
-        widget.set_overlay(CanvasOverlay::FrameRegions(regions.to_vec()));
-        let (_, shapes) = run_frame_with_shapes(&ctx, vec![], &mut widget, (64, 64));
-
-        let theme = Theme::default_dark().colors;
-        let under = ant_under_stroke_color(theme.frame_region_ant_under_core());
-        let under_color =
-            egui::Color32::from_rgba_unmultiplied(under.r, under.g, under.b, under.a);
-        let base = theme.frame_region_ant_core();
-        let a = (u32::from(base.a) * u32::from(FRAME_REGION_ANT_STROKE_ALPHA) / 255) as u8;
-        let ant_color = egui::Color32::from_rgba_unmultiplied(base.r, base.g, base.b, a);
-        let under_lines = ant_line_points(&shapes, under_color);
-        let dashes = ant_line_points(&shapes, ant_color);
+        let regions = vec![Rect2i::new(2, 2, 4, 4), Rect2i::new(6, 2, 4, 4)];
+        widget.set_overlay(CanvasOverlay::FrameRegions(regions));
+        let (_, shapes_t0) = run_frame_with_shapes_time(&ctx, vec![], &mut widget, (64, 64), 0.0);
+        let (_, shapes_t1) = run_frame_with_shapes_time(&ctx, vec![], &mut widget, (64, 64), 0.5);
         assert_eq!(
-            under_lines.len(),
-            32,
-            "two perimeters × 16 unit edges of bordeaux under-line"
-        );
-        assert_eq!(
-            dashes.len(),
-            (16 * PIXEL_ANT_SUBDIV as usize / 2) * 2,
-            "each 16-edge perimeter contributes half its sub-edges as dashes"
-        );
-
-        // Every unit edge of both outer perimeters is painted (undirected).
-        let origin = widget.canvas_rect_to_screen(Camera::new(), Rect2i::new(0, 0, 1, 1)).min;
-        let to_screen = |x: f32, y: f32| egui::pos2(origin.x + x, origin.y + y);
-        for r in regions {
-            for seg in frame_region_boundary_segments(std::slice::from_ref(&r)) {
-                let a = to_screen(seg.0 .0 as f32, seg.0 .1 as f32);
-                let b = to_screen(seg.1 .0 as f32, seg.1 .1 as f32);
-                assert!(
-                    (under_lines.contains(&[a, b]) || under_lines.contains(&[b, a])),
-                    "missing bordeaux under-segment for frame {r:?} unit edge {seg:?}"
-                );
-            }
-        }
-
-        // Nothing is painted across (or inside) the open gap band (6, 8).
-        let (gap_min, gap_max) = (origin.x + 6.0, origin.x + 8.0);
-        let crosses_or_fills_gap = |lines: &[[egui::Pos2; 2]]| {
-            lines.iter().any(|[a, b]| {
-                let lo = a.x.min(b.x);
-                let hi = a.x.max(b.x);
-                lo < gap_max - 1e-3 && hi > gap_min + 1e-3
-            })
-        };
-        assert!(
-            !crosses_or_fills_gap(&dashes) && !crosses_or_fills_gap(&under_lines),
-            "nothing may be painted across the gap between the two frames"
-        );
-    }
-
-    #[test]
-    fn frame_regions_march_at_half_the_global_ant_speed() {
-        // Given: one 4×4 frame region painted at t = 0.5 s (500 ms of wall
-        // clock).
-        // Then: the painted dash pattern is EXACTLY the one
-        // `pixel_ant_edges_from_polylines` yields at t = 250 ms
-        // (`time_ms * FRAME_REGION_ANT_SPEED_SCALE` = 500 * 0.5), and differs
-        // from the full-speed 500 ms pattern — the halved phase input matters.
-        let ctx = egui::Context::default();
-        let mut widget = CanvasWidget::new();
-        let region = Rect2i::new(2, 2, 4, 4);
-        widget.set_overlay(CanvasOverlay::FrameRegions(vec![region]));
-        let (_, shapes) = run_frame_with_shapes_time(&ctx, vec![], &mut widget, (64, 64), 0.5);
-
-        let theme = Theme::default_dark().colors;
-        let base = theme.frame_region_ant_core();
-        let a = (u32::from(base.a) * u32::from(FRAME_REGION_ANT_STROKE_ALPHA) / 255) as u8;
-        let ant_color = egui::Color32::from_rgba_unmultiplied(base.r, base.g, base.b, a);
-        let painted = ant_line_points(&shapes, ant_color);
-        assert!(!painted.is_empty(), "expected live-yellow dashes");
-
-        let loops = mask_polylines(&frame_region_boundary_segments(&[region]));
-        let half_edges: std::collections::BTreeSet<((i32, i32), (i32, i32))> =
-            pixel_ant_edges_from_polylines(&loops, 250)
-                .into_iter()
-                .filter(|e| e.on)
-                .map(|e| (e.start, e.end))
-                .collect();
-        let full_edges: std::collections::BTreeSet<((i32, i32), (i32, i32))> =
-            pixel_ant_edges_from_polylines(&loops, 500)
-                .into_iter()
-                .filter(|e| e.on)
-                .map(|e| (e.start, e.end))
-                .collect();
-        assert_ne!(
-            half_edges, full_edges,
-            "half-speed (250 ms) and full-speed (500 ms) phases must differ"
-        );
-
-        // Recover each painted dash's SUB-UNIT coordinates by inverting the
-        // paint path's mapping (origin + pan + su/SUBDIV * scale; pan (0,0),
-        // scale 1), then compare with the integer half-speed edge set.
-        let origin = widget.canvas_rect_to_screen(Camera::new(), Rect2i::new(0, 0, 1, 1)).min;
-        let subdiv = PIXEL_ANT_SUBDIV as f32;
-        let actual: std::collections::BTreeSet<((i32, i32), (i32, i32))> = painted
-            .iter()
-            .map(|[a, b]| {
-                (
-                    (
-                        ((a.x - origin.x) * subdiv).round() as i32,
-                        ((a.y - origin.y) * subdiv).round() as i32,
-                    ),
-                    (
-                        ((b.x - origin.x) * subdiv).round() as i32,
-                        ((b.y - origin.y) * subdiv).round() as i32,
-                    ),
-                )
-            })
-            .collect();
-        assert_eq!(
-            actual, half_edges,
-            "the painted dashes must be exactly the HALF-speed (250 ms) pattern"
+            shapes_t0.len(),
+            shapes_t1.len(),
+            "static animation borders must remain identical across frames"
         );
     }
 
@@ -6160,11 +6015,6 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         assert!(
             !ant_line_points(&shapes, dark_under).is_empty(),
             "expected the base's dark contrast backing"
-        );
-        assert_eq!(
-            on_lines.len(),
-            6 * PIXEL_ANT_SUBDIV as usize,
-            "half of the 12 document edges × SUBDIV sub-edges are ON"
         );
 
         // The swept cell is still a plain solid unit outline (no fill, no
