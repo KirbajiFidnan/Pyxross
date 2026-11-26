@@ -2,6 +2,17 @@
 
 All notable changes to **Pyxross Workshop** are documented in this file.
 
+## [0.9.4] - 2026-11-26
+
+### Added
+- **Pencil & Eraser Canvas-Locked `Pattern` Mode:** added a `Pattern` selector (`Normal`, `Bayer Dither`, `Line`) in the Tool Property panel for both Pencil and Eraser (stored independently per tool), evaluated in absolute canvas coordinates `(x, y)` so symmetry and alignment remain unbroken across separate strokes, `Shift+Line` gestures, and Curve transforms:
+  - **Bayer Dither:** 8×8 ordered Bayer matrix dithering with a configurable `Density` (`0..=100%`) slider (`50%` yields an exact 1×1 checkerboard).
+  - **Line:** parallel stripes with configurable `Thickness` (`1..=32` px), `Angle` (`0..=180°`), and `Spacing` (`1..=64` px) sliders.
+- **Scrollable Tool Property Panel:** wrapped Tool Property contents in a vertical scroll area so expanded pattern sliders remain accessible at any panel height.
+
+### Fixed
+- **Large Brush Line Performance:** eliminated lag when drawing lines with thick/large brushes (`32–64` px) in Pencil and Eraser by replacing per-stamp heap allocations and `BTreeSet` preview tracking with stack-allocated `BrushRowSpans`, delta leading-edge stepping along Bresenham lines, a word-level `FootprintMask` bitmask, merged horizontal-span `egui::Mesh` rendering (with cached nearest-neighbor texture fallback for dense pattern previews), and collinear-merged Eraser outlines.
+
 ## [0.9.3] - 2026-11-25
 
 ### Added

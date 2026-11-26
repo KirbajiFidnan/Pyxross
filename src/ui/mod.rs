@@ -70,7 +70,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::core::anim::AnimationController;
-use crate::core::brush::{snap_line_angle, BrushShape, BrushSpec, DrawMode, DrawTool, Stroke};
+use crate::core::brush::{
+    snap_line_angle, BrushPattern, BrushShape, BrushSpec, DrawMode, DrawTool, Stroke,
+};
 use crate::core::buffer::PixelBuffer;
 use crate::core::clip::PixelClip;
 use crate::core::clipboard::ClipboardRegion;
@@ -3977,6 +3979,43 @@ impl App {
                     let session = self.projects.current_mut();
                     let tool = session.tool_state.tool();
                     session.draw_settings_mut(tool).tail = tail;
+                }
+                ToolbarEvent::BrushPatternKindChanged(kind) => {
+                    let session = self.projects.current_mut();
+                    let tool = session.tool_state.tool();
+                    session.draw_settings_mut(tool).pattern.kind = kind;
+                }
+                ToolbarEvent::BrushPatternDitherDensityChanged(density) => {
+                    let session = self.projects.current_mut();
+                    let tool = session.tool_state.tool();
+                    session.draw_settings_mut(tool).pattern.dither_density = density.clamp(
+                        BrushPattern::MIN_DITHER_DENSITY,
+                        BrushPattern::MAX_DITHER_DENSITY,
+                    );
+                }
+                ToolbarEvent::BrushPatternLineThicknessChanged(thickness) => {
+                    let session = self.projects.current_mut();
+                    let tool = session.tool_state.tool();
+                    session.draw_settings_mut(tool).pattern.line_thickness = thickness.clamp(
+                        BrushPattern::MIN_LINE_THICKNESS,
+                        BrushPattern::MAX_LINE_THICKNESS,
+                    );
+                }
+                ToolbarEvent::BrushPatternLineAngleChanged(angle) => {
+                    let session = self.projects.current_mut();
+                    let tool = session.tool_state.tool();
+                    session.draw_settings_mut(tool).pattern.line_angle = angle.clamp(
+                        BrushPattern::MIN_LINE_ANGLE,
+                        BrushPattern::MAX_LINE_ANGLE,
+                    );
+                }
+                ToolbarEvent::BrushPatternLineSpacingChanged(spacing) => {
+                    let session = self.projects.current_mut();
+                    let tool = session.tool_state.tool();
+                    session.draw_settings_mut(tool).pattern.line_spacing = spacing.clamp(
+                        BrushPattern::MIN_LINE_SPACING,
+                        BrushPattern::MAX_LINE_SPACING,
+                    );
                 }
                 ToolbarEvent::FieldierChildChanged(child) => {
                     // A deliberate child switch commits any in-flight transform
@@ -8967,6 +9006,7 @@ impl App {
             .with_scatter(settings.scatter)
             .with_scatter_shape(settings.scatter_shape)
             .with_tail(settings.tail)
+            .with_pattern(settings.pattern)
             .with_clip(clip);
         let Some(mut stroke_session) = StrokeSession::begin(
             &session.layers.active_layer().buffer,
@@ -10420,6 +10460,11 @@ impl App {
                 _ => DrawMode::Pen,
             },
             brush_color: session.color,
+            brush_pattern: if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
+                session.draw_settings(tool).pattern
+            } else {
+                BrushPattern::NORMAL
+            },
             line: None,
             selection_clip: Self::selection_pixel_clip(session.selection.as_ref()),
             selection_drag_active: false,
@@ -12834,6 +12879,11 @@ impl App {
                     _ => DrawMode::Pen,
                 },
                 brush_color: self.projects.current().color,
+                brush_pattern: if matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Draw) {
+                    self.projects.current().draw_settings(tool).pattern
+                } else {
+                    BrushPattern::NORMAL
+                },
                 line: match (self.line_mode, self.line_anchor, self.line_end) {
                     (true, Some(anchor), Some(end)) => Some(LinePreview { anchor, end }),
                     _ => None,
@@ -21501,6 +21551,40 @@ mod tests {
         assert_eq!(view.tool, Tool::Fieldier);
         assert_eq!(view.child, FieldierChild::Wand);
         assert_eq!(view.draw.size, 7, "the draw properties are unchanged");
+    }
+
+    #[test]
+    fn brush_pattern_events_update_active_draw_tool_independently_and_clamp() {
+        use crate::core::brush::BrushPatternKind;
+
+        let mut app = App::default();
+        app.apply_toolbar_events(vec![
+            ToolbarEvent::ToolSelected(Tool::Pencil),
+            ToolbarEvent::BrushPatternKindChanged(BrushPatternKind::BayerDither),
+            ToolbarEvent::BrushPatternDitherDensityChanged(150),
+        ]);
+        let pen_pat = app.projects.current().draw_settings(Tool::Pencil).pattern;
+        assert_eq!(pen_pat.kind, BrushPatternKind::BayerDither);
+        assert_eq!(pen_pat.dither_density, BrushPattern::MAX_DITHER_DENSITY);
+
+        // Switching to Eraser keeps its own independent pattern settings.
+        app.apply_toolbar_events(vec![
+            ToolbarEvent::ToolSelected(Tool::Eraser),
+            ToolbarEvent::BrushPatternKindChanged(BrushPatternKind::Line),
+            ToolbarEvent::BrushPatternLineThicknessChanged(0),
+            ToolbarEvent::BrushPatternLineAngleChanged(250),
+            ToolbarEvent::BrushPatternLineSpacingChanged(200),
+        ]);
+        let eraser_pat = app.projects.current().draw_settings(Tool::Eraser).pattern;
+        assert_eq!(eraser_pat.kind, BrushPatternKind::Line);
+        assert_eq!(eraser_pat.line_thickness, BrushPattern::MIN_LINE_THICKNESS);
+        assert_eq!(eraser_pat.line_angle, BrushPattern::MAX_LINE_ANGLE);
+        assert_eq!(eraser_pat.line_spacing, BrushPattern::MAX_LINE_SPACING);
+        // Pen pattern was not disturbed.
+        assert_eq!(
+            app.projects.current().draw_settings(Tool::Pencil).pattern.kind,
+            BrushPatternKind::BayerDither
+        );
     }
 
     #[test]

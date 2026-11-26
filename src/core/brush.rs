@@ -138,6 +138,288 @@ impl BrushSpec {
         }
         out
     }
+
+    /// Computes stack-allocated per-row horizontal spans `(dx_min, dx_max)` for
+    /// this brush footprint with zero heap allocation.
+    pub fn row_spans(&self) -> BrushRowSpans {
+        let size = (self.size as i32).clamp(Self::MIN_SIZE as i32, Self::MAX_SIZE as i32);
+        let k = size / 2;
+        let (min, max) = (-k, (size - 1) / 2);
+        let mut spans = [(0i32, -1i32); Self::MAX_SIZE as usize];
+        let mut len = 0usize;
+        let mut dy_min = min;
+        let mut started = false;
+        let full_block = self.shape == BrushShape::Square;
+        for dy in min..=max {
+            let (mut row_min, mut row_max) = (i32::MAX, i32::MIN);
+            if full_block {
+                row_min = min;
+                row_max = max;
+            } else if size % 2 == 0 {
+                let ey = 2 * dy + 1;
+                let rem = size * size - ey * ey;
+                if rem >= 0 {
+                    for dx in min..=max {
+                        let ex = 2 * dx + 1;
+                        if ex * ex <= rem {
+                            if row_min == i32::MAX {
+                                row_min = dx;
+                            }
+                            row_max = dx;
+                        }
+                    }
+                }
+            } else {
+                let rem = k * k - dy * dy;
+                if rem >= 0 {
+                    for dx in min..=max {
+                        if dx * dx <= rem {
+                            if row_min == i32::MAX {
+                                row_min = dx;
+                            }
+                            row_max = dx;
+                        }
+                    }
+                }
+            }
+            if row_min <= row_max {
+                if !started {
+                    dy_min = dy;
+                    started = true;
+                }
+                spans[len] = (row_min, row_max);
+                len += 1;
+            }
+        }
+        BrushRowSpans { dy_min, len, spans }
+    }
+}
+
+/// Stack-allocated per-row horizontal spans for a [`BrushSpec`] footprint.
+///
+/// Both [`BrushShape::Square`] and [`BrushShape::Round`] are convex, so each
+/// row `dy` in `dy_min .. dy_min + len` covers a single contiguous inclusive
+/// horizontal interval `dx_min..=dx_max`. Storing spans on the stack avoids
+/// heap allocation on every stamp and enables O(size) delta stepping along
+/// Bresenham lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrushRowSpans {
+    dy_min: i32,
+    len: usize,
+    spans: [(i32, i32); BrushSpec::MAX_SIZE as usize],
+}
+
+impl BrushRowSpans {
+    /// First row offset `dy` (inclusive).
+    #[inline(always)]
+    pub const fn dy_min(&self) -> i32 {
+        self.dy_min
+    }
+
+    /// Number of rows covered (`1..=64`).
+    #[inline(always)]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Inclusive `(dx_min, dx_max)` span for row index `row` (`0..self.len()`).
+    #[inline(always)]
+    pub const fn row(&self, row: usize) -> (i32, i32) {
+        self.spans[row]
+    }
+
+    /// Inclusive `(dx_min, dx_max)` span at relative row `dy`, or `None` if
+    /// `dy` is outside the footprint.
+    #[inline(always)]
+    pub const fn span_at_dy(&self, dy: i32) -> Option<(i32, i32)> {
+        let idx = dy - self.dy_min;
+        if idx >= 0 && (idx as usize) < self.len {
+            Some(self.spans[idx as usize])
+        } else {
+            None
+        }
+    }
+}
+
+/// Pattern mode applied in canvas coordinates when painting with Pencil or Eraser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BrushPatternKind {
+    /// Solid brush: every pixel in the footprint is painted.
+    #[default]
+    Normal,
+    /// Ordered 8×8 Bayer matrix dithering locked to canvas coordinates `(x, y)`.
+    BayerDither,
+    /// Parallel lines locked to canvas coordinates `(x, y)`.
+    Line,
+}
+
+/// Canvas-locked pattern configuration for Pencil and Eraser.
+///
+/// Because pattern evaluation depends solely on absolute canvas pixel
+/// coordinates `(x, y)`, separate strokes always align seamlessly on the same
+/// symmetry grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BrushPattern {
+    pub kind: BrushPatternKind,
+    /// Bayer dither density in percent (`0..=100`). `50` produces an exact 1×1
+    /// checkerboard; `0` paints nothing; `100` paints solid.
+    pub dither_density: u8,
+    /// Line pattern stripe thickness in pixels (`1..=32`).
+    pub line_thickness: u8,
+    /// Line pattern orientation in degrees (`0..=180`). `0°` = horizontal,
+    /// `45°` = diagonal, `90°` = vertical.
+    pub line_angle: i16,
+    /// Line pattern gap between stripes in pixels (`1..=64`).
+    pub line_spacing: u8,
+}
+
+impl BrushPattern {
+    pub const MIN_DITHER_DENSITY: u8 = 0;
+    pub const MAX_DITHER_DENSITY: u8 = 100;
+    pub const DEFAULT_DITHER_DENSITY: u8 = 50;
+
+    pub const MIN_LINE_THICKNESS: u8 = 1;
+    pub const MAX_LINE_THICKNESS: u8 = 32;
+    pub const DEFAULT_LINE_THICKNESS: u8 = 1;
+
+    pub const MIN_LINE_ANGLE: i16 = 0;
+    pub const MAX_LINE_ANGLE: i16 = 180;
+    pub const DEFAULT_LINE_ANGLE: i16 = 45;
+
+    pub const MIN_LINE_SPACING: u8 = 1;
+    pub const MAX_LINE_SPACING: u8 = 64;
+    pub const DEFAULT_LINE_SPACING: u8 = 4;
+
+    /// Solid (no pattern) default.
+    pub const NORMAL: Self = Self {
+        kind: BrushPatternKind::Normal,
+        dither_density: Self::DEFAULT_DITHER_DENSITY,
+        line_thickness: Self::DEFAULT_LINE_THICKNESS,
+        line_angle: Self::DEFAULT_LINE_ANGLE,
+        line_spacing: Self::DEFAULT_LINE_SPACING,
+    };
+
+    /// Precomputes a stack-allocated, O(1) per-pixel sampler (no trigonometry
+    /// or floating-point work inside inner paint loops).
+    pub fn sampler(self) -> PatternSampler {
+        match self.kind {
+            BrushPatternKind::Normal => PatternSampler::Normal,
+            BrushPatternKind::BayerDither => {
+                let d = self
+                    .dither_density
+                    .clamp(Self::MIN_DITHER_DENSITY, Self::MAX_DITHER_DENSITY);
+                let threshold = match d {
+                    0 => 0,
+                    100 => 64,
+                    _ => ((u16::from(d) * 64 + 50) / 100) as u8,
+                };
+                PatternSampler::BayerDither { threshold }
+            }
+            BrushPatternKind::Line => {
+                const FP_SCALE: i64 = 1 << 16;
+                let thickness = i64::from(
+                    self.line_thickness
+                        .clamp(Self::MIN_LINE_THICKNESS, Self::MAX_LINE_THICKNESS),
+                );
+                let spacing = i64::from(
+                    self.line_spacing
+                        .clamp(Self::MIN_LINE_SPACING, Self::MAX_LINE_SPACING),
+                );
+                let angle = self
+                    .line_angle
+                    .clamp(Self::MIN_LINE_ANGLE, Self::MAX_LINE_ANGLE);
+                // Normal vector perpendicular to the line direction `(cos θ, sin θ)`.
+                let (nx_fp, ny_fp) = match angle {
+                    0 | 180 => (0, FP_SCALE),
+                    90 => (FP_SCALE, 0),
+                    _ => {
+                        let rad = f64::from(angle).to_radians();
+                        let nx = (-rad.sin() * (FP_SCALE as f64)).round() as i64;
+                        let ny = (rad.cos() * (FP_SCALE as f64)).round() as i64;
+                        (nx, ny)
+                    }
+                };
+                PatternSampler::Line {
+                    nx_fp,
+                    ny_fp,
+                    period_fp: (thickness + spacing) * FP_SCALE,
+                    thickness_fp: thickness * FP_SCALE,
+                }
+            }
+        }
+    }
+}
+
+impl Default for BrushPattern {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+/// Standard 8×8 ordered Bayer threshold matrix (`0..64`).
+///
+/// All values `0..32` lie on `(x + y) % 2 == 0` cells, so a threshold of `32`
+/// (50% density) produces a mathematically exact 1×1 checkerboard across the
+/// entire canvas.
+const BAYER_8X8: [u8; 64] = [
+    0, 32, 8, 40, 2, 34, 10, 42, //
+    48, 16, 56, 24, 50, 18, 58, 26, //
+    12, 44, 4, 36, 14, 46, 6, 38, //
+    60, 28, 52, 20, 62, 30, 54, 22, //
+    3, 35, 11, 43, 1, 33, 9, 41, //
+    51, 19, 59, 27, 49, 17, 57, 25, //
+    15, 47, 7, 39, 13, 45, 5, 37, //
+    63, 31, 55, 23, 61, 29, 53, 21, //
+];
+
+/// Precomputed per-pixel pattern evaluator: O(1), integer-only, zero allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternSampler {
+    Normal,
+    BayerDither {
+        threshold: u8,
+    },
+    Line {
+        nx_fp: i64,
+        ny_fp: i64,
+        period_fp: i64,
+        thickness_fp: i64,
+    },
+}
+
+impl PatternSampler {
+    /// Returns `true` when this sampler is [`Self::Normal`] (matches every pixel).
+    #[inline(always)]
+    pub const fn is_normal(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+
+    /// Evaluates whether canvas pixel `(x, y)` should be painted by this pattern.
+    #[inline(always)]
+    pub fn matches(self, x: i32, y: i32) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::BayerDither { threshold } => {
+                if threshold == 0 {
+                    return false;
+                }
+                if threshold >= 64 {
+                    return true;
+                }
+                let idx = (((y & 7) << 3) | (x & 7)) as usize;
+                BAYER_8X8[idx] < threshold
+            }
+            Self::Line {
+                nx_fp,
+                ny_fp,
+                period_fp,
+                thickness_fp,
+            } => {
+                let dist = i64::from(x) * nx_fp + i64::from(y) * ny_fp;
+                dist.rem_euclid(period_fp) < thickness_fp
+            }
+        }
+    }
 }
 
 /// Draw-tool paint mode.
@@ -168,6 +450,8 @@ pub struct DrawTool {
     /// one pixel; the sign is the direction (`+` grows, `-` shrinks). `0` is
     /// byte-identical to no tail.
     pub tail: i8,
+    /// Canvas-locked paint pattern (`Normal`, `BayerDither`, or `Line`).
+    pub pattern: BrushPattern,
 }
 
 impl DrawTool {
@@ -348,14 +632,35 @@ fn apply_tool(dst: Color, tool: DrawTool) -> Color {
     }
 }
 
-/// Writes every stamp pixel `(cx+dx, cy+dy)` that is in bounds.
-/// Out-of-bounds offsets (negative or past the buffer edge) are skipped.
+/// Writes every stamp pixel `(cx+dx, cy+dy)` that is in bounds and matches
+/// `tool.pattern`. Out-of-bounds offsets are skipped.
 pub fn stamp_at(buf: &mut PixelBuffer, tool: DrawTool, cx: i32, cy: i32) {
-    for (dx, dy) in tool.spec.stamp_offsets() {
-        let px = cx + dx;
-        let py = cy + dy;
-        if px >= 0 && py >= 0 {
-            stamp_pixel(buf, px as usize, py as usize, tool);
+    let spans = tool.spec.row_spans();
+    let sampler = tool.pattern.sampler();
+    let w = buf.width() as i32;
+    let h = buf.height() as i32;
+    for row in 0..spans.len() {
+        let py = cy + spans.dy_min() + row as i32;
+        if py < 0 || py >= h {
+            continue;
+        }
+        let (dx_min, dx_max) = spans.row(row);
+        let x0 = (cx + dx_min).max(0);
+        let x1 = (cx + dx_max).min(w - 1);
+        if x0 > x1 {
+            continue;
+        }
+        let uy = py as usize;
+        if sampler.is_normal() {
+            for px in x0..=x1 {
+                stamp_pixel_unchecked(buf, px as usize, uy, tool);
+            }
+        } else {
+            for px in x0..=x1 {
+                if sampler.matches(px, py) {
+                    stamp_pixel_unchecked(buf, px as usize, uy, tool);
+                }
+            }
         }
     }
 }
@@ -363,14 +668,24 @@ pub fn stamp_at(buf: &mut PixelBuffer, tool: DrawTool, cx: i32, cy: i32) {
 /// In-bounds-only variant; the caller guarantees every offset lands in bounds
 /// (used by the fast stroke path after rect-clipping the line).
 pub fn stamp_at_unchecked(buf: &mut PixelBuffer, tool: DrawTool, cx: i32, cy: i32) {
-    for (dx, dy) in tool.spec.stamp_offsets() {
-        stamp_pixel_unchecked(buf, (cx + dx) as usize, (cy + dy) as usize, tool);
-    }
-}
-
-fn stamp_pixel(buf: &mut PixelBuffer, x: usize, y: usize, tool: DrawTool) {
-    if let Some(dst) = buf.get_pixel(x, y) {
-        buf.set_pixel(x, y, apply_tool(dst, tool));
+    let spans = tool.spec.row_spans();
+    let sampler = tool.pattern.sampler();
+    for row in 0..spans.len() {
+        let py = cy + spans.dy_min() + row as i32;
+        let (dx_min, dx_max) = spans.row(row);
+        let uy = py as usize;
+        if sampler.is_normal() {
+            for dx in dx_min..=dx_max {
+                stamp_pixel_unchecked(buf, (cx + dx) as usize, uy, tool);
+            }
+        } else {
+            for dx in dx_min..=dx_max {
+                let px = cx + dx;
+                if sampler.matches(px, py) {
+                    stamp_pixel_unchecked(buf, px as usize, uy, tool);
+                }
+            }
+        }
     }
 }
 
@@ -390,6 +705,7 @@ pub fn erase_to(buf: &mut PixelBuffer, spec: BrushSpec, x: i32, y: i32) {
             scatter: 0,
             scatter_shape: ScatterShape::Square,
             tail: 0,
+            pattern: BrushPattern::NORMAL,
         },
         x,
         y,
@@ -407,6 +723,7 @@ pub fn draw_to(buf: &mut PixelBuffer, spec: BrushSpec, x: i32, y: i32, color: Co
             scatter: 0,
             scatter_shape: ScatterShape::Square,
             tail: 0,
+            pattern: BrushPattern::NORMAL,
         },
         x,
         y,
@@ -527,12 +844,22 @@ pub struct Stroke {
     /// the first in-bounds stamp; a fresh `Stroke` starts clear, while a
     /// segment restart on the same stroke keeps the record.
     touched: Option<TouchedCells>,
+    /// Precomputed pattern sampler for O(1) per-pixel pattern evaluation.
+    sampler: PatternSampler,
+    /// Cached row spans for [`Self::cached_spec`] (recomputed only when `tail`
+    /// changes the brush size).
+    cached_spec: BrushSpec,
+    cached_spans: BrushRowSpans,
+    /// Previous stamp's `(cx, cy, spec)` when it was scanned inside bounds,
+    /// allowing adjacent Bresenham steps to skip the overlapping interior.
+    prev_stamp: Option<(i32, i32, BrushSpec)>,
 }
 
 impl Stroke {
     /// Bounds default to `Rect2i::ZERO` (unbounded: `stamp_at` clips to the
     /// buffer); call [`Self::set_bounds`] to clamp to a canvas/layer rect.
     pub fn new(spec: BrushSpec, mode: DrawMode, color: Color) -> Self {
+        let cached_spans = spec.row_spans();
         Self {
             tool: DrawTool {
                 spec,
@@ -541,6 +868,7 @@ impl Stroke {
                 scatter: 0,
                 scatter_shape: ScatterShape::Square,
                 tail: 0,
+                pattern: BrushPattern::NORMAL,
             },
             clip: None,
             last: (0, 0),
@@ -551,7 +879,18 @@ impl Stroke {
             travel: 0.0,
             travel_anchor: (0, 0),
             touched: None,
+            sampler: PatternSampler::Normal,
+            cached_spec: spec,
+            cached_spans,
+            prev_stamp: None,
         }
+    }
+
+    /// Sets the canvas-locked paint pattern for this stroke.
+    pub fn with_pattern(mut self, pattern: BrushPattern) -> Self {
+        self.tool.pattern = pattern;
+        self.sampler = pattern.sampler();
+        self
     }
 
     /// Per-stamp jitter radius in pixels, clamped to `0..=MAX_SCATTER`
@@ -592,6 +931,7 @@ impl Stroke {
     /// Clamp the stroke to a canvas/layer rect (clipped stamps).
     pub fn set_bounds(&mut self, bounds: Rect2i) {
         self.bounds = bounds;
+        self.prev_stamp = None;
     }
 
     /// Stamps at `(x, y)` and records it as the stroke origin.
@@ -655,34 +995,98 @@ impl Stroke {
         if !self.bounds.is_empty() {
             stamp_bounds = stamp_bounds.clamp_to(self.bounds);
         }
+        let buf_rect = Rect2i::new(0, 0, buf.width() as i32, buf.height() as i32);
+        stamp_bounds = stamp_bounds.clamp_to(buf_rect);
         if stamp_bounds.is_empty() {
             return;
         }
+        if spec != self.cached_spec {
+            self.cached_spec = spec;
+            self.cached_spans = spec.row_spans();
+        }
+        let spans = self.cached_spans;
         let touched = self
             .touched
             .get_or_insert_with(|| TouchedCells::new(buf.width(), buf.height()));
         if touched.width != buf.width() || touched.height != buf.height() {
             *touched = TouchedCells::new(buf.width(), buf.height());
+            self.prev_stamp = None;
         }
-        let mut written = 0;
-        for (dx, dy) in spec.stamp_offsets() {
-            let px = cx + dx;
-            let py = cy + dy;
-            if let Some(pixel_clip) = &self.clip {
-                if !pixel_clip.contains(px, py) {
-                    continue;
-                }
+        let min_x = stamp_bounds.x;
+        let max_x = stamp_bounds.x + stamp_bounds.w - 1;
+        let min_y = stamp_bounds.y;
+        let max_y = stamp_bounds.y + stamp_bounds.h - 1;
+
+        let prev_same = self
+            .prev_stamp
+            .filter(|&(pcx, pcy, pspec)| pspec == spec && (cx - pcx).abs() <= 1 && (cy - pcy).abs() <= 1);
+        let sampler = self.sampler;
+        let is_normal = sampler.is_normal();
+        let tool = self.tool;
+        let clip = self.clip.as_ref();
+        let mut written = 0usize;
+
+        let mut paint_span = |py: i32, x0: i32, x1: i32| {
+            let x0 = x0.max(min_x);
+            let x1 = x1.min(max_x);
+            if x0 > x1 {
+                return;
             }
-            if stamp_bounds.contains(px, py) && px >= 0 && py >= 0 {
-                let (ux, uy) = (px as usize, py as usize);
-                if let Some(dst) = buf.get_pixel(ux, uy) {
+            let uy = py as usize;
+            if is_normal && clip.is_none() {
+                for px in x0..=x1 {
+                    let ux = px as usize;
                     if touched.mark(ux, uy) {
-                        buf.set_pixel_unchecked(ux, uy, apply_tool(dst, self.tool));
+                        let dst = buf.get_pixel_unchecked(ux, uy);
+                        buf.set_pixel_unchecked(ux, uy, apply_tool(dst, tool));
+                        written += 1;
+                    }
+                }
+            } else {
+                for px in x0..=x1 {
+                    if let Some(pixel_clip) = clip {
+                        if !pixel_clip.contains(px, py) {
+                            continue;
+                        }
+                    }
+                    if !is_normal && !sampler.matches(px, py) {
+                        continue;
+                    }
+                    let ux = px as usize;
+                    if touched.mark(ux, uy) {
+                        let dst = buf.get_pixel_unchecked(ux, uy);
+                        buf.set_pixel_unchecked(ux, uy, apply_tool(dst, tool));
                         written += 1;
                     }
                 }
             }
+        };
+
+        for row in 0..spans.len() {
+            let dy = spans.dy_min() + row as i32;
+            let py = cy + dy;
+            if py < min_y || py > max_y {
+                continue;
+            }
+            let (dx_min, dx_max) = spans.row(row);
+            let x_start = cx + dx_min;
+            let x_end = cx + dx_max;
+            if let Some((pcx, pcy, _)) = prev_same {
+                if let Some((old_min, old_max)) = spans.span_at_dy(py - pcy) {
+                    let old_x0 = pcx + old_min;
+                    let old_x1 = pcx + old_max;
+                    if x_start < old_x0 {
+                        paint_span(py, x_start, (old_x0 - 1).min(x_end));
+                    }
+                    if x_end > old_x1 {
+                        paint_span(py, (old_x1 + 1).max(x_start), x_end);
+                    }
+                    continue;
+                }
+            }
+            paint_span(py, x_start, x_end);
         }
+        self.prev_stamp = Some((cx, cy, spec));
         if written == 0 {
             return;
         }
@@ -752,6 +1156,7 @@ mod tests {
             scatter: 0,
             scatter_shape: ScatterShape::Square,
             tail: 0,
+            pattern: BrushPattern::NORMAL,
         }
     }
 
@@ -763,6 +1168,7 @@ mod tests {
             scatter: 0,
             scatter_shape: ScatterShape::Square,
             tail: 0,
+            pattern: BrushPattern::NORMAL,
         }
     }
 
@@ -2180,5 +2586,236 @@ mod tests {
             }
         }
         assert_eq!(buffer.get_pixel(2, 2), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn row_spans_match_stamp_offsets_for_all_sizes_and_shapes() {
+        for shape in [BrushShape::Square, BrushShape::Round] {
+            for size in BrushSpec::MIN_SIZE..=BrushSpec::MAX_SIZE {
+                let s = BrushSpec::new(size, shape);
+                let expected = s.stamp_offsets();
+                let spans = s.row_spans();
+                let mut actual = Vec::with_capacity(expected.len());
+                for row in 0..spans.len() {
+                    let dy = spans.dy_min() + row as i32;
+                    let (dx0, dx1) = spans.row(row);
+                    for dx in dx0..=dx1 {
+                        actual.push((dx, dy));
+                    }
+                }
+                assert_eq!(
+                    actual, expected,
+                    "row_spans mismatch for size={size} shape={shape:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bayer_dither_50_percent_is_exact_checkerboard_and_stroke_invariant() {
+        let mut buf = PixelBuffer::new(32, 32);
+        let pattern = BrushPattern {
+            kind: BrushPatternKind::BayerDither,
+            dither_density: 50,
+            ..BrushPattern::NORMAL
+        };
+        let paint = Color::rgb(255, 0, 0);
+
+        // Two separate strokes starting from different coordinates must align
+        // on the exact same canvas checkerboard grid.
+        let mut s1 = Stroke::new(spec(8, BrushShape::Square), DrawMode::Pen, paint)
+            .with_pattern(pattern);
+        s1.start(&mut buf, 6, 6);
+        s1.continue_to(&mut buf, 14, 6);
+
+        let mut s2 = Stroke::new(spec(8, BrushShape::Square), DrawMode::Pen, paint)
+            .with_pattern(pattern);
+        s2.start(&mut buf, 11, 9);
+        s2.continue_to(&mut buf, 19, 9);
+
+        let mut painted_count = 0usize;
+        for y in 2..14 {
+            for x in 2..22 {
+                let is_painted = buf.get_pixel(x, y) == Some(paint);
+                if is_painted {
+                    painted_count += 1;
+                    assert_eq!(
+                        (x + y) % 2,
+                        0,
+                        "50% Bayer dither must only paint (x+y)%2==0 cells, got ({x},{y})"
+                    );
+                }
+            }
+        }
+        assert!(painted_count > 30);
+
+        // Density 0 paints nothing; density 100 paints every pixel.
+        let mut zero_buf = PixelBuffer::new(16, 16);
+        let mut s0 = Stroke::new(spec(4, BrushShape::Square), DrawMode::Pen, paint).with_pattern(
+            BrushPattern {
+                kind: BrushPatternKind::BayerDither,
+                dither_density: 0,
+                ..BrushPattern::NORMAL
+            },
+        );
+        s0.start(&mut zero_buf, 8, 8);
+        assert!(zero_buf.as_bytes().iter().all(|&b| b == 0));
+
+        let mut full_buf = PixelBuffer::new(16, 16);
+        let mut s100 = Stroke::new(spec(4, BrushShape::Square), DrawMode::Pen, paint).with_pattern(
+            BrushPattern {
+                kind: BrushPatternKind::BayerDither,
+                dither_density: 100,
+                ..BrushPattern::NORMAL
+            },
+        );
+        s100.start(&mut full_buf, 8, 8);
+        let mut filled = 0;
+        for y in 0..16 {
+            for x in 0..16 {
+                if full_buf.get_pixel(x, y) == Some(paint) {
+                    filled += 1;
+                }
+            }
+        }
+        assert_eq!(filled, 16);
+    }
+
+    #[test]
+    fn line_pattern_angles_thickness_spacing_and_cross_stroke_symmetry() {
+        let paint = Color::rgb(0, 200, 255);
+        // Horizontal lines (0 deg): thickness=2, spacing=3 => period=5 (rows 0,1, 5,6, 10,11...).
+        let horiz = BrushPattern {
+            kind: BrushPatternKind::Line,
+            line_thickness: 2,
+            line_angle: 0,
+            line_spacing: 3,
+            ..BrushPattern::NORMAL
+        };
+        let mut buf = PixelBuffer::new(32, 32);
+        let mut s1 =
+            Stroke::new(spec(12, BrushShape::Square), DrawMode::Pen, paint).with_pattern(horiz);
+        s1.start(&mut buf, 8, 8);
+        let mut s2 =
+            Stroke::new(spec(12, BrushShape::Square), DrawMode::Pen, paint).with_pattern(horiz);
+        s2.start(&mut buf, 13, 11);
+
+        for y in 2..17 {
+            let expected_on = (y % 5) < 2;
+            assert_eq!(
+                buf.get_pixel(10, y) == Some(paint),
+                expected_on,
+                "horizontal line symmetry failed at y={y}"
+            );
+        }
+
+        // Vertical lines (90 deg): thickness=1, spacing=2 => period=3 (cols 0, 3, 6, 9...).
+        let vert = BrushPattern {
+            kind: BrushPatternKind::Line,
+            line_thickness: 1,
+            line_angle: 90,
+            line_spacing: 2,
+            ..BrushPattern::NORMAL
+        };
+        let mut vbuf = PixelBuffer::new(32, 32);
+        let mut sv =
+            Stroke::new(spec(12, BrushShape::Square), DrawMode::Pen, paint).with_pattern(vert);
+        sv.start(&mut vbuf, 10, 10);
+        for x in 4..16 {
+            let expected_on = (x % 3) == 0;
+            assert_eq!(
+                vbuf.get_pixel(x, 10) == Some(paint),
+                expected_on,
+                "vertical line symmetry failed at x={x}"
+            );
+        }
+
+        // Diagonal lines (45 deg): two separate strokes match identical pattern sampler.
+        let diag = BrushPattern {
+            kind: BrushPatternKind::Line,
+            line_thickness: 2,
+            line_angle: 45,
+            line_spacing: 4,
+            ..BrushPattern::NORMAL
+        };
+        let sampler = diag.sampler();
+        let mut dbuf = PixelBuffer::new(32, 32);
+        let mut sd1 =
+            Stroke::new(spec(10, BrushShape::Square), DrawMode::Pen, paint).with_pattern(diag);
+        sd1.start(&mut dbuf, 8, 8);
+        let mut sd2 =
+            Stroke::new(spec(10, BrushShape::Square), DrawMode::Pen, paint).with_pattern(diag);
+        sd2.start(&mut dbuf, 12, 12);
+        for y in 7..13 {
+            for x in 7..13 {
+                assert_eq!(
+                    dbuf.get_pixel(x, y) == Some(paint),
+                    sampler.matches(x as i32, y as i32)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eraser_honors_bayer_dither_and_line_patterns() {
+        let mut buf = PixelBuffer::new(16, 16);
+        buf.fill(Color::WHITE);
+        let pattern = BrushPattern {
+            kind: BrushPatternKind::BayerDither,
+            dither_density: 50,
+            ..BrushPattern::NORMAL
+        };
+        let mut s = Stroke::new(spec(6, BrushShape::Square), DrawMode::Eraser, Color::BLACK)
+            .with_pattern(pattern);
+        s.start(&mut buf, 8, 8);
+        for y in 5..11 {
+            for x in 5..11 {
+                if (x + y) % 2 == 0 {
+                    assert_eq!(buf.get_pixel(x, y), Some(Color::TRANSPARENT));
+                } else {
+                    assert_eq!(buf.get_pixel(x, y), Some(Color::WHITE));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_64px_brush_long_line_matches_expected_and_runs_fast() {
+        let mut buf = PixelBuffer::new(600, 128);
+        let paint = Color::rgb(10, 200, 120);
+        for pattern in [
+            BrushPattern::NORMAL,
+            BrushPattern {
+                kind: BrushPatternKind::BayerDither,
+                dither_density: 50,
+                ..BrushPattern::NORMAL
+            },
+            BrushPattern {
+                kind: BrushPatternKind::Line,
+                line_thickness: 2,
+                line_angle: 45,
+                line_spacing: 4,
+                ..BrushPattern::NORMAL
+            },
+        ] {
+            buf.fill(Color::TRANSPARENT);
+            let t0 = std::time::Instant::now();
+            let mut stroke =
+                Stroke::new(spec(64, BrushShape::Round), DrawMode::Pen, paint).with_pattern(pattern);
+            stroke.start(&mut buf, 40, 64);
+            stroke.continue_to(&mut buf, 540, 64);
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed.as_millis() < 200,
+                "64px 500px line with {:?} took too long: {:?}",
+                pattern.kind,
+                elapsed
+            );
+            // Verify center pixel matches sampler.
+            assert_eq!(
+                buf.get_pixel(250, 64) == Some(paint),
+                pattern.sampler().matches(250, 64)
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Canvas widget — wgpu texture → egui. R1 milestone.
 
-use crate::core::brush::{bresenham_line, BrushSpec, DrawMode};
+use crate::core::brush::{bresenham_line, BrushPattern, BrushSpec, DrawMode, PatternSampler};
 use crate::core::camera::Camera;
 use crate::core::clip::PixelClip;
 use crate::core::color::Color;
@@ -302,6 +302,8 @@ pub struct CanvasView {
     pub draw_mode: DrawMode,
     /// The primary color the Pen preview is filled with.
     pub brush_color: Color,
+    /// Canvas-locked pattern applied to Pencil/Eraser strokes and Pen previews.
+    pub brush_pattern: BrushPattern,
     /// Live LINE-mode anchor→end preview; `None` outside a line gesture.
     pub line: Option<LinePreview>,
     /// The committed selection as a pixel clip, or `None` when nothing is
@@ -342,6 +344,7 @@ impl Default for CanvasView {
             brush: None,
             draw_mode: DrawMode::Pen,
             brush_color: Color::BLACK,
+            brush_pattern: BrushPattern::NORMAL,
             line: None,
             selection_clip: None,
             selection_drag_active: false,
@@ -421,6 +424,10 @@ pub struct CanvasWidget {
     /// `(content_hash, canvas_bbox, texture)` so large tiles render as a single
     /// crisp quad without per-pixel egui anti-alias seams.
     tile_preview_texture: Option<(u64, Rect2i, egui::TextureHandle)>,
+    /// Cached nearest-neighbor texture for large/dithered brush & line previews
+    /// `(content_hash, canvas_bbox, texture)` so high-span pattern previews
+    /// render as a single GPU quad instead of thousands of per-pixel shapes.
+    footprint_preview_texture: Option<(u64, Rect2i, egui::TextureHandle)>,
     /// Sub-pixel pan remainder accumulated across slow drag frames so small
     /// deltas (< 0.5 px) are never dropped.
     pan_remainder: egui::Vec2,
@@ -474,6 +481,7 @@ impl CanvasWidget {
             ants_polylines: None,
             sand_bg_texture: None,
             tile_preview_texture: None,
+            footprint_preview_texture: None,
             pan_remainder: egui::Vec2::ZERO,
             text_caret: None,
             frame_regions_overlay: Vec::new(),
@@ -733,6 +741,7 @@ impl CanvasWidget {
             brush,
             draw_mode,
             brush_color,
+            brush_pattern,
             line,
             selection_clip,
             selection_drag_active,
@@ -1213,19 +1222,26 @@ impl CanvasWidget {
                 );
             }
             if let Some(brush) = brush {
-                let cells = footprint_cells(samples.iter().copied(), &brush.stamp_offsets());
-                paint_footprint(
-                    &painter,
-                    theme,
-                    &FootprintPreview {
-                        cells: &cells,
-                        mode: draw_mode,
-                        color: brush_color,
-                        origin: egui::pos2(origin_x, origin_y),
+                let preview_origin = egui::pos2(origin_x, origin_y);
+                let vis = visible_canvas_rect(painter.clip_rect(), preview_origin, scale, 2);
+                if let Some(mut mask) = FootprintMask::rasterize(samples, brush, vis, None) {
+                    let sampler = match draw_mode {
+                        DrawMode::Pen => brush_pattern.sampler(),
+                        DrawMode::Eraser => PatternSampler::Normal,
+                    };
+                    mask.apply_clip_and_pattern(preview_clip, sampler);
+                    paint_footprint_mask(
+                        ui.ctx(),
+                        &painter,
+                        theme,
+                        &mask,
+                        draw_mode,
+                        brush_color,
+                        preview_origin,
                         scale,
-                        clip: preview_clip,
-                    },
-                );
+                        &mut self.footprint_preview_texture,
+                    );
+                }
             }
             for (index, gizmo) in gizmos.iter().enumerate() {
                 let rect = egui::Rect::from_center_size(to_screen(*gizmo), egui::vec2(8.0, 8.0));
@@ -1537,19 +1553,26 @@ impl CanvasWidget {
                     canvas_footprint_anchor(pos, origin, scale, pan, view_size, brush.size)
                         .map(|local| self.local_to_canvas(local))
                 {
-                    let cells = footprint_cells(std::iter::once((cx, cy)), &brush.stamp_offsets());
-                    paint_footprint(
-                        &painter,
-                        theme,
-                        &FootprintPreview {
-                            cells: &cells,
-                            mode: draw_mode,
-                            color: brush_color,
-                            origin: self.content_origin(render_camera),
+                    let preview_origin = self.content_origin(render_camera);
+                    let vis = visible_canvas_rect(painter.clip_rect(), preview_origin, scale, 2);
+                    if let Some(mut mask) = FootprintMask::rasterize(&[(cx, cy)], brush, vis, None) {
+                        let sampler = match draw_mode {
+                            DrawMode::Pen => brush_pattern.sampler(),
+                            DrawMode::Eraser => PatternSampler::Normal,
+                        };
+                        mask.apply_clip_and_pattern(selection_clip.as_ref(), sampler);
+                        paint_footprint_mask(
+                            ui.ctx(),
+                            &painter,
+                            theme,
+                            &mask,
+                            draw_mode,
+                            brush_color,
+                            preview_origin,
                             scale,
-                            clip: selection_clip.as_ref(),
-                        },
-                    );
+                            &mut self.footprint_preview_texture,
+                        );
+                    }
                 }
             }
         }
@@ -1559,29 +1582,33 @@ impl CanvasWidget {
         // the App paints the real stroke on release.
         let line = line.filter(|_| !transform_phase);
         if let (Some(line), Some(brush)) = (line, brush) {
-            let cells = footprint_cells(
-                bresenham_line(line.anchor, line.end),
-                &brush.stamp_offsets(),
-            );
-            paint_footprint(
-                &painter,
-                theme,
-                &FootprintPreview {
-                    cells: &cells,
-                    mode: draw_mode,
-                    color: brush_color,
-                    origin: self.content_origin(render_camera),
+            let preview_origin = self.content_origin(render_camera);
+            let line_clip = match draw_mode {
+                DrawMode::Pen => preview_clip,
+                DrawMode::Eraser => selection_clip.as_ref(),
+            };
+            let vis = visible_canvas_rect(painter.clip_rect(), preview_origin, scale, 2);
+            let points = bresenham_line(line.anchor, line.end);
+            if let Some(mut mask) =
+                FootprintMask::rasterize(&points, brush, vis, line_clip.map(PixelClip::rect))
+            {
+                let sampler = match draw_mode {
+                    DrawMode::Pen => brush_pattern.sampler(),
+                    DrawMode::Eraser => PatternSampler::Normal,
+                };
+                mask.apply_clip_and_pattern(line_clip, sampler);
+                paint_footprint_mask(
+                    ui.ctx(),
+                    &painter,
+                    theme,
+                    &mask,
+                    draw_mode,
+                    brush_color,
+                    preview_origin,
                     scale,
-                    // The pen preview clips its cells to the selection, or to
-                    // the canvas when nothing is selected; the eraser
-                    // silhouette stays window-clipped by the painter unless a
-                    // selection is active.
-                    clip: match draw_mode {
-                        DrawMode::Pen => preview_clip,
-                        DrawMode::Eraser => selection_clip.as_ref(),
-                    },
-                },
-            );
+                    &mut self.footprint_preview_texture,
+                );
+            }
         }
 
         // Tile-placer preview — the LAST thing this frame paints (item 1/2/4/6).
@@ -2152,19 +2179,586 @@ pub fn brush_outline_segments(offsets: &[(i32, i32)]) -> Vec<((i32, i32), (i32, 
     segments
 }
 
-/// Deduped union of the brush footprint stamped at every `point`: the cells
-/// the path previews paint.
-fn footprint_cells(
-    points: impl IntoIterator<Item = (i32, i32)>,
-    offsets: &[(i32, i32)],
-) -> std::collections::BTreeSet<(i32, i32)> {
-    let mut cells: std::collections::BTreeSet<(i32, i32)> = std::collections::BTreeSet::new();
-    for (px, py) in points {
-        for &(dx, dy) in offsets {
-            cells.insert((px + dx, py + dy));
+/// Projects the painter's screen-space `clip_rect` back into canvas pixel
+/// coordinates, padded by `margin` cells on each side so outline edges near
+/// the viewport border never acquire artificial cuts.
+fn visible_canvas_rect(
+    clip_rect: egui::Rect,
+    origin: egui::Pos2,
+    scale: f32,
+    margin: i32,
+) -> Option<Rect2i> {
+    if !clip_rect.is_positive() || scale <= 0.0 || !clip_rect.min.x.is_finite() {
+        return None;
+    }
+    let min_x = ((clip_rect.min.x - origin.x) / scale).floor() as i32 - margin;
+    let min_y = ((clip_rect.min.y - origin.y) / scale).floor() as i32 - margin;
+    let max_x = ((clip_rect.max.x - origin.x) / scale).ceil() as i32 + margin;
+    let max_y = ((clip_rect.max.y - origin.y) / scale).ceil() as i32 + margin;
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    Some(Rect2i::new(min_x, min_y, max_x - min_x, max_y - min_y))
+}
+
+/// Compact 1-bit-per-pixel bounding-box mask for fast brush/line/curve
+/// footprint previews (replaces per-pixel `BTreeSet` insertion and per-pixel
+/// `painter.rect_filled` calls).
+struct FootprintMask {
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    words_per_row: usize,
+    bits: Vec<u64>,
+}
+
+impl FootprintMask {
+    /// Rasterizes `points` stamped with `spec` into a tight bitmask.
+    ///
+    /// `clip_bound` is always enforced (e.g. canvas/selection bounds); `vis_bound`
+    /// is applied only when the footprint bbox is large (`> 128` px on either axis)
+    /// so small off-edge hover cursors remain intact while giant lines never
+    /// rasterize off-screen pixels.
+    fn rasterize(
+        points: &[(i32, i32)],
+        spec: BrushSpec,
+        vis_bound: Option<Rect2i>,
+        clip_bound: Option<Rect2i>,
+    ) -> Option<Self> {
+        if points.is_empty() {
+            return None;
+        }
+        let spans = spec.row_spans();
+        if spans.len() == 0 {
+            return None;
+        }
+        let (mut min_px, mut min_py) = (i32::MAX, i32::MAX);
+        let (mut max_px, mut max_py) = (i32::MIN, i32::MIN);
+        for &(px, py) in points {
+            min_px = min_px.min(px);
+            min_py = min_py.min(py);
+            max_px = max_px.max(px);
+            max_py = max_py.max(py);
+        }
+        let half = spec.size as i32 / 2;
+        let max_off = (spec.size as i32 - 1) / 2;
+        let mut bbox = Rect2i::new(
+            min_px - half,
+            min_py - half,
+            (max_px + max_off) - (min_px - half) + 1,
+            (max_py + max_off) - (min_py - half) + 1,
+        );
+        if let Some(c) = clip_bound {
+            bbox = bbox.clamp_to(c);
+        }
+        if bbox.w > 128 || bbox.h > 128 {
+            if let Some(v) = vis_bound {
+                bbox = bbox.clamp_to(v);
+            }
+        }
+        if bbox.is_empty() {
+            return None;
+        }
+        let width = bbox.w as usize;
+        let height = bbox.h as usize;
+        let words_per_row = width.div_ceil(64);
+        let mut mask = Self {
+            origin_x: bbox.x,
+            origin_y: bbox.y,
+            width,
+            height,
+            words_per_row,
+            bits: vec![0u64; words_per_row * height],
+        };
+        let min_x = bbox.x;
+        let max_x = bbox.x + bbox.w - 1;
+        let min_y = bbox.y;
+        let max_y = bbox.y + bbox.h - 1;
+        let mut prev: Option<(i32, i32)> = None;
+        for &(cx, cy) in points {
+            let prev_adj = prev.filter(|&(pcx, pcy)| (cx - pcx).abs() <= 1 && (cy - pcy).abs() <= 1);
+            for row in 0..spans.len() {
+                let dy = spans.dy_min() + row as i32;
+                let py = cy + dy;
+                if py < min_y || py > max_y {
+                    continue;
+                }
+                let ly = (py - min_y) as usize;
+                let (dx_min, dx_max) = spans.row(row);
+                let x_start = cx + dx_min;
+                let x_end = cx + dx_max;
+                if let Some((pcx, pcy)) = prev_adj {
+                    if let Some((old_min, old_max)) = spans.span_at_dy(py - pcy) {
+                        let old_x0 = pcx + old_min;
+                        let old_x1 = pcx + old_max;
+                        if x_start < old_x0 {
+                            mask.set_span_clamped(ly, x_start, (old_x0 - 1).min(x_end), min_x, max_x);
+                        }
+                        if x_end > old_x1 {
+                            mask.set_span_clamped(ly, (old_x1 + 1).max(x_start), x_end, min_x, max_x);
+                        }
+                        continue;
+                    }
+                }
+                mask.set_span_clamped(ly, x_start, x_end, min_x, max_x);
+            }
+            prev = Some((cx, cy));
+        }
+        Some(mask)
+    }
+
+    #[inline(always)]
+    fn set_span_clamped(&mut self, ly: usize, x0: i32, x1: i32, min_x: i32, max_x: i32) {
+        let cx0 = x0.max(min_x);
+        let cx1 = x1.min(max_x);
+        if cx0 > cx1 {
+            return;
+        }
+        let lx0 = (cx0 - min_x) as usize;
+        let lx1 = (cx1 - min_x) as usize;
+        let row_base = ly * self.words_per_row;
+        let w0 = lx0 / 64;
+        let w1 = lx1 / 64;
+        let b0 = lx0 % 64;
+        let b1 = lx1 % 64;
+        if w0 == w1 {
+            let len = b1 - b0 + 1;
+            let bits = if len == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << len) - 1) << b0
+            };
+            self.bits[row_base + w0] |= bits;
+        } else {
+            self.bits[row_base + w0] |= u64::MAX << b0;
+            for w in (w0 + 1)..w1 {
+                self.bits[row_base + w] = u64::MAX;
+            }
+            let end_mask = if b1 == 63 {
+                u64::MAX
+            } else {
+                (1u64 << (b1 + 1)) - 1
+            };
+            self.bits[row_base + w1] |= end_mask;
         }
     }
-    cells
+
+    #[inline(always)]
+    fn get(&self, lx: usize, ly: usize) -> bool {
+        let word = ly * self.words_per_row + lx / 64;
+        (self.bits[word] & (1u64 << (lx % 64))) != 0
+    }
+
+    fn apply_clip_and_pattern(&mut self, clip: Option<&PixelClip>, sampler: PatternSampler) {
+        if clip.is_none() && sampler.is_normal() {
+            return;
+        }
+        let is_normal = sampler.is_normal();
+        for ly in 0..self.height {
+            let py = self.origin_y + ly as i32;
+            let row_base = ly * self.words_per_row;
+            for wi in 0..self.words_per_row {
+                let mut w = self.bits[row_base + wi];
+                if w == 0 {
+                    continue;
+                }
+                let mut kept = 0u64;
+                let base_x = self.origin_x + (wi * 64) as i32;
+                while w != 0 {
+                    let bit = w.trailing_zeros();
+                    let px = base_x + bit as i32;
+                    let ok_clip = clip.is_none_or(|c| c.contains(px, py));
+                    let ok_pat = is_normal || sampler.matches(px, py);
+                    if ok_clip && ok_pat {
+                        kept |= 1u64 << bit;
+                    }
+                    w &= w - 1;
+                }
+                self.bits[row_base + wi] = kept;
+            }
+        }
+    }
+
+    /// Counts the total number of set bits in the mask.
+    fn count_set_bits(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Collects merged horizontal spans `(canvas_y, x0_inclusive, x1_exclusive)`.
+    fn horizontal_runs(&self) -> Vec<(i32, i32, i32)> {
+        let mut runs = Vec::new();
+        for ly in 0..self.height {
+            let py = self.origin_y + ly as i32;
+            let row_base = ly * self.words_per_row;
+            let mut run_start: Option<usize> = None;
+            for wi in 0..self.words_per_row {
+                let w = self.bits[row_base + wi];
+                let x_base = wi * 64;
+                if w == 0 {
+                    if let Some(start) = run_start.take() {
+                        runs.push((py, self.origin_x + start as i32, self.origin_x + x_base as i32));
+                    }
+                    continue;
+                }
+                if w == u64::MAX && x_base + 64 <= self.width {
+                    if run_start.is_none() {
+                        run_start = Some(x_base);
+                    }
+                    continue;
+                }
+                let limit = (self.width - x_base).min(64);
+                for b in 0..limit {
+                    if (w & (1u64 << b)) != 0 {
+                        if run_start.is_none() {
+                            run_start = Some(x_base + b);
+                        }
+                    } else if let Some(start) = run_start.take() {
+                        runs.push((
+                            py,
+                            self.origin_x + start as i32,
+                            self.origin_x + (x_base + b) as i32,
+                        ));
+                    }
+                }
+            }
+            if let Some(start) = run_start.take() {
+                runs.push((
+                    py,
+                    self.origin_x + start as i32,
+                    self.origin_x + self.width as i32,
+                ));
+            }
+        }
+        runs
+    }
+}
+
+/// Up to this many set cells, small previews (hover cursors, short lines) emit
+/// simple `rect_filled` shapes directly; above it, Pen switches to merged-span
+/// `egui::Mesh` / cached `TextureHandle` and Eraser switches to collinear-merged
+/// `egui::Mesh` outlines.
+const SMALL_FOOTPRINT_CELL_LIMIT: usize = 512;
+
+/// Maximum number of horizontal spans rendered directly as a single `egui::Mesh`
+/// before switching to a cached nearest-neighbor preview texture quad.
+const FOOTPRINT_MESH_SPAN_LIMIT: usize = 2048;
+
+/// Paint a [`FootprintMask`] preview:
+/// - **Small footprints (`<= 512` cells)**: emits crisp per-cell / per-edge
+///   filled quads directly (fast and preserves exact legacy shape geometry).
+/// - **Large Pen footprints**: merges contiguous pixels into horizontal spans
+///   and renders them as a single `egui::Mesh` (zero tessellation), or a single
+///   cached nearest-neighbor texture quad when dense patterns exceed
+///   [`FOOTPRINT_MESH_SPAN_LIMIT`].
+/// - **Large Eraser footprints**: extracts boundary edges directly from the
+///   bitmask, merges collinear horizontal/vertical runs, and renders them in a
+///   single `egui::Mesh`.
+#[allow(clippy::too_many_arguments)]
+fn paint_footprint_mask(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    theme: &ThemeColors,
+    mask: &FootprintMask,
+    mode: DrawMode,
+    color: Color,
+    origin: egui::Pos2,
+    scale: f32,
+    tex_cache: &mut Option<(u64, Rect2i, egui::TextureHandle)>,
+) {
+    let cell_count = mask.count_set_bits();
+    if cell_count == 0 {
+        return;
+    }
+    match mode {
+        DrawMode::Pen => {
+            let color32 = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
+            if cell_count <= SMALL_FOOTPRINT_CELL_LIMIT {
+                let cell_size = egui::vec2(scale, scale).max(egui::vec2(1.0, 1.0));
+                for ly in 0..mask.height {
+                    let py = mask.origin_y + ly as i32;
+                    let row_base = ly * mask.words_per_row;
+                    for wi in 0..mask.words_per_row {
+                        let mut w = mask.bits[row_base + wi];
+                        let base_x = mask.origin_x + (wi * 64) as i32;
+                        while w != 0 {
+                            let bit = w.trailing_zeros();
+                            let px = base_x + bit as i32;
+                            let min = egui::pos2(
+                                origin.x + px as f32 * scale,
+                                origin.y + py as f32 * scale,
+                            );
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(min, min + cell_size),
+                                0.0,
+                                color32,
+                            );
+                            w &= w - 1;
+                        }
+                    }
+                }
+                return;
+            }
+            let runs = mask.horizontal_runs();
+            if runs.is_empty() {
+                return;
+            }
+            if runs.len() <= FOOTPRINT_MESH_SPAN_LIMIT {
+                let mut mesh = egui::epaint::Mesh::default();
+                mesh.vertices.reserve(runs.len() * 4);
+                mesh.indices.reserve(runs.len() * 6);
+                for &(py, x0, x1) in &runs {
+                    let min = egui::pos2(
+                        origin.x + x0 as f32 * scale,
+                        origin.y + py as f32 * scale,
+                    );
+                    let max = egui::pos2(
+                        (origin.x + x1 as f32 * scale).max(min.x + 1.0),
+                        (origin.y + (py + 1) as f32 * scale).max(min.y + 1.0),
+                    );
+                    mesh.add_colored_rect(egui::Rect::from_min_max(min, max), color32);
+                }
+                painter.add(egui::Shape::mesh(mesh));
+            } else {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                mask.origin_x.hash(&mut hasher);
+                mask.origin_y.hash(&mut hasher);
+                mask.width.hash(&mut hasher);
+                mask.height.hash(&mut hasher);
+                color.r.hash(&mut hasher);
+                color.g.hash(&mut hasher);
+                color.b.hash(&mut hasher);
+                color.a.hash(&mut hasher);
+                mask.bits.hash(&mut hasher);
+                let hash = hasher.finish();
+                let bbox = Rect2i::new(
+                    mask.origin_x,
+                    mask.origin_y,
+                    mask.width as i32,
+                    mask.height as i32,
+                );
+                let cache_hit = tex_cache
+                    .as_ref()
+                    .is_some_and(|(h, r, _)| *h == hash && *r == bbox);
+                if !cache_hit {
+                    let mut pixels = vec![egui::Color32::TRANSPARENT; mask.width * mask.height];
+                    for &(py, x0, x1) in &runs {
+                        let ly = (py - mask.origin_y) as usize;
+                        let lx0 = (x0 - mask.origin_x) as usize;
+                        let lx1 = (x1 - mask.origin_x) as usize;
+                        let row = ly * mask.width;
+                        pixels[row + lx0..row + lx1].fill(color32);
+                    }
+                    let image = egui::ColorImage {
+                        size: [mask.width, mask.height],
+                        source_size: egui::vec2(mask.width as f32, mask.height as f32),
+                        pixels,
+                    };
+                    if let Some((cached_hash, cached_rect, tex)) = tex_cache.as_mut() {
+                        tex.set(image, egui::TextureOptions::NEAREST);
+                        *cached_hash = hash;
+                        *cached_rect = bbox;
+                    } else {
+                        let tex = ctx.load_texture(
+                            "footprint_preview",
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        );
+                        *tex_cache = Some((hash, bbox, tex));
+                    }
+                }
+                if let Some((_, _, tex)) = tex_cache.as_ref() {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(
+                            origin.x + bbox.x as f32 * scale,
+                            origin.y + bbox.y as f32 * scale,
+                        ),
+                        egui::pos2(
+                            origin.x + (bbox.x + bbox.w) as f32 * scale,
+                            origin.y + (bbox.y + bbox.h) as f32 * scale,
+                        ),
+                    );
+                    painter.image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        crate::ui::theme::SKIN_TINT,
+                    );
+                }
+            }
+        }
+        DrawMode::Eraser => {
+            let color = theme.selection_stroke32();
+            let edge_rect = |x0: i32, y0: i32, x1: i32, y1: i32| {
+                let sx0 = origin.x + x0 as f32 * scale;
+                let sy0 = origin.y + y0 as f32 * scale;
+                let sx1 = origin.x + x1 as f32 * scale;
+                let sy1 = origin.y + y1 as f32 * scale;
+                egui::Rect::from_min_max(
+                    egui::pos2(sx0.min(sx1), sy0.min(sy1)),
+                    egui::pos2(
+                        sx0.max(sx1).max(sx0.min(sx1) + 1.0),
+                        sy0.max(sy1).max(sy0.min(sy1) + 1.0),
+                    ),
+                )
+            };
+            if cell_count <= SMALL_FOOTPRINT_CELL_LIMIT {
+                for ly in 0..mask.height {
+                    let py = mask.origin_y + ly as i32;
+                    for lx in 0..mask.width {
+                        if !mask.get(lx, ly) {
+                            continue;
+                        }
+                        let px = mask.origin_x + lx as i32;
+                        if ly == 0 || !mask.get(lx, ly - 1) {
+                            painter.rect_filled(edge_rect(px, py, px + 1, py), 0.0, color);
+                        }
+                        if ly + 1 == mask.height || !mask.get(lx, ly + 1) {
+                            painter.rect_filled(edge_rect(px, py + 1, px + 1, py + 1), 0.0, color);
+                        }
+                        if lx == 0 || !mask.get(lx - 1, ly) {
+                            painter.rect_filled(edge_rect(px, py, px, py + 1), 0.0, color);
+                        }
+                        if lx + 1 == mask.width || !mask.get(lx + 1, ly) {
+                            painter.rect_filled(edge_rect(px + 1, py, px + 1, py + 1), 0.0, color);
+                        }
+                    }
+                }
+                return;
+            }
+            let mut mesh = egui::epaint::Mesh::default();
+            // Horizontal edges (top & bottom boundaries), collinear-merged per row.
+            for ly in 0..mask.height {
+                let py = mask.origin_y + ly as i32;
+                let mut top_start: Option<usize> = None;
+                let mut bot_start: Option<usize> = None;
+                for lx in 0..mask.width {
+                    let cur = mask.get(lx, ly);
+                    let has_top = cur && (ly == 0 || !mask.get(lx, ly - 1));
+                    let has_bot = cur && (ly + 1 == mask.height || !mask.get(lx, ly + 1));
+                    if has_top {
+                        if top_start.is_none() {
+                            top_start = Some(lx);
+                        }
+                    } else if let Some(s) = top_start.take() {
+                        mesh.add_colored_rect(
+                            edge_rect(
+                                mask.origin_x + s as i32,
+                                py,
+                                mask.origin_x + lx as i32,
+                                py,
+                            ),
+                            color,
+                        );
+                    }
+                    if has_bot {
+                        if bot_start.is_none() {
+                            bot_start = Some(lx);
+                        }
+                    } else if let Some(s) = bot_start.take() {
+                        mesh.add_colored_rect(
+                            edge_rect(
+                                mask.origin_x + s as i32,
+                                py + 1,
+                                mask.origin_x + lx as i32,
+                                py + 1,
+                            ),
+                            color,
+                        );
+                    }
+                }
+                if let Some(s) = top_start {
+                    mesh.add_colored_rect(
+                        edge_rect(
+                            mask.origin_x + s as i32,
+                            py,
+                            mask.origin_x + mask.width as i32,
+                            py,
+                        ),
+                        color,
+                    );
+                }
+                if let Some(s) = bot_start {
+                    mesh.add_colored_rect(
+                        edge_rect(
+                            mask.origin_x + s as i32,
+                            py + 1,
+                            mask.origin_x + mask.width as i32,
+                            py + 1,
+                        ),
+                        color,
+                    );
+                }
+            }
+            // Vertical edges (left & right boundaries), collinear-merged per column.
+            for lx in 0..mask.width {
+                let px = mask.origin_x + lx as i32;
+                let mut left_start: Option<usize> = None;
+                let mut right_start: Option<usize> = None;
+                for ly in 0..mask.height {
+                    let cur = mask.get(lx, ly);
+                    let has_left = cur && (lx == 0 || !mask.get(lx - 1, ly));
+                    let has_right = cur && (lx + 1 == mask.width || !mask.get(lx + 1, ly));
+                    if has_left {
+                        if left_start.is_none() {
+                            left_start = Some(ly);
+                        }
+                    } else if let Some(s) = left_start.take() {
+                        mesh.add_colored_rect(
+                            edge_rect(
+                                px,
+                                mask.origin_y + s as i32,
+                                px,
+                                mask.origin_y + ly as i32,
+                            ),
+                            color,
+                        );
+                    }
+                    if has_right {
+                        if right_start.is_none() {
+                            right_start = Some(ly);
+                        }
+                    } else if let Some(s) = right_start.take() {
+                        mesh.add_colored_rect(
+                            edge_rect(
+                                px + 1,
+                                mask.origin_y + s as i32,
+                                px + 1,
+                                mask.origin_y + ly as i32,
+                            ),
+                            color,
+                        );
+                    }
+                }
+                if let Some(s) = left_start {
+                    mesh.add_colored_rect(
+                        edge_rect(
+                            px,
+                            mask.origin_y + s as i32,
+                            px,
+                            mask.origin_y + mask.height as i32,
+                        ),
+                        color,
+                    );
+                }
+                if let Some(s) = right_start {
+                    mesh.add_colored_rect(
+                        edge_rect(
+                            px + 1,
+                            mask.origin_y + s as i32,
+                            px + 1,
+                            mask.origin_y + mask.height as i32,
+                        ),
+                        color,
+                    );
+                }
+            }
+            if !mesh.vertices.is_empty() {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+        }
+    }
 }
 
 /// How this frame's primary drag turns a pointer position into a canvas point.
@@ -2186,73 +2780,6 @@ struct DragMapping {
     pan: (i32, i32),
     /// The active tool's brush size (1 for the point tools).
     anchor_size: u8,
-}
-
-/// One footprint preview: the cells, the draw mode, the primary color, and the
-/// canvas→screen mapping they are painted through.
-struct FootprintPreview<'a> {
-    cells: &'a std::collections::BTreeSet<(i32, i32)>,
-    mode: DrawMode,
-    color: Color,
-    /// Screen position of canvas pixel (0, 0).
-    origin: egui::Pos2,
-    scale: f32,
-    /// Cells outside this clip are dropped; `None` paints every cell (the brush
-    /// cursor is window-clipped by the painter instead).
-    clip: Option<&'a PixelClip>,
-}
-
-/// Paint a footprint preview the way the brush cursor does: Pen fills each
-/// cell solid in [`FootprintPreview::color`], Eraser draws the hollow
-/// silhouette in the theme's selection stroke. Edges are drawn as thin filled
-/// quads: 1 pt line segments are culled by the tessellator, filled shapes are
-/// not.
-fn paint_footprint(painter: &egui::Painter, theme: &ThemeColors, preview: &FootprintPreview<'_>) {
-    let inside = |cx: i32, cy: i32| preview.clip.is_none_or(|clip| clip.contains(cx, cy));
-    match preview.mode {
-        DrawMode::Pen => {
-            let color = preview.color;
-            let color32 = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
-            for &(cx, cy) in preview.cells {
-                if !inside(cx, cy) {
-                    continue;
-                }
-                let min = egui::pos2(
-                    preview.origin.x + cx as f32 * preview.scale,
-                    preview.origin.y + cy as f32 * preview.scale,
-                );
-                // At least 1 pt per cell, like the outline quads.
-                let rect = egui::Rect::from_min_max(
-                    min,
-                    min + egui::vec2(preview.scale, preview.scale).max(egui::vec2(1.0, 1.0)),
-                );
-                painter.rect_filled(rect, 0.0, color32);
-            }
-        }
-        DrawMode::Eraser => {
-            let color = theme.selection_stroke32();
-            let cells: Vec<(i32, i32)> = preview
-                .cells
-                .iter()
-                .copied()
-                .filter(|&(cx, cy)| inside(cx, cy))
-                .collect();
-            for ((x0, y0), (x1, y1)) in brush_outline_segments(&cells) {
-                let sx0 = preview.origin.x + x0 as f32 * preview.scale;
-                let sy0 = preview.origin.y + y0 as f32 * preview.scale;
-                let sx1 = preview.origin.x + x1 as f32 * preview.scale;
-                let sy1 = preview.origin.y + y1 as f32 * preview.scale;
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(sx0.min(sx1), sy0.min(sy1)),
-                    egui::pos2(
-                        sx0.max(sx1).max(sx0.min(sx1) + 1.0),
-                        sy0.max(sy1).max(sy0.min(sy1) + 1.0),
-                    ),
-                );
-                painter.rect_filled(rect, 0.0, color);
-            }
-        }
-    }
 }
 
 /// The live-gesture outline color: the marching-ants core token converted to
@@ -3046,6 +3573,7 @@ mod tests {
             brush,
             draw_mode,
             brush_color,
+            brush_pattern: BrushPattern::NORMAL,
             line,
             selection_clip,
             selection_drag_active: false,
@@ -4320,20 +4848,45 @@ mod tests {
         );
     }
 
-    /// Canvas cells the pen preview paints, recovered from the filled `Rect`
-    /// shapes (origin (0,0), pan (0,0), so `rect.min / scale` is the cell).
+    /// Canvas cells the pen preview paints, recovered from filled `Rect` shapes
+    /// and merged horizontal-span `Mesh` quads (origin (0,0), pan (0,0)).
     fn preview_cells(shapes: &[egui::Shape], scale: f32, color: egui::Color32) -> Vec<(i32, i32)> {
-        let mut cells: Vec<(i32, i32)> = shapes
-            .iter()
-            .filter_map(|shape| match shape {
-                egui::Shape::Rect(rect) if rect.fill == color => Some((
-                    (rect.rect.min.x / scale).round() as i32,
-                    (rect.rect.min.y / scale).round() as i32,
-                )),
-                _ => None,
-            })
-            .collect();
+        let mut cells: Vec<(i32, i32)> = Vec::new();
+        let mut push_rect = |rect: egui::Rect| {
+            let x0 = (rect.min.x / scale).round() as i32;
+            let y0 = (rect.min.y / scale).round() as i32;
+            let x1 = ((rect.max.x / scale).round() as i32).max(x0 + 1);
+            let y1 = ((rect.max.y / scale).round() as i32).max(y0 + 1);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    cells.push((x, y));
+                }
+            }
+        };
+        for shape in shapes {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill == color => push_rect(rect.rect),
+                egui::Shape::Mesh(mesh) if mesh.texture_id == egui::TextureId::default() => {
+                    for quad in mesh.vertices.chunks_exact(4) {
+                        if quad[0].color == color {
+                            let min_x = quad.iter().map(|v| v.pos.x).fold(f32::INFINITY, f32::min);
+                            let min_y = quad.iter().map(|v| v.pos.y).fold(f32::INFINITY, f32::min);
+                            let max_x =
+                                quad.iter().map(|v| v.pos.x).fold(f32::NEG_INFINITY, f32::max);
+                            let max_y =
+                                quad.iter().map(|v| v.pos.y).fold(f32::NEG_INFINITY, f32::max);
+                            push_rect(egui::Rect::from_min_max(
+                                egui::pos2(min_x, min_y),
+                                egui::pos2(max_x, max_y),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         cells.sort_unstable();
+        cells.dedup();
         cells
     }
 
@@ -4369,6 +4922,7 @@ mod tests {
                 scatter: 0,
                 scatter_shape: crate::core::brush::ScatterShape::Square,
                 tail: 0,
+                pattern: crate::core::brush::BrushPattern::NORMAL,
             },
             anchor.0,
             anchor.1,
@@ -6860,5 +7414,107 @@ let (_, shapes) = run_frame_with_shapes_state_with_brush(
         // An empty region is treated as "no region" (full canvas).
         widget.set_sheet_region(Some(Rect2i::new(0, 0, 0, 0)));
         assert_eq!(widget.sheet_region(), None);
+    }
+
+    #[test]
+    fn pen_line_preview_respects_bayer_dither_and_line_pattern() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let camera = Camera::new();
+        let scale = camera.scale() as f32;
+        let primary = Color::rgb(200, 30, 40);
+        let primary32 = egui::Color32::from_rgba_unmultiplied(200, 30, 40, 255);
+
+        let dither = BrushPattern {
+            kind: crate::core::brush::BrushPatternKind::BayerDither,
+            dither_density: 50,
+            ..BrushPattern::NORMAL
+        };
+        let view = CanvasView {
+            canvas_size: (32, 32),
+            grid_visible: false,
+            brush: Some(crate::core::brush::BrushSpec::new(
+                4,
+                crate::core::brush::BrushShape::Square,
+            )),
+            draw_mode: DrawMode::Pen,
+            brush_color: primary,
+            brush_pattern: dither,
+            line: Some(LinePreview {
+                anchor: (4, 10),
+                end: (16, 10),
+            }),
+            ..Default::default()
+        };
+        let (_, shapes) = run_frame_with_view(&ctx, Vec::new(), &mut widget, view, camera);
+        let cells = preview_cells(&shapes, scale, primary32);
+        assert!(!cells.is_empty());
+        for (x, y) in &cells {
+            assert_eq!(
+                (x + y) % 2,
+                0,
+                "50% Bayer dither preview must only show checkerboard cells, got ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn large_64px_line_preview_is_fast_and_bounded_in_shape_count() {
+        let ctx = egui::Context::default();
+        let mut widget = CanvasWidget::new();
+        let camera = Camera::new();
+        let spec = crate::core::brush::BrushSpec::new(64, crate::core::brush::BrushShape::Round);
+
+        for (mode, pattern) in [
+            (DrawMode::Pen, BrushPattern::NORMAL),
+            (DrawMode::Eraser, BrushPattern::NORMAL),
+            (
+                DrawMode::Pen,
+                BrushPattern {
+                    kind: crate::core::brush::BrushPatternKind::BayerDither,
+                    dither_density: 50,
+                    ..BrushPattern::NORMAL
+                },
+            ),
+            (
+                DrawMode::Pen,
+                BrushPattern {
+                    kind: crate::core::brush::BrushPatternKind::Line,
+                    line_thickness: 2,
+                    line_angle: 45,
+                    line_spacing: 4,
+                    ..BrushPattern::NORMAL
+                },
+            ),
+        ] {
+            let view = CanvasView {
+                canvas_size: (640, 480),
+                grid_visible: false,
+                brush: Some(spec),
+                draw_mode: mode,
+                brush_color: Color::rgb(255, 80, 40),
+                brush_pattern: pattern,
+                line: Some(LinePreview {
+                    anchor: (40, 200),
+                    end: (560, 240),
+                }),
+                ..Default::default()
+            };
+            let t0 = std::time::Instant::now();
+            let (_, shapes) = run_frame_with_view(&ctx, Vec::new(), &mut widget, view, camera);
+            let elapsed = t0.elapsed();
+            assert!(
+                shapes.len() <= 16,
+                "large 64px line preview ({mode:?}, {:?}) must batch into a single mesh or texture, got {} shapes",
+                pattern.kind,
+                shapes.len()
+            );
+            assert!(
+                elapsed.as_millis() < 200,
+                "large 64px line preview ({mode:?}, {:?}) took too long: {:?}",
+                pattern.kind,
+                elapsed
+            );
+        }
     }
 }

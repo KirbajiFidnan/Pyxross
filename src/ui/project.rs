@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 
 use crate::core::anim::AnimationController;
-use crate::core::brush::{BrushShape, BrushSpec, ScatterShape};
+use crate::core::brush::{BrushPattern, BrushShape, BrushSpec, ScatterShape};
 use crate::core::buffer::PixelBuffer;
 use crate::core::camera::Camera;
 use crate::core::clipboard::ClipboardRegion;
@@ -117,6 +117,7 @@ pub struct DrawSettings {
     pub scatter: u8,
     pub scatter_shape: ScatterShape,
     pub tail: i8,
+    pub pattern: BrushPattern,
 }
 
 impl Default for DrawSettings {
@@ -127,6 +128,7 @@ impl Default for DrawSettings {
             scatter: 0,
             scatter_shape: ScatterShape::Square,
             tail: 0,
+            pattern: BrushPattern::NORMAL,
         }
     }
 }

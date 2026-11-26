@@ -1329,6 +1329,7 @@ fn pen_and_eraser_keep_independent_draw_settings() {
             scatter: 4,
             scatter_shape: ScatterShape::Diamond,
             tail: 30,
+            pattern: pyxross::core::brush::BrushPattern::NORMAL,
         },
         "the pen's settings must survive an eraser edit"
     );
@@ -1341,6 +1342,7 @@ fn pen_and_eraser_keep_independent_draw_settings() {
             scatter: 9,
             scatter_shape: ScatterShape::Circle,
             tail: -40,
+            pattern: pyxross::core::brush::BrushPattern::NORMAL,
         },
         "the eraser keeps its own settings"
     );

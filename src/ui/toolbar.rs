@@ -6,7 +6,7 @@
 //! emitted as a [`ToolbarEvent`] for the App shell to apply (D62: deliberate
 //! switches only; every event here is deliberate).
 
-use crate::core::brush::{BrushShape, BrushSpec, ScatterShape};
+use crate::core::brush::{BrushPatternKind, BrushShape, BrushSpec, ScatterShape};
 use crate::core::color::Color;
 use crate::core::palette::Palette;
 use crate::core::transform::TransformAlgorithm;
@@ -35,6 +35,16 @@ pub enum ToolbarEvent {
     BrushScatterShapeChanged(ScatterShape),
     /// The user moved the brush-tail taper control (-100..=100 percent, 0 = off).
     BrushTailChanged(i8),
+    /// The user picked a canvas-locked brush pattern (Normal / Bayer Dither / Line).
+    BrushPatternKindChanged(BrushPatternKind),
+    /// The user adjusted the Bayer dither density (0..=100 percent).
+    BrushPatternDitherDensityChanged(u8),
+    /// The user adjusted the Line pattern thickness (1..=32 px).
+    BrushPatternLineThicknessChanged(u8),
+    /// The user adjusted the Line pattern angle (0..=180 degrees).
+    BrushPatternLineAngleChanged(i16),
+    /// The user adjusted the Line pattern spacing (1..=64 px).
+    BrushPatternLineSpacingChanged(u8),
     /// The user picked a Fieldier child (Rectangle / Wand / Lasso / BrushSelector)
     /// in the Tool Property panel or Toolbox.
     FieldierChildChanged(FieldierChild),

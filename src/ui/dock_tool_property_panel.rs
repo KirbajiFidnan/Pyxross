@@ -9,7 +9,9 @@
 
 use egui::vec2;
 
-use crate::core::brush::{BrushShape, BrushSpec, DrawTool, ScatterShape};
+use crate::core::brush::{
+    BrushPattern, BrushPatternKind, BrushShape, BrushSpec, DrawTool, ScatterShape,
+};
 use crate::core::transform::TransformAlgorithm;
 use crate::input::{FieldierChild, Tool};
 use crate::ui::dock_hosts::{ToolboxHost, ToolboxView};
@@ -71,26 +73,29 @@ impl Component for ToolPropertyComponent {
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(4.0);
-        match view.tool {
-            Tool::Pencil | Tool::Eraser => {
-                self.draw_properties(ui, &view, chrome);
-            }
-            Tool::Fieldier => {
-                self.fieldier_properties(ui, &view, chrome);
-            }
-            Tool::Fill => {
-                self.fill_properties(ui, &view, chrome);
-            }
-            Tool::Tile => {
-                self.tile_properties(ui, &view);
-            }
-            Tool::Text => {
-                self.text_properties(ui, &view, chrome);
-            }
-            Tool::Eyedropper | Tool::Draw | Tool::AnimationPlacer => {
-                ui.weak(TOOL_PROPERTY_PLACEHOLDER);
-            }
-        }
+        egui::ScrollArea::vertical()
+            .id_salt("tool_property_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match view.tool {
+                Tool::Pencil | Tool::Eraser => {
+                    self.draw_properties(ui, &view, chrome);
+                }
+                Tool::Fieldier => {
+                    self.fieldier_properties(ui, &view, chrome);
+                }
+                Tool::Fill => {
+                    self.fill_properties(ui, &view, chrome);
+                }
+                Tool::Tile => {
+                    self.tile_properties(ui, &view);
+                }
+                Tool::Text => {
+                    self.text_properties(ui, &view, chrome);
+                }
+                Tool::Eyedropper | Tool::Draw | Tool::AnimationPlacer => {
+                    ui.weak(TOOL_PROPERTY_PLACEHOLDER);
+                }
+            });
     }
 }
 
@@ -350,6 +355,211 @@ impl ToolPropertyComponent {
                     }
                 });
         });
+        let pattern = view.draw.pattern;
+        property_row(ui, "Pattern", |ui| {
+            let kinds = [
+                (BrushPatternKind::Normal, "Normal"),
+                (BrushPatternKind::BayerDither, "Bayer Dither"),
+                (BrushPatternKind::Line, "Line"),
+            ];
+            let current = kinds
+                .iter()
+                .find(|(k, _)| *k == pattern.kind)
+                .map(|(_, l)| *l)
+                .unwrap_or("Normal");
+            egui::ComboBox::from_id_salt("tool_prop_brush_pattern")
+                .width(ui.available_width().clamp(96.0, 180.0))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (kind, label) in kinds {
+                        let selected = pattern.kind == kind;
+                        if chrome.combo_item(ui, selected, label).clicked() && !selected {
+                            events
+                                .borrow_mut()
+                                .push(ToolbarEvent::BrushPatternKindChanged(kind));
+                        }
+                    }
+                });
+        });
+        match pattern.kind {
+            BrushPatternKind::Normal => {}
+            BrushPatternKind::BayerDither => {
+                property_row(ui, "Density", |ui| {
+                    let mut density = pattern.dither_density.clamp(
+                        BrushPattern::MIN_DITHER_DENSITY,
+                        BrushPattern::MAX_DITHER_DENSITY,
+                    );
+                    let input = ui.add_sized(
+                        vec2(42.0, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut density)
+                            .range(
+                                BrushPattern::MIN_DITHER_DENSITY..=BrushPattern::MAX_DITHER_DENSITY,
+                            )
+                            .suffix("%"),
+                    );
+                    let mut density_f = density as f32;
+                    let slider_w = (ui.available_width() - 50.0).max(40.0);
+                    let slider = ui
+                        .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                            pro_slider(
+                                ui,
+                                "brush-pattern-density",
+                                &mut density_f,
+                                (BrushPattern::MIN_DITHER_DENSITY as f32)
+                                    ..=(BrushPattern::MAX_DITHER_DENSITY as f32),
+                                false,
+                            )
+                        })
+                        .inner;
+                    if slider.changed() {
+                        density = density_f.round() as u8;
+                    }
+                    let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+                    if (input.changed() || slider.changed()) && density != pattern.dither_density {
+                        events
+                            .borrow_mut()
+                            .push(ToolbarEvent::BrushPatternDitherDensityChanged(density));
+                    }
+                    if reset.clicked() {
+                        events.borrow_mut().push(
+                            ToolbarEvent::BrushPatternDitherDensityChanged(
+                                BrushPattern::DEFAULT_DITHER_DENSITY,
+                            ),
+                        );
+                    }
+                });
+            }
+            BrushPatternKind::Line => {
+                property_row(ui, "Thickness", |ui| {
+                    let mut thickness = pattern.line_thickness.clamp(
+                        BrushPattern::MIN_LINE_THICKNESS,
+                        BrushPattern::MAX_LINE_THICKNESS,
+                    );
+                    let input = ui.add_sized(
+                        vec2(42.0, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut thickness).range(
+                            BrushPattern::MIN_LINE_THICKNESS..=BrushPattern::MAX_LINE_THICKNESS,
+                        ),
+                    );
+                    let mut thickness_f = thickness as f32;
+                    let slider_w = (ui.available_width() - 50.0).max(40.0);
+                    let slider = ui
+                        .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                            pro_slider(
+                                ui,
+                                "brush-pattern-thickness",
+                                &mut thickness_f,
+                                (BrushPattern::MIN_LINE_THICKNESS as f32)
+                                    ..=(BrushPattern::MAX_LINE_THICKNESS as f32),
+                                false,
+                            )
+                        })
+                        .inner;
+                    if slider.changed() {
+                        thickness = thickness_f.round() as u8;
+                    }
+                    let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+                    if (input.changed() || slider.changed())
+                        && thickness != pattern.line_thickness
+                    {
+                        events
+                            .borrow_mut()
+                            .push(ToolbarEvent::BrushPatternLineThicknessChanged(thickness));
+                    }
+                    if reset.clicked() {
+                        events.borrow_mut().push(
+                            ToolbarEvent::BrushPatternLineThicknessChanged(
+                                BrushPattern::DEFAULT_LINE_THICKNESS,
+                            ),
+                        );
+                    }
+                });
+                property_row(ui, "Angle", |ui| {
+                    let mut angle = pattern.line_angle.clamp(
+                        BrushPattern::MIN_LINE_ANGLE,
+                        BrushPattern::MAX_LINE_ANGLE,
+                    );
+                    let input = ui.add_sized(
+                        vec2(42.0, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut angle)
+                            .range(BrushPattern::MIN_LINE_ANGLE..=BrushPattern::MAX_LINE_ANGLE)
+                            .suffix("°"),
+                    );
+                    let mut angle_f = angle as f32;
+                    let slider_w = (ui.available_width() - 50.0).max(40.0);
+                    let slider = ui
+                        .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                            pro_slider(
+                                ui,
+                                "brush-pattern-angle",
+                                &mut angle_f,
+                                (BrushPattern::MIN_LINE_ANGLE as f32)
+                                    ..=(BrushPattern::MAX_LINE_ANGLE as f32),
+                                false,
+                            )
+                        })
+                        .inner;
+                    if slider.changed() {
+                        angle = angle_f.round() as i16;
+                    }
+                    let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+                    if (input.changed() || slider.changed()) && angle != pattern.line_angle {
+                        events
+                            .borrow_mut()
+                            .push(ToolbarEvent::BrushPatternLineAngleChanged(angle));
+                    }
+                    if reset.clicked() {
+                        events.borrow_mut().push(
+                            ToolbarEvent::BrushPatternLineAngleChanged(
+                                BrushPattern::DEFAULT_LINE_ANGLE,
+                            ),
+                        );
+                    }
+                });
+                property_row(ui, "Spacing", |ui| {
+                    let mut spacing = pattern.line_spacing.clamp(
+                        BrushPattern::MIN_LINE_SPACING,
+                        BrushPattern::MAX_LINE_SPACING,
+                    );
+                    let input = ui.add_sized(
+                        vec2(42.0, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut spacing).range(
+                            BrushPattern::MIN_LINE_SPACING..=BrushPattern::MAX_LINE_SPACING,
+                        ),
+                    );
+                    let mut spacing_f = spacing as f32;
+                    let slider_w = (ui.available_width() - 50.0).max(40.0);
+                    let slider = ui
+                        .allocate_ui(vec2(slider_w, 18.0), |ui| {
+                            pro_slider(
+                                ui,
+                                "brush-pattern-spacing",
+                                &mut spacing_f,
+                                (BrushPattern::MIN_LINE_SPACING as f32)
+                                    ..=(BrushPattern::MAX_LINE_SPACING as f32),
+                                false,
+                            )
+                        })
+                        .inner;
+                    if slider.changed() {
+                        spacing = spacing_f.round() as u8;
+                    }
+                    let reset = chrome.button(ui, RESET_LABEL, ButtonStyle::plain());
+                    if (input.changed() || slider.changed()) && spacing != pattern.line_spacing {
+                        events
+                            .borrow_mut()
+                            .push(ToolbarEvent::BrushPatternLineSpacingChanged(spacing));
+                    }
+                    if reset.clicked() {
+                        events.borrow_mut().push(
+                            ToolbarEvent::BrushPatternLineSpacingChanged(
+                                BrushPattern::DEFAULT_LINE_SPACING,
+                            ),
+                        );
+                    }
+                });
+            }
+        }
     }
 
     /// The Fieldier's properties: the child picker (Rectangle / Wand / Lasso)

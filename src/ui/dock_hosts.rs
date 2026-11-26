@@ -350,6 +350,7 @@ mod tests {
             scatter: 6,
             scatter_shape: crate::core::brush::ScatterShape::Diamond,
             tail: -4,
+            pattern: crate::core::brush::BrushPattern::NORMAL,
         };
         *host.view.borrow_mut() = ToolboxView {
             tool: Tool::Fill,
